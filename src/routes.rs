@@ -179,6 +179,7 @@ async fn catch_all(
         return html_response(format_error_embed("https://git.facebed.com", "C"));
     };
 
+    info!(working = %working, kind = ?kind, "dispatch");
     process(&state, &working, kind).await
 }
 
@@ -188,7 +189,7 @@ fn path_only(s: &str) -> Option<String> {
         .map(|u| u.path().to_owned())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ParserKind {
     JsonPost,
     SinglePhoto,
