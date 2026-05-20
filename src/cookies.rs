@@ -169,6 +169,10 @@ impl CookieJar {
         self.accounts.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+    }
+
     /// Round-robin select an account.
     pub fn next_account(&self) -> Option<&CookieAccount> {
         if self.accounts.is_empty() {
@@ -176,6 +180,25 @@ impl CookieJar {
         }
         let i = self.cursor.fetch_add(1, Ordering::Relaxed) % self.accounts.len();
         Some(&self.accounts[i])
+    }
+
+    /// Pick a specific account by index (modulo account count). Returns None for empty jar.
+    pub fn account_at(&self, i: usize) -> Option<&CookieAccount> {
+        if self.accounts.is_empty() {
+            return None;
+        }
+        Some(&self.accounts[i % self.accounts.len()])
+    }
+
+    /// Current round-robin cursor (without advancing). Used to seed retry loops so the
+    /// first attempt matches the regular round-robin pick.
+    pub fn cursor(&self) -> usize {
+        self.cursor.load(Ordering::Relaxed)
+    }
+
+    /// Advance the round-robin cursor by one.
+    pub fn advance_cursor(&self) {
+        self.cursor.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn expired_labels(&self) -> Vec<String> {

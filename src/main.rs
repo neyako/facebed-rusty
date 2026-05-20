@@ -78,7 +78,13 @@ async fn main() -> anyhow::Result<()> {
         notifier,
         fetcher,
     };
-    let app = router(state).layer(tower_http::trace::TraceLayer::new_for_http());
+    let app = router(state).layer(
+        tower_http::trace::TraceLayer::new_for_http()
+            .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO))
+            .on_response(
+                tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
+            ),
+    );
 
     info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
