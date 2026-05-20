@@ -1,0 +1,197 @@
+use crate::parsers::ParsedPost;
+use chrono::{FixedOffset, TimeZone};
+use html_escape::encode_quoted_attribute;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+const CREDIT: &str = "facebed by pi.kt";
+
+/// Match Python `quote()` — percent-encode the same special chars.
+const UNSAFE: &AsciiSet = &CONTROLS
+    .add(b'<').add(b'>').add(b'"').add(b'\'')
+    .add(b'#').add(b'%').add(b'{').add(b'}')
+    .add(b'[').add(b']').add(b'|').add(b'\\')
+    .add(b'^').add(b'~').add(b'`');
+
+pub fn quote(s: &str) -> String {
+    utf8_percent_encode(s, UNSAFE).to_string()
+}
+
+fn escape_attr(s: &str) -> String {
+    encode_quoted_attribute(s).to_string()
+}
+
+fn truncate_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+fn format_timestamp(ts: i64, tz_offset: i32) -> String {
+    if ts < 0 {
+        return String::new();
+    }
+    let offset_seconds = tz_offset * 3600;
+    let tz = match FixedOffset::east_opt(offset_seconds) {
+        Some(t) => t,
+        None => return String::new(),
+    };
+    let dt = match tz.timestamp_opt(ts, 0).single() {
+        Some(d) => d,
+        None => return String::new(),
+    };
+    let sign = if tz_offset >= 0 { '+' } else { '-' };
+    format!("⌚ {} UTC{}{}", dt.format("%Y/%m/%d %H:%M:%S"), sign, tz_offset.abs())
+}
+
+fn format_reactions(likes: &str, cmts: &str, shares: &str) -> String {
+    let mut parts = Vec::new();
+    if likes != "null" { parts.push(format!("❤️ {}", likes)); }
+    if cmts != "null" { parts.push(format!("💬 {}", cmts)); }
+    if shares != "null" { parts.push(format!("🔁 {}", shares)); }
+    parts.join(" • ").replace(',', ".")
+}
+
+pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
+    if !post.video_links.is_empty() {
+        return format_reel_post_embed(post, tz_offset);
+    }
+    let mut images = post.image_links.clone();
+    let extra = if images.len() > 4 { "\ncontains 4+ images".to_string() } else { String::new() };
+    images.truncate(4);
+    let image_meta = images
+        .iter()
+        .map(|u| format!(r#"<meta property="og:image" content="{}"/>"#, escape_attr(u)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let post_date = format_timestamp(post.date, tz_offset);
+    let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
+    let url_q = quote(&post.url);
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="">
+<head>
+    <title>{credit}</title>
+    <meta charset="UTF-8"/>
+    <meta property="og:title" content="{title}"/>
+    <meta property="og:description" content="{desc}"/>
+    <meta property="og:site_name" content="{credit}
+{post_date}
+{reactions}{extra}"/>
+    <meta property="og:url" content="{url_q}"/>
+    {image_meta}
+    <link rel="canonical" href="{url_q}"/>
+    <meta http-equiv="refresh" content="0;url={url_q}"/>
+    <meta name="twitter:card" content="summary_large_image"/>
+    <meta name="theme-color" content="#0866ff"/>
+</head>
+</html>"##,
+        credit = CREDIT,
+        title = escape_attr(&post.author_name),
+        desc = escape_attr(truncate_chars(&post.text, 1024)),
+        post_date = post_date,
+        reactions = reactions,
+        extra = extra,
+        url_q = url_q,
+        image_meta = image_meta,
+    )
+}
+
+pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
+    let video_meta = post
+        .video_links
+        .iter()
+        .map(|u| {
+            let q = escape_attr(u);
+            format!(
+                r#"<meta property="twitter:player:stream" content="{q}"/>
+<meta property="og:video" content="{q}"/>
+<meta property="og:video:secure_url" content="{q}"/>"#,
+                q = q
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let post_date = format_timestamp(post.date, tz_offset);
+    let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
+    let url_q = quote(&post.url);
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="">
+<head>
+    <title>{credit}</title>
+    <meta charset="UTF-8"/>
+    <meta property="og:title" content="{title}"/>
+    <meta property="og:description" content="{desc}"/>
+    <meta property="og:site_name" content="{credit}
+{post_date}
+{reactions}"/>
+    <meta property="og:url" content="{url_q}"/>
+    <meta property="og:video:type" content="video/mp4"/>
+    <meta property="twitter:player:stream:content_type" content="video/mp4"/>
+
+    {video_meta}
+
+    <link rel="canonical" href="{url_q}"/>
+    <meta http-equiv="refresh" content="0;url={url_q}"/>
+    <meta name="twitter:card" content="player"/>
+    <meta name="theme-color" content="#0866ff"/>
+</head>
+</html>"##,
+        credit = CREDIT,
+        title = escape_attr(&post.author_name),
+        desc = escape_attr(truncate_chars(&post.text, 1024)),
+        post_date = post_date,
+        reactions = reactions,
+        url_q = url_q,
+        video_meta = video_meta,
+    )
+}
+
+pub fn format_error_embed(original_url: &str, error_code: &str) -> String {
+    let suffix = if error_code.is_empty() { String::new() } else { format!(" [{}]", error_code) };
+    let url_q = quote(original_url);
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="">
+<head>
+<meta charset="UTF-8" />
+    <meta name="theme-color" content="#2c3048f" />
+    <meta property="og:title" content="Log in or sign up to view{suffix}"/>
+    <meta property="og:description" content="See posts, photos and more on Facebook.
+If viewable in incognito report to git.facebed.com"/>
+    <meta http-equiv="refresh" content="0;url={url_q}"/>
+</head>
+</html>"##,
+        suffix = suffix,
+        url_q = url_q,
+    )
+}
+
+pub fn format_redirect_page(url: &str) -> String {
+    let q = quote(url);
+    let esc = escape_attr(url);
+    format!(
+        r#"<!DOCTYPE HTML>
+<html lang="en-US">
+    <head>
+        <meta charset="UTF-8">
+        <meta http-equiv="refresh" content="0; url={q}">
+        <script type="text/javascript">
+            window.location.href = "{esc}"
+        </script>
+        <title>redirecting...</title>
+    </head>
+    <body>
+    </body>
+</html>"#,
+        q = q,
+        esc = esc,
+    )
+}
+
+pub fn credit() -> &'static str {
+    CREDIT
+}

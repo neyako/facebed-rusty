@@ -1,13 +1,24 @@
-FROM python:3.14-alpine AS builder
-WORKDIR /app
-COPY requirements.txt .
-RUN pip3.14 install -r ./requirements.txt
+# syntax=docker/dockerfile:1.7
 
-FROM python:3.14-alpine
+FROM --platform=$BUILDPLATFORM rust:1-alpine AS builder
+RUN apk add --no-cache musl-dev pkgconfig
+WORKDIR /build
+
+# Cache deps separately from src changes.
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs \
+ && cargo build --release \
+ && rm -rf src target/release/deps/facebed* target/release/facebed*
+
+COPY src ./src
+RUN touch src/main.rs && cargo build --release
+
+FROM scratch
 WORKDIR /facebed
-COPY . .
-RUN /bin/sh -c "echo '{}' > ./config.yaml"
-COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
-RUN adduser -D facebed
-USER facebed
-CMD ["python3.14", "./facebed.py", "-c", "./config.yaml"]
+COPY --from=builder /build/target/release/facebed /facebed/facebed
+COPY assets /facebed/assets
+# Non-root: uid/gid 65532 ("nobody" on most distros).
+USER 65532:65532
+EXPOSE 9812
+ENTRYPOINT ["/facebed/facebed"]
+CMD ["-c", "/facebed/config.yaml"]
