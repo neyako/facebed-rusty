@@ -95,31 +95,56 @@ impl Fetcher {
     }
 }
 
-/// Resolve a `/share/v/...` or `/share/[pr]/...` link.
-/// First tries the HTTP redirect chain; falls back to parsing `og:url` from the
-/// share page when FB serves it as a 200 (no redirect) — that page still carries
-/// the canonical post URL.
-/// Returns the resolved path (no host), or empty if neither resolves off /share/.
+/// Resolve a `/share/v/...` or `/share/[pr]/...` link to its canonical
+/// content path.
+///
+/// We send a Discordbot UA here (not our Chrome UA from [`HEADERS`]) on
+/// purpose: FB serves the share page differently per UA. With a normal
+/// browser UA, FB sometimes HTTP-redirects share/v/ to `/reel/<id>` even
+/// when the underlying content is a Page video post (`<page>/videos/<slug>/<id>`)
+/// — trusting that redirect drags ReelsParser onto unrelated content on
+/// the served `/reel/<id>` page. With a Discordbot UA, FB consistently
+/// returns the share page as 200 with a `og:url` pointing at the real
+/// canonical path (the `/videos/` URL for page videos, `/reel/<id>` for
+/// true reels), which is what we want.
+///
+/// `og:url` is preferred over the HTTP redirect target for the same
+/// reason. Returns the resolved path (no host), or empty if nothing
+/// off-/share/ could be derived.
 pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<String> {
     let url = ensure_absolute(path);
     let mut req = fetcher.client().get(&url);
     for (k, v) in HEADERS {
+        // Drop our default Chrome UA — we override it below.
+        if k.eq_ignore_ascii_case("user-agent") {
+            continue;
+        }
         req = req.header(*k, *v);
     }
+    req = req.header(
+        "user-agent",
+        "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+    );
     let resp = req.send().await?;
     let final_url = resp.url().to_string();
     let body = resp.text().await?;
 
-    let still_on_share = final_url == url
-        || final_url.starts_with("https://www.facebook.com/share")
-        || final_url.starts_with("http://www.facebook.com/share");
+    // Prefer og:url / link[rel=canonical] from the response body — that
+    // value is the page's own declared canonical path, not just wherever
+    // the redirect chain happened to land.
+    let canonical = extract_canonical_url(&body);
 
-    let resolved = if !still_on_share {
-        final_url
-    } else if let Some(u) = extract_canonical_url(&body) {
-        u
-    } else {
-        return Ok(String::new());
+    let resolved = match canonical {
+        Some(u) => u,
+        None => {
+            let still_on_share = final_url == url
+                || final_url.starts_with("https://www.facebook.com/share")
+                || final_url.starts_with("http://www.facebook.com/share");
+            if still_on_share {
+                return Ok(String::new());
+            }
+            final_url
+        }
     };
 
     let stripped = resolved
