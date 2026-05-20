@@ -1,0 +1,14 @@
+# facebed config — all fields are optional; defaults shown.
+
+host: 0.0.0.0
+port: 9812
+
+# Hours offset from UTC, used in embed timestamps. Range: -12 to 14.
+timezone: 7
+
+# Facebook author IDs whose posts return a "banned" placeholder instead of being embedded.
+banned_users: []
+
+# Discord webhook URL. If set, the server posts parser-bug reports and expired-cookie alerts here.
+# Leave empty to disable.
+notifier_webhook: ""

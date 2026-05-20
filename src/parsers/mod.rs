@@ -1,0 +1,56 @@
+use crate::cookies::CookieJar;
+use crate::error::FacebedResult;
+use crate::fetch::Fetcher;
+use std::sync::Arc;
+
+pub mod util;
+pub mod json_post;
+pub mod single_photo;
+pub mod photocom;
+pub mod reels;
+pub mod video_watch;
+pub mod stories;
+
+#[derive(Debug, Clone)]
+pub struct ParsedPost {
+    pub author_name: String,
+    pub text: String,
+    pub image_links: Vec<String>,
+    pub url: String,
+    pub date: i64,
+    pub likes: String,
+    pub comments: String,
+    pub shares: String,
+    pub video_links: Vec<String>,
+}
+
+pub struct ParserCtx {
+    pub fetcher: Arc<Fetcher>,
+    pub cookies: Arc<CookieJar>,
+    pub banned_users: Vec<String>,
+}
+
+impl ParserCtx {
+    pub fn is_banned(&self, author_id: &str) -> bool {
+        self.banned_users.iter().any(|b| b == author_id)
+    }
+}
+
+pub fn banned_post(url: &str) -> ParsedPost {
+    ParsedPost {
+        author_name: "Banned".into(),
+        text: "This user is banned by the operators of this embed server".into(),
+        image_links: Vec::new(),
+        url: url.to_owned(),
+        date: -1,
+        likes: "null".into(),
+        comments: "null".into(),
+        shares: "null".into(),
+        video_links: Vec::new(),
+    }
+}
+
+#[async_trait::async_trait]
+pub trait Parser {
+    async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost>;
+}

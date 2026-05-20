@@ -1,0 +1,19 @@
+{
+  "_README": "Two shapes are accepted. (1) A flat Cookie-Editor export: a JSON array of {name, value, expirationDate, ...} → treated as one account labeled 'default'. (2) Multi-account: {\"accounts\": [{\"label\": \"...\", \"entries\": [...cookie-editor entries...]}, ...]}. Multi-account is round-robin across requests, so each account should belong to a different FB user to view posts from each account's friends/groups.",
+  "accounts": [
+    {
+      "label": "alice",
+      "entries": [
+        {"name": "c_user", "value": "100000000000001", "domain": ".facebook.com", "expirationDate": 4070908800},
+        {"name": "xs", "value": "REPLACE_ME", "domain": ".facebook.com", "expirationDate": 4070908800}
+      ]
+    },
+    {
+      "label": "bob",
+      "entries": [
+        {"name": "c_user", "value": "100000000000002", "domain": ".facebook.com", "expirationDate": 4070908800},
+        {"name": "xs", "value": "REPLACE_ME", "domain": ".facebook.com", "expirationDate": 4070908800}
+      ]
+    }
+  ]
+}

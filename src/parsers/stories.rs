@@ -1,0 +1,148 @@
+//! 24-hour Facebook stories. URL pattern: `/stories/<author_id>/<media_id>/...`.
+//!
+//! JSON layout (block usually contains `bucket`):
+//! ```text
+//! data.bucket
+//!   ├─ owner { id, name, short_name }
+//!   └─ unified_stories_with_notes.edges[0].node
+//!        ├─ creation_time
+//!        ├─ story_card_info.permalink_info.uri    (canonical url)
+//!        └─ attachments[0].media
+//!             ├─ playable_url           (video story)
+//!             └─ image.uri              (photo story)
+//! ```
+
+use crate::error::{FacebedError, FacebedResult};
+use crate::fetch::get_json_blocks;
+use crate::jq;
+use crate::parsers::util::val_str_at;
+use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
+use crate::url_clean::ensure_absolute;
+use scraper::Html;
+use serde_json::Value;
+
+pub struct StoriesParser;
+
+#[async_trait::async_trait]
+impl Parser for StoriesParser {
+    async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
+        let page = ctx.fetcher.fetch(post_path, true).await?;
+        let html = page.parse();
+        let (bucket, node) = find_story_bucket_and_node(&html).ok_or_else(|| {
+            // No bucket = expired or login wall. Treat as NoData (24h-old stories vanish).
+            FacebedError::no_data(format!(
+                "story unavailable for {} (expired or restricted)",
+                post_path
+            ))
+        })?;
+
+        let owner = bucket.get("owner");
+        let author_name = owner
+            .and_then(|o| val_str_at(o, "name"))
+            .unwrap_or("")
+            .to_owned();
+        let author_id = owner.and_then(|o| val_str_at(o, "id")).unwrap_or("").to_owned();
+
+        let date = node.get("creation_time").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        let permalink = node
+            .pointer("/story_card_info/permalink_info/uri")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| ensure_absolute(post_path));
+
+        let media = node
+            .pointer("/attachments/0/media")
+            .ok_or_else(|| {
+                FacebedError::parse_with("Invalid story (media)", page.html.clone(), page.url.clone())
+            })?;
+
+        let mut image_links = Vec::new();
+        let mut video_links = Vec::new();
+
+        if let Some(playable) = media.get("playable_url_quality_hd").and_then(|v| v.as_str()) {
+            video_links.push(playable.to_owned());
+        } else if let Some(playable) = media.get("playable_url").and_then(|v| v.as_str()) {
+            video_links.push(playable.to_owned());
+        } else if let Some(thumb) = media
+            .pointer("/preferred_thumbnail/image/uri")
+            .and_then(|v| v.as_str())
+        {
+            image_links.push(thumb.to_owned());
+        } else if let Some(uri) = media.pointer("/image/uri").and_then(|v| v.as_str()) {
+            image_links.push(uri.to_owned());
+        } else {
+            return Err(FacebedError::parse_with(
+                "Invalid story (no media url)",
+                page.html.clone(),
+                page.url.clone(),
+            ));
+        }
+
+        if ctx.is_banned(&author_id) {
+            return Ok(banned_post(&permalink));
+        }
+
+        Ok(ParsedPost {
+            author_name,
+            text: String::new(),
+            image_links,
+            url: permalink,
+            date,
+            likes: "null".into(),
+            comments: "null".into(),
+            shares: "null".into(),
+            video_links,
+        })
+    }
+}
+
+/// Find the `(bucket, story_node)` pair for the requested story.
+/// First match wins — FB usually puts the relevant bucket in the largest block.
+fn find_story_bucket_and_node(html: &Html) -> Option<(Value, Value)> {
+    for bloc in get_json_blocks(html, true) {
+        for usn in jq::all(&bloc, "unified_stories_with_notes") {
+            let edges = usn.get("edges").and_then(|e| e.as_array())?;
+            let node = edges.first()?.get("node")?;
+            if node.get("attachments").is_none() {
+                continue;
+            }
+            // walk up: the bucket is the parent containing usn + owner
+            let bucket = find_bucket_containing(&bloc, usn)?;
+            return Some((bucket.clone(), node.clone()));
+        }
+    }
+    None
+}
+
+/// Locate the bucket object that owns this `unified_stories_with_notes`.
+fn find_bucket_containing<'a>(root: &'a Value, needle: &Value) -> Option<&'a Value> {
+    match root {
+        Value::Object(map) => {
+            if let Some(usn) = map.get("unified_stories_with_notes") {
+                if std::ptr::eq(usn as *const _, needle as *const _) {
+                    return Some(root);
+                }
+                // pointer equality won't work after a clone — fall back to structural match
+                if usn == needle {
+                    return Some(root);
+                }
+            }
+            for v in map.values() {
+                if let Some(found) = find_bucket_containing(v, needle) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                if let Some(found) = find_bucket_containing(v, needle) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}

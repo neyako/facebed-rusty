@@ -1,0 +1,247 @@
+use crate::config::Config;
+use crate::crawler;
+use crate::embed::{
+    format_error_embed, format_full_post_embed, format_redirect_page, format_reel_post_embed,
+};
+use crate::error::FacebedError;
+use crate::fetch::{resolve_share_link, Fetcher};
+use crate::notifier::Notifier;
+use crate::parsers::{
+    json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
+    single_photo::SinglePhotoParser, stories::StoriesParser, video_watch::VideoWatchParser,
+    ParsedPost, Parser, ParserCtx,
+};
+use crate::url_clean;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use std::sync::Arc;
+use tracing::{error, info, warn};
+use url::Url;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub ctx: Arc<ParserCtx>,
+    pub notifier: Notifier,
+    pub fetcher: Arc<Fetcher>,
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/favicon.ico", get(favicon))
+        .route("/banner.png", get(banner))
+        .route("/*path", get(catch_all))
+        .with_state(state)
+}
+
+async fn root() -> impl IntoResponse {
+    match tokio::fs::read_to_string("assets/index.html").await {
+        Ok(s) => {
+            let body = s.replace("{|CREDIT|}", crate::embed::credit());
+            html_response(body)
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "").into_response(),
+    }
+}
+
+async fn favicon() -> impl IntoResponse {
+    static_asset("assets/favicon.ico", "image/x-icon").await
+}
+
+async fn banner() -> impl IntoResponse {
+    static_asset("assets/banner.png", "image/png").await
+}
+
+async fn static_asset(path: &str, ct: &'static str) -> Response {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(ct));
+            (StatusCode::OK, headers, bytes).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "").into_response(),
+    }
+}
+
+fn html_response(body: String) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, body).into_response()
+}
+
+static RE_REEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?reel/[0-9]+").unwrap());
+static RE_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"/videos/(\d+).*").unwrap());
+static RE_PHOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
+static RE_WATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*watch").unwrap());
+static RE_SHARE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
+static RE_SHARE_PR: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/([pr]/)?[a-zA-Z0-9\-._]*(/)?").unwrap());
+static RE_STORIES: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?stories/\d+/[A-Za-z0-9=_-]+").unwrap());
+
+fn is_facebook_url(path: &str) -> bool {
+    let username_pat = r"[a-zA-Z0-9\-._]*";
+    let full = format!("https://www.facebook.com/{path}");
+    let Ok(parsed) = Url::parse(&full) else { return false };
+    let p = parsed.path();
+    let is_group = Regex::new(&format!("^/groups/{username_pat}")).unwrap().is_match(p);
+    let is_permalink = p.starts_with("/permalink.php");
+    let is_story = p.starts_with("/story.php");
+    let is_post = Regex::new(&format!("/{username_pat}/posts")).unwrap().is_match(p);
+    let is_photo = p.starts_with("/photo");
+    is_permalink || is_post || is_story || is_photo || is_group
+}
+
+async fn catch_all(
+    State(state): State<AppState>,
+    axum::extract::Path(mut path): axum::extract::Path<String>,
+    raw_query: axum::extract::RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(q) = raw_query.0 {
+        if !q.is_empty() {
+            path = format!("{path}?{q}");
+        }
+    }
+    info!(path = %path, "request");
+
+    // image-in-comment priority
+    if let Ok(parsed) = Url::parse(&format!("https://www.facebook.com/{path}")) {
+        let types: Vec<String> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "type")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        if types.iter().any(|t| t.contains('3')) {
+            return process(&state, &path, ParserKind::Photocom).await;
+        }
+    }
+
+    // crawler gate
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crawler::is_crawler(ua) {
+        let target = url_clean::ensure_absolute(&path);
+        let body = format_redirect_page(&target);
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(axum::http::header::LOCATION, HeaderValue::from_str(&target).unwrap_or_else(|_| HeaderValue::from_static("/")));
+        hdrs.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+        return (StatusCode::MOVED_PERMANENTLY, hdrs, body).into_response();
+    }
+
+    // share link resolve
+    let mut working = path.clone();
+    if RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working) {
+        match resolve_share_link(&state.fetcher, &working).await {
+            Ok(p) if !p.is_empty() => working = p,
+            Ok(_) => {
+                return html_response(format_error_embed(&url_clean::ensure_absolute(&working), "C"));
+            }
+            Err(e) => return error_response(&state, &working, e),
+        }
+    }
+
+    // strip tracking AFTER share resolve
+    working = url_clean::clean_path(&working);
+
+    // /videos/<id> → reel/<id>
+    if let Some(caps) = RE_VIDEOS.captures(&working) {
+        working = format!("reel/{}", &caps[1]);
+    }
+
+    // dispatch
+    let kind = if RE_STORIES.is_match(&working) {
+        ParserKind::Stories
+    } else if RE_REEL.is_match(&working) {
+        ParserKind::Reels
+    } else if path_only(&working).map(|p| RE_PHOTO.is_match(&p)).unwrap_or(false) {
+        ParserKind::SinglePhoto
+    } else if path_only(&working).map(|p| RE_WATCH.is_match(&p)).unwrap_or(false) {
+        ParserKind::Watch
+    } else if is_facebook_url(&working) {
+        ParserKind::JsonPost
+    } else {
+        return html_response(format_error_embed("https://git.facebed.com", "C"));
+    };
+
+    process(&state, &working, kind).await
+}
+
+fn path_only(s: &str) -> Option<String> {
+    Url::parse(&format!("https://www.facebook.com/{}", s.trim_start_matches('/')))
+        .ok()
+        .map(|u| u.path().to_owned())
+}
+
+#[derive(Clone, Copy)]
+enum ParserKind {
+    JsonPost,
+    SinglePhoto,
+    Photocom,
+    Reels,
+    Watch,
+    Stories,
+}
+
+async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
+    let result = match kind {
+        ParserKind::JsonPost => JsonPostParser.process(&state.ctx, path).await,
+        ParserKind::SinglePhoto => SinglePhotoParser.process(&state.ctx, path).await,
+        ParserKind::Photocom => PhotocomParser.process(&state.ctx, path).await,
+        ParserKind::Reels => ReelsParser.process(&state.ctx, path).await,
+        ParserKind::Watch => VideoWatchParser.process(&state.ctx, path).await,
+        ParserKind::Stories => StoriesParser.process(&state.ctx, path).await,
+    };
+
+    match result {
+        Ok(post) => html_response(render(&post, state.config.timezone, kind)),
+        Err(e) => error_response(state, path, e),
+    }
+}
+
+fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
+    let is_reel_like = matches!(kind, ParserKind::Reels | ParserKind::Watch) || !post.video_links.is_empty();
+    if is_reel_like {
+        format_reel_post_embed(post, tz)
+    } else {
+        format_full_post_embed(post, tz)
+    }
+}
+
+fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
+    let url = url_clean::ensure_absolute(path);
+    let code = e.error_code();
+    match &e {
+        FacebedError::NoData(msg) => {
+            info!(path = %path, "no data: {}", msg);
+        }
+        FacebedError::Parse { message, html, url: u } => {
+            error!(path = %path, error = %message, "parser bug");
+            let page_url = u.clone().unwrap_or_else(|| url.clone());
+            let warn_msg = format!("🚨 **ParseException** for `{path}`\n{page_url}\n`{message}`");
+            if let Some(h) = html {
+                let safe = path
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .take(80)
+                    .collect::<String>();
+                state.notifier.warn(warn_msg, Some((format!("{safe}.html"), h.clone().into_bytes())));
+            } else {
+                state.notifier.warn(warn_msg, None);
+            }
+        }
+        _ => {
+            warn!(path = %path, error = %e, "unclassified error");
+        }
+    }
+    html_response(format_error_embed(&url, code))
+}

@@ -1,0 +1,15 @@
+services:
+  facebed:
+    build: .
+    image: facebed:latest
+    container_name: facebed
+    restart: unless-stopped
+    ports:
+      - "9812:9812"
+    volumes:
+      # YAML config. Required even if empty — see config.example.yaml.
+      - ./config.yaml:/facebed/config.yaml:ro
+      # Cookies (optional). Cookie-Editor JSON or multi-account format.
+      - ./cookies.json:/facebed/cookies.json:ro
+    environment:
+      RUST_LOG: info

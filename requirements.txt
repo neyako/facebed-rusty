@@ -1,8 +1,0 @@
-stealth_requests
-requests~=2.32.3
-bottle~=0.13.2
-beautifulsoup4~=4.13.3
-discord-webhook~=1.4.1
-yattag~=1.16.1
-PyYAML~=6.0.2
-crawler-user-agents
