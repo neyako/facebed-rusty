@@ -4,7 +4,7 @@ use crate::embed::{
     format_error_embed, format_full_post_embed, format_redirect_page, format_reel_post_embed,
 };
 use crate::error::FacebedError;
-use crate::fetch::{resolve_share_link, Fetcher};
+use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
 use crate::notifier::Notifier;
 use crate::parsers::{
     json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
@@ -110,7 +110,12 @@ async fn catch_all(
             path = format!("{path}?{q}");
         }
     }
-    info!(path = %path, "request");
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let is_bot = crawler::is_crawler(ua);
+    info!(path = %path, bot = is_bot, ua = %ua, "request");
 
     // image-in-comment priority
     if let Ok(parsed) = Url::parse(&format!("https://www.facebook.com/{path}")) {
@@ -125,11 +130,7 @@ async fn catch_all(
     }
 
     // crawler gate
-    let ua = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !crawler::is_crawler(ua) {
+    if !is_bot {
         let target = url_clean::ensure_absolute(&path);
         let body = format_redirect_page(&target);
         let mut hdrs = HeaderMap::new();
@@ -193,19 +194,71 @@ enum ParserKind {
 }
 
 async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
-    let result = match kind {
+    // Retry across every cookie account. With multi-account setups, a given post
+    // may only be visible to some accounts — round-robin happily picks ones that
+    // can't view it. We loop deterministically through all accounts (seeded from
+    // the current round-robin cursor so cold requests still rotate fairly) and
+    // bail to error_response only after every account has failed.
+    let n = state.ctx.cookies.len();
+    let attempts = n.max(1);
+    let start = state.ctx.cookies.cursor();
+    let mut last_err: Option<FacebedError> = None;
+    let advance_cursor = n > 0;
+
+    for attempt in 0..attempts {
+        let account_index = start.wrapping_add(attempt);
+        let result = if n > 0 {
+            ACCOUNT_OVERRIDE
+                .scope(account_index, run_parser(state, path, kind))
+                .await
+        } else {
+            run_parser(state, path, kind).await
+        };
+
+        match result {
+            Ok(post) => {
+                if advance_cursor {
+                    state.ctx.cookies.advance_cursor();
+                }
+                return html_response(render(&post, state.config.timezone, kind));
+            }
+            Err(e) if is_retryable(&e) && attempt + 1 < attempts => {
+                warn!(path = %path, attempt, error = %e, "retrying with next account");
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => {
+                if advance_cursor {
+                    state.ctx.cookies.advance_cursor();
+                }
+                return error_response(state, path, e);
+            }
+        }
+    }
+
+    if advance_cursor {
+        state.ctx.cookies.advance_cursor();
+    }
+    error_response(
+        state,
+        path,
+        last_err.unwrap_or_else(|| FacebedError::no_data(String::from("no accounts available"))),
+    )
+}
+
+async fn run_parser(state: &AppState, path: &str, kind: ParserKind) -> Result<ParsedPost, FacebedError> {
+    match kind {
         ParserKind::JsonPost => JsonPostParser.process(&state.ctx, path).await,
         ParserKind::SinglePhoto => SinglePhotoParser.process(&state.ctx, path).await,
         ParserKind::Photocom => PhotocomParser.process(&state.ctx, path).await,
         ParserKind::Reels => ReelsParser.process(&state.ctx, path).await,
         ParserKind::Watch => VideoWatchParser.process(&state.ctx, path).await,
         ParserKind::Stories => StoriesParser.process(&state.ctx, path).await,
-    };
-
-    match result {
-        Ok(post) => html_response(render(&post, state.config.timezone, kind)),
-        Err(e) => error_response(state, path, e),
     }
+}
+
+fn is_retryable(e: &FacebedError) -> bool {
+    matches!(e, FacebedError::NoData(_) | FacebedError::Parse { .. })
 }
 
 fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {

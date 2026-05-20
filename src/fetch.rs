@@ -9,6 +9,13 @@ use scraper::{Html, Selector};
 use serde_json::Value;
 use std::sync::Arc;
 
+tokio::task_local! {
+    /// When set, [`Fetcher::fetch`] uses this account index (modulo account count)
+    /// instead of round-robin. Used by the per-request retry loop to deterministically
+    /// rotate through every cookie account.
+    pub static ACCOUNT_OVERRIDE: usize;
+}
+
 pub struct Fetcher {
     client: Client,
     cookies: Arc<CookieJar>,
@@ -66,7 +73,12 @@ impl Fetcher {
             req = req.header(*k, *v);
         }
         if use_cookies {
-            if let Some(acc) = self.cookies.next_account() {
+            let acc = ACCOUNT_OVERRIDE
+                .try_with(|i| self.cookies.account_at(*i))
+                .ok()
+                .flatten()
+                .or_else(|| self.cookies.next_account());
+            if let Some(acc) = acc {
                 req = req.header("cookie", acc.header_value());
             }
         }
