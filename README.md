@@ -63,12 +63,23 @@ serves plain HTTP on the configured port.
 ## Cookies
 
 facebed can fetch private content (friends-only posts, private groups, viewable stories) when
-authenticated. Cookies are loaded from `./cookies.json`. Two shapes are accepted:
+authenticated. Cookies are loaded from `./cookies.json` AND any sibling file matching
+`cookies*.json` (e.g. `cookies-alice.json`, `cookies2.json`, `cookies-neyako.json`). Each file
+contributes one or more accounts to a round-robin pool; the account label is taken from the
+filename when it isn't supplied in the file itself.
 
-1. **Single account** — a flat Cookie-Editor JSON export (array of `{name, value, expirationDate, ...}`).
-   Treated as one account labeled `default`.
-2. **Multi-account** — an object `{"accounts": [{"label": "...", "entries": [...]}, ...]}`. Requests
-   round-robin across accounts so different accounts can view different friends/groups.
+Two file shapes are accepted:
+
+1. **Flat Cookie-Editor export** — a JSON array of `{name, value, expirationDate, ...}`. Becomes
+   one account; the label is the part of the filename after `cookies` (so `cookies-alice.json`
+   → `alice`, plain `cookies.json` → `default`).
+2. **Multi-account object** — `{"accounts": [{"label": "...", "entries": [...]}, ...]}`. Each
+   listed account is loaded with its declared label.
+
+Easiest way to add another account: drop the Cookie-Editor export as
+`cookies-<name>.json` next to the existing `cookies.json`. No config edit needed. When running
+in Docker, also add a matching volume mount in `docker-compose.yml` (commented examples are
+included).
 
 When any cookie is past its `expirationDate`, facebed posts a `@everyone cookies expired` alert
 to the Discord webhook configured in `notifier_webhook`.
