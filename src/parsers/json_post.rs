@@ -4,6 +4,8 @@ use crate::jq;
 use crate::parsers::util::{interaction_counts, val_str_at, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use scraper::Html;
 use serde_json::Value;
 
@@ -14,7 +16,8 @@ impl Parser for JsonPostParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
         let html = page.parse();
-        let post_json = get_post_json(&html).ok_or_else(|| {
+        let post_id = extract_post_id(post_path);
+        let post_json = get_post_json(&html, post_id.as_deref()).ok_or_else(|| {
             FacebedError::parse_with(
                 "cannot find post json",
                 page.html.clone(),
@@ -63,13 +66,58 @@ impl Parser for JsonPostParser {
     }
 }
 
-fn get_post_json(html: &Html) -> Option<Value> {
+/// Find the JSON block describing the requested post. When `post_id` is provided, only
+/// blocks whose serialized payload mentions that ID are accepted — without this guard
+/// FB feeds (group landing pages, ad-injected feeds) cause the parser to latch onto
+/// whichever featured/suggested post happens to be the biggest block, returning a
+/// completely unrelated embed (e.g. a Meta-for-Business ad).
+fn get_post_json(html: &Html, post_id: Option<&str>) -> Option<Value> {
+    // First pass: id-aware match.
+    if let Some(pid) = post_id {
+        for bloc in get_json_blocks(html, true) {
+            if !jq::has(&bloc, &["i18n_reaction_count"]) {
+                continue;
+            }
+            let s = serde_json::to_string(&bloc).unwrap_or_default();
+            if s.contains(pid) {
+                return Some(bloc);
+            }
+        }
+        // No block matched the requested id — return None so the caller can raise
+        // NoData/Parse instead of serving a wrong-post embed. Falling back to any
+        // i18n_reaction_count block here is what produced the bug.
+        return None;
+    }
+
+    // No id available (very old paths) — fall back to first reaction block.
     for bloc in get_json_blocks(html, true) {
         if jq::has(&bloc, &["i18n_reaction_count"]) {
             return Some(bloc);
         }
     }
     None
+}
+
+static POST_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)
+        /posts/(\d+)
+        | /permalink/(\d+)
+        | story_fbid=(\d+)
+        | multi_permalinks=(\d+)
+        | /videos/(?:[^/]+/)?(\d+)
+        | /reel/(\d+)
+        ",
+    )
+    .unwrap()
+});
+
+fn extract_post_id(post_path: &str) -> Option<String> {
+    POST_ID_RE
+        .captures(post_path)?
+        .iter()
+        .skip(1)
+        .find_map(|m| m.map(|x| x.as_str().to_owned()))
 }
 
 fn get_root_node(post_json: &Value) -> Option<&Value> {
