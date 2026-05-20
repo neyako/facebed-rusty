@@ -78,8 +78,11 @@ impl Fetcher {
     }
 }
 
-/// Resolve a `/share/v/...` or `/share/[pr]/...` link via redirect-follow.
-/// Returns the resolved path (no host), or empty if it stays on /share/.
+/// Resolve a `/share/v/...` or `/share/[pr]/...` link.
+/// First tries the HTTP redirect chain; falls back to parsing `og:url` from the
+/// share page when FB serves it as a 200 (no redirect) — that page still carries
+/// the canonical post URL.
+/// Returns the resolved path (no host), or empty if neither resolves off /share/.
 pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<String> {
     let url = ensure_absolute(path);
     let mut req = fetcher.client().get(&url);
@@ -88,17 +91,49 @@ pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<
     }
     let resp = req.send().await?;
     let final_url = resp.url().to_string();
-    let unchanged = final_url == url
+    let body = resp.text().await?;
+
+    let still_on_share = final_url == url
         || final_url.starts_with("https://www.facebook.com/share")
         || final_url.starts_with("http://www.facebook.com/share");
-    if unchanged {
+
+    let resolved = if !still_on_share {
+        final_url
+    } else if let Some(u) = extract_canonical_url(&body) {
+        u
+    } else {
         return Ok(String::new());
-    }
-    let stripped = final_url
+    };
+
+    let stripped = resolved
         .trim_start_matches("https://www.facebook.com/")
         .trim_start_matches("http://www.facebook.com/")
         .to_owned();
     Ok(stripped)
+}
+
+/// Pull the post's canonical URL out of an FB share-page HTML body. Tries
+/// `<link rel="canonical">` first, falls back to `<meta property="og:url">`.
+/// Skips values that point back at /share/ to avoid loops.
+fn extract_canonical_url(body: &str) -> Option<String> {
+    let doc = Html::parse_document(body);
+    let canon_sel = Selector::parse(r#"link[rel="canonical"]"#).unwrap();
+    if let Some(el) = doc.select(&canon_sel).next() {
+        if let Some(href) = el.value().attr("href") {
+            if !href.contains("/share/") {
+                return Some(href.to_owned());
+            }
+        }
+    }
+    let og_sel = Selector::parse(r#"meta[property="og:url"]"#).unwrap();
+    for el in doc.select(&og_sel) {
+        if let Some(content) = el.value().attr("content") {
+            if !content.contains("/share/") {
+                return Some(content.to_owned());
+            }
+        }
+    }
+    None
 }
 
 static LOGIN_HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"/login\b").unwrap());

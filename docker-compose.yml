@@ -1,7 +1,6 @@
 services:
   facebed:
-    build: .
-    image: facebed:latest
+    image: ghcr.io/neyako/facebed:latest
     container_name: facebed
     restart: unless-stopped
     ports:

@@ -3,7 +3,7 @@ use chrono::{FixedOffset, TimeZone};
 use html_escape::encode_quoted_attribute;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-const CREDIT: &str = "facebed by pi.kt";
+const CREDIT: &str = "facebed on Rust";
 
 /// Match Python `quote()` — percent-encode the same special chars.
 const UNSAFE: &AsciiSet = &CONTROLS
@@ -53,11 +53,14 @@ fn format_reactions(likes: &str, cmts: &str, shares: &str) -> String {
 }
 
 pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
-    if !post.video_links.is_empty() {
-        return format_reel_post_embed(post, tz_offset);
-    }
     let mut images = post.image_links.clone();
-    let extra = if images.len() > 4 { "\ncontains 4+ images".to_string() } else { String::new() };
+    let mut extra = String::new();
+    if images.len() > 4 {
+        extra.push_str("\ncontains 4+ images");
+    }
+    if !post.video_links.is_empty() {
+        extra.push_str("\n🎥 also contains video");
+    }
     images.truncate(4);
     let image_meta = images
         .iter()
@@ -161,7 +164,7 @@ pub fn format_error_embed(original_url: &str, error_code: &str) -> String {
     <meta name="theme-color" content="#2c3048f" />
     <meta property="og:title" content="Log in or sign up to view{suffix}"/>
     <meta property="og:description" content="See posts, photos and more on Facebook.
-If viewable in incognito report to git.facebed.com"/>
+@neyako for cookies donation"/>
     <meta http-equiv="refresh" content="0;url={url_q}"/>
 </head>
 </html>"##,
