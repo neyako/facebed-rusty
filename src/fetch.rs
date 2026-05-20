@@ -72,6 +72,7 @@ impl Fetcher {
         for (k, v) in HEADERS {
             req = req.header(*k, *v);
         }
+        let mut account_label = String::new();
         if use_cookies {
             let acc = ACCOUNT_OVERRIDE
                 .try_with(|i| self.cookies.account_at(*i))
@@ -79,11 +80,15 @@ impl Fetcher {
                 .flatten()
                 .or_else(|| self.cookies.next_account());
             if let Some(acc) = acc {
+                account_label = acc.label.clone();
                 req = req.header("cookie", acc.header_value());
             }
         }
         let resp = req.send().await?;
+        let status = resp.status();
+        let final_url = resp.url().to_string();
         let html = resp.text().await?;
+        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), "fetch done");
         let page = FetchedPage { url, html };
         check_or_raise(&page, post_path)?;
         Ok(page)
