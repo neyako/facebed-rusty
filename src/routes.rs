@@ -79,7 +79,7 @@ fn html_response(body: String) -> Response {
 }
 
 static RE_REEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?reel/[0-9]+").unwrap());
-static RE_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"/videos/(\d+).*").unwrap());
+static RE_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"/videos/(?:[^/]+/)?(\d+)").unwrap());
 static RE_PHOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
 static RE_WATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*watch").unwrap());
 static RE_SHARE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
@@ -209,8 +209,13 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
 }
 
 fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
-    let is_reel_like = matches!(kind, ParserKind::Reels | ParserKind::Watch) || !post.video_links.is_empty();
-    if is_reel_like {
+    // Reels/Watch always render as a video card. For mixed-media JsonPosts (video
+    // + images), prefer the image-grid embed so Discord can show the photos and
+    // text — Discord only renders one og:video per embed anyway, so the video
+    // alone hid the rest of the post.
+    let force_reel = matches!(kind, ParserKind::Reels | ParserKind::Watch);
+    let video_only = !post.video_links.is_empty() && post.image_links.is_empty();
+    if force_reel || video_only {
         format_reel_post_embed(post, tz)
     } else {
         format_full_post_embed(post, tz)
