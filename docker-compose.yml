@@ -9,6 +9,11 @@ services:
       # YAML config. Required even if empty — see config.example.yaml.
       - ./config.yaml:/facebed/config.yaml:ro
       # Cookies (optional). Cookie-Editor JSON or multi-account format.
+      # Drop additional accounts as cookies-<name>.json next to this file and
+      # uncomment matching mounts below — each sibling cookies*.json is picked
+      # up automatically.
       - ./cookies.json:/facebed/cookies.json:ro
+      # - ./cookies-alice.json:/facebed/cookies-alice.json:ro
+      # - ./cookies-bob.json:/facebed/cookies-bob.json:ro
     environment:
       RUST_LOG: info
