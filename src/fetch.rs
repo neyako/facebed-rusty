@@ -40,6 +40,10 @@ impl FetchedPage {
     }
 }
 
+/// Fallback UA when an account has no `user_agent` set in its cookie file
+/// and for anonymous (no-cookie) requests.
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+
 const HEADERS: &[(&str, &str)] = &[
     ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
     ("accept-language", "en-US,en;q=0.9"),
@@ -48,7 +52,6 @@ const HEADERS: &[(&str, &str)] = &[
     ("priority", "u=0, i"),
     ("sec-fetch-mode", "navigate"),
     ("sec-fetch-site", "none"),
-    ("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"),
 ];
 
 impl Fetcher {
@@ -91,6 +94,7 @@ impl Fetcher {
             req = req.header(*k, *v);
         }
         let mut account_label = String::new();
+        let mut user_agent: &str = DEFAULT_USER_AGENT;
         if use_cookies {
             let acc = ACCOUNT_OVERRIDE
                 .try_with(|i| self.cookies.account_at(*i))
@@ -100,8 +104,12 @@ impl Fetcher {
             if let Some(acc) = acc {
                 account_label = acc.label.clone();
                 req = req.header("cookie", acc.header_value());
+                if let Some(ua) = acc.user_agent.as_deref() {
+                    user_agent = ua;
+                }
             }
         }
+        req = req.header("user-agent", user_agent);
         let resp = req.send().await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
@@ -133,10 +141,6 @@ pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<
     let url = ensure_absolute(path);
     let mut req = fetcher.client().get(&url);
     for (k, v) in HEADERS {
-        // Drop our default Chrome UA — we override it below.
-        if k.eq_ignore_ascii_case("user-agent") {
-            continue;
-        }
         req = req.header(*k, *v);
     }
     req = req.header(

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::cookies::NOTIFY_FAILURE_THRESHOLD;
 use crate::crawler;
 use crate::embed::{
     format_error_embed, format_full_post_embed, format_oversized_video_embed,
@@ -195,6 +196,36 @@ fn path_only(s: &str) -> Option<String> {
         .map(|u| u.path().to_owned())
 }
 
+/// Stable identifier for "this group" or "this user" used to pin a working
+/// cookie account. Discord embeds go stale fast, so the second time a link
+/// from the same group/profile lands we want to skip the round-robin
+/// warm-up and hit the account that worked last time.
+///
+/// Returns None for shapes where the path can't identify a scope (raw
+/// reels, /watch?v=..., photo.php) — those fall back to plain round-robin.
+fn scope_key(path: &str) -> Option<String> {
+    let p = path_only(path)?;
+    let p = p.trim_start_matches('/');
+    if let Some(rest) = p.strip_prefix("groups/") {
+        let id = rest.split('/').next()?;
+        if !id.is_empty() {
+            return Some(format!("groups/{id}"));
+        }
+    }
+    let mut parts = p.split('/');
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if !first.is_empty()
+        && matches!(
+            second,
+            "posts" | "videos" | "photos" | "timeline" | "reels" | "media"
+        )
+    {
+        return Some(format!("user/{first}"));
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ParserKind {
     JsonPost,
@@ -221,9 +252,13 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     let start = state.ctx.cookies.cursor();
     let mut last_err: Option<FacebedError> = None;
     let advance_cursor = n > 0;
+    let key = scope_key(path);
 
     // Build ordering: healthy accounts first (in round-robin order), then
     // cooldowned ones as fallback. With n=0 (anonymous) we still loop once.
+    // If we've previously seen an account succeed for this group/user, hoist
+    // it to the front of the healthy list — Discord embeds expire if the
+    // first try is slow, so skipping the warm-up matters here.
     let order: Vec<usize> = if n > 0 {
         let mut healthy = Vec::new();
         let mut cooled = Vec::new();
@@ -233,6 +268,14 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 cooled.push(i);
             } else {
                 healthy.push(i);
+            }
+        }
+        if let Some(k) = key.as_deref() {
+            if let Some(pref) = state.ctx.cookies.affinity_for(k) {
+                if let Some(pos) = healthy.iter().position(|&i| i == pref) {
+                    let e = healthy.remove(pos);
+                    healthy.insert(0, e);
+                }
             }
         }
         healthy.into_iter().chain(cooled).collect()
@@ -254,13 +297,22 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 if advance_cursor {
                     state.ctx.cookies.mark_ok(account_index);
                     state.ctx.cookies.advance_cursor();
+                    if let Some(k) = key.as_deref() {
+                        state.ctx.cookies.set_affinity(k.to_string(), account_index);
+                    }
                 }
                 let body = render_with_size_check(state, &post, kind).await;
                 return html_response(body);
             }
             Err(e) if is_retryable(&e) && loop_idx + 1 < order.len() => {
                 if advance_cursor {
-                    state.ctx.cookies.mark_failed(account_index);
+                    let count = state.ctx.cookies.mark_failed(account_index);
+                    maybe_notify_bad_account(state, account_index, count, &e);
+                    if let Some(k) = key.as_deref() {
+                        if state.ctx.cookies.affinity_for(k) == Some(account_index) {
+                            state.ctx.cookies.forget_affinity(k);
+                        }
+                    }
                 }
                 let label = state.ctx.cookies.label_at(account_index).unwrap_or("?");
                 warn!(path = %path, attempt = loop_idx, account = %label, error = %e, "retrying with next account");
@@ -269,7 +321,8 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
             }
             Err(e) => {
                 if advance_cursor {
-                    state.ctx.cookies.mark_failed(account_index);
+                    let count = state.ctx.cookies.mark_failed(account_index);
+                    maybe_notify_bad_account(state, account_index, count, &e);
                     state.ctx.cookies.advance_cursor();
                 }
                 return error_response(state, path, e);
@@ -345,6 +398,28 @@ async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: Parse
     format_oversized_video_embed(post, tz)
 }
 
+/// Fire a Discord webhook when an account has failed [`NOTIFY_FAILURE_THRESHOLD`]
+/// times in a row. Resets the counter afterwards so the next bad streak
+/// re-alerts instead of spamming on every subsequent failure.
+fn maybe_notify_bad_account(state: &AppState, account_index: usize, count: u64, e: &FacebedError) {
+    if count != NOTIFY_FAILURE_THRESHOLD {
+        return;
+    }
+    let label = state
+        .ctx
+        .cookies
+        .label_at(account_index)
+        .unwrap_or("?")
+        .to_owned();
+    let msg = format!(
+        "@everyone account `{label}` failed {count}× in a row — cookie likely expired or checkpointed. \
+         Please re-export and update `cookies-{label}.json`. Last error: `{e}`"
+    );
+    warn!(account = %label, count, "notifying admin about bad account");
+    state.notifier.warn(msg, None);
+    state.ctx.cookies.reset_failure_count(account_index);
+}
+
 fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
     let url = url_clean::ensure_absolute(path);
     let code = e.error_code();
@@ -372,4 +447,40 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
         }
     }
     html_response(format_error_embed(&url, code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_key;
+
+    #[test]
+    fn group_path_extracts_group_id() {
+        assert_eq!(scope_key("groups/12345/posts/678"), Some("groups/12345".into()));
+        assert_eq!(scope_key("/groups/foo.bar"), Some("groups/foo.bar".into()));
+    }
+
+    #[test]
+    fn user_post_path_extracts_username() {
+        assert_eq!(scope_key("alice/posts/123"), Some("user/alice".into()));
+        assert_eq!(scope_key("zuck/videos/abc/456"), Some("user/zuck".into()));
+        assert_eq!(scope_key("page.name/photos/123"), Some("user/page.name".into()));
+        assert_eq!(scope_key("u-name/reels/123"), Some("user/u-name".into()));
+    }
+
+    #[test]
+    fn unscoped_paths_return_none() {
+        assert_eq!(scope_key("reel/12345"), None);
+        assert_eq!(scope_key("watch?v=12345"), None);
+        assert_eq!(scope_key("photo.php?fbid=1&id=2"), None);
+        assert_eq!(scope_key("permalink.php?story_fbid=1&id=2"), None);
+        assert_eq!(scope_key("alice"), None);
+    }
+
+    #[test]
+    fn query_string_does_not_affect_key() {
+        assert_eq!(
+            scope_key("groups/12345/posts/678?some=tracker"),
+            Some("groups/12345".into())
+        );
+    }
 }
