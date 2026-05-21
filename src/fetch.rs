@@ -44,6 +44,18 @@ impl FetchedPage {
 /// and for anonymous (no-cookie) requests.
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 
+/// Append a `_cb=<unix-millis>` query param so FB's edge cache can't serve
+/// a stale snapshot of the post (reaction counts, comments, edits). FB
+/// silently ignores unknown params, so this is safe across all post shapes.
+fn with_cache_buster(url: &str) -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}_cb={ms}")
+}
+
 const HEADERS: &[(&str, &str)] = &[
     ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
     ("accept-language", "en-US,en;q=0.9"),
@@ -88,7 +100,7 @@ impl Fetcher {
 
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
-        let url = ensure_absolute(post_path);
+        let url = with_cache_buster(&ensure_absolute(post_path));
         let mut req = self.client.get(&url);
         for (k, v) in HEADERS {
             req = req.header(*k, *v);

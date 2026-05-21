@@ -77,12 +77,19 @@ impl<'a> Story<'a> {
             Some(other) => other.to_string(),
             None => String::new(),
         };
-        let text = story_json
+        let mut text = story_json
             .get("message")
             .and_then(|m| m.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_owned();
+        if let Some((title, link_url)) = extract_link_card(story_json) {
+            if title.is_empty() {
+                text.push_str(&format!("\n🔗 {}", link_url));
+            } else {
+                text.push_str(&format!("\n🔗 {}: {}", title, link_url));
+            }
+        }
         let url = val_str_at(story_json, "wwwURL").unwrap_or("").to_owned();
 
         let mut image_links = images_from_post(story_json);
@@ -288,6 +295,29 @@ pub fn thumbnail_in_node(node: &Value) -> Option<String> {
                 }
             }
         }
+    }
+    None
+}
+
+/// Extract the first link-card attachment from a story subtree: `(title, url)`
+/// for `attachment.target.external_url`. FB posts that are just a shared link
+/// (with optional preview title) have no `message.text`, so without this the
+/// embed body comes back empty. `title` may be empty when FB renders only the
+/// URL. Scan is recursive — same behavior as the upstream JS reference.
+pub fn extract_link_card(story_json: &Value) -> Option<(String, String)> {
+    for attachment in jq::all(story_json, "attachment") {
+        let Some(target) = attachment.get("target") else { continue };
+        let Some(url) = target.get("external_url").and_then(|u| u.as_str()) else { continue };
+        if url.is_empty() {
+            continue;
+        }
+        let title = attachment
+            .get("title_with_entities")
+            .and_then(|t| t.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_owned();
+        return Some((title, url.to_owned()));
     }
     None
 }
