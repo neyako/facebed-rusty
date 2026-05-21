@@ -211,14 +211,36 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     // can't view it. We loop deterministically through all accounts (seeded from
     // the current round-robin cursor so cold requests still rotate fairly) and
     // bail to error_response only after every account has failed.
+    //
+    // Cooldown: accounts that failed recently are skipped on the first pass so
+    // we don't pay a slow FB round-trip on a checkpointed/expired account
+    // every other request. They're still tried as a last resort if no healthy
+    // account succeeded.
     let n = state.ctx.cookies.len();
     let attempts = n.max(1);
     let start = state.ctx.cookies.cursor();
     let mut last_err: Option<FacebedError> = None;
     let advance_cursor = n > 0;
 
-    for attempt in 0..attempts {
-        let account_index = start.wrapping_add(attempt);
+    // Build ordering: healthy accounts first (in round-robin order), then
+    // cooldowned ones as fallback. With n=0 (anonymous) we still loop once.
+    let order: Vec<usize> = if n > 0 {
+        let mut healthy = Vec::new();
+        let mut cooled = Vec::new();
+        for attempt in 0..attempts {
+            let i = start.wrapping_add(attempt) % n;
+            if state.ctx.cookies.in_cooldown(i) {
+                cooled.push(i);
+            } else {
+                healthy.push(i);
+            }
+        }
+        healthy.into_iter().chain(cooled).collect()
+    } else {
+        vec![0]
+    };
+
+    for (loop_idx, &account_index) in order.iter().enumerate() {
         let result = if n > 0 {
             ACCOUNT_OVERRIDE
                 .scope(account_index, run_parser(state, path, kind))
@@ -230,18 +252,24 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
         match result {
             Ok(post) => {
                 if advance_cursor {
+                    state.ctx.cookies.mark_ok(account_index);
                     state.ctx.cookies.advance_cursor();
                 }
                 let body = render_with_size_check(state, &post, kind).await;
                 return html_response(body);
             }
-            Err(e) if is_retryable(&e) && attempt + 1 < attempts => {
-                warn!(path = %path, attempt, error = %e, "retrying with next account");
+            Err(e) if is_retryable(&e) && loop_idx + 1 < order.len() => {
+                if advance_cursor {
+                    state.ctx.cookies.mark_failed(account_index);
+                }
+                let label = state.ctx.cookies.label_at(account_index).unwrap_or("?");
+                warn!(path = %path, attempt = loop_idx, account = %label, error = %e, "retrying with next account");
                 last_err = Some(e);
                 continue;
             }
             Err(e) => {
                 if advance_cursor {
+                    state.ctx.cookies.mark_failed(account_index);
                     state.ctx.cookies.advance_cursor();
                 }
                 return error_response(state, path, e);
