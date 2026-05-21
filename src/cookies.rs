@@ -1,7 +1,8 @@
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -21,6 +22,10 @@ pub struct CookieEntry {
 pub struct CookieAccount {
     pub label: String,
     pub entries: Vec<CookieEntry>,
+    /// Optional UA override for this account. Lets each account look like a
+    /// different browser/device to FB, which makes a multi-account setup
+    /// look less like a single scraper hammering with rotated cookies.
+    pub user_agent: Option<String>,
 }
 
 impl CookieAccount {
@@ -45,6 +50,17 @@ impl CookieAccount {
 /// also in cooldown, so a transient blip doesn't lock everyone out.
 pub const ACCOUNT_COOLDOWN_SECS: u64 = 300;
 
+/// Max distinct scope keys retained in the affinity map. Past this, we drop
+/// an arbitrary entry on insert to bound memory. Affinity is a hint, not a
+/// correctness invariant, so eviction is cheap.
+pub const AFFINITY_CAP: usize = 1024;
+
+/// Number of consecutive failures on the same account that triggers an
+/// admin notification. One or two failures can be transient FB blips; three
+/// in a row almost always means the cookie is expired/checkpointed and
+/// needs human attention.
+pub const NOTIFY_FAILURE_THRESHOLD: u64 = 3;
+
 /// Pool of accounts. Empty pool = anonymous fetches.
 #[derive(Debug)]
 pub struct CookieJar {
@@ -53,6 +69,16 @@ pub struct CookieJar {
     /// Per-account "last failure" unix seconds. Parallel to `accounts`.
     /// Zero means "never failed".
     last_failures: Vec<AtomicU64>,
+    /// Per-account count of consecutive failures since last success. Used
+    /// to fire an admin notification when an account looks persistently
+    /// broken (vs. a one-off transient blip).
+    consecutive_failures: Vec<AtomicU64>,
+    /// Scope key (e.g. `groups/123`, `user/alice`) -> last-successful account
+    /// index. Lets the retry loop skip the round-robin warm-up for repeat
+    /// requests against the same group/profile — important for Discord
+    /// embeds, where the link goes stale if the first fetch wastes time on
+    /// an account that can't see the post.
+    affinity: Mutex<HashMap<String, usize>>,
 }
 
 impl CookieJar {
@@ -61,6 +87,8 @@ impl CookieJar {
             accounts: Vec::new(),
             cursor: AtomicUsize::new(0),
             last_failures: Vec::new(),
+            consecutive_failures: Vec::new(),
+            affinity: Mutex::new(HashMap::new()),
         }
     }
 
@@ -137,10 +165,13 @@ impl CookieJar {
         }
 
         let last_failures = (0..accounts.len()).map(|_| AtomicU64::new(0)).collect();
+        let consecutive_failures = (0..accounts.len()).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             accounts,
             cursor: AtomicUsize::new(0),
             last_failures,
+            consecutive_failures,
+            affinity: Mutex::new(HashMap::new()),
         })
     }
 
@@ -164,7 +195,11 @@ impl CookieJar {
                 if entries.is_empty() {
                     Ok(Vec::new())
                 } else {
-                    Ok(vec![CookieAccount { label: fname_label, entries }])
+                    Ok(vec![CookieAccount {
+                        label: fname_label,
+                        entries,
+                        user_agent: None,
+                    }])
                 }
             }
             serde_json::Value::Object(_) => {
@@ -172,12 +207,18 @@ impl CookieJar {
                 struct AccountIn {
                     label: String,
                     entries: Vec<CookieEntry>,
+                    #[serde(default, rename = "user_agent", alias = "userAgent")]
+                    user_agent: Option<String>,
                 }
                 let raw_accs = v.get("accounts").cloned().unwrap_or_default();
                 let arr: Vec<AccountIn> = serde_json::from_value(raw_accs)?;
                 Ok(arr
                     .into_iter()
-                    .map(|a| CookieAccount { label: a.label, entries: a.entries })
+                    .map(|a| CookieAccount {
+                        label: a.label,
+                        entries: a.entries,
+                        user_agent: a.user_agent,
+                    })
                     .collect())
             }
             _ => anyhow::bail!("unsupported cookies file shape"),
@@ -222,23 +263,42 @@ impl CookieJar {
 
     /// Mark the account at `i` (mod len) as having just failed. Future
     /// requests skip it on first attempt for [`ACCOUNT_COOLDOWN_SECS`].
-    pub fn mark_failed(&self, i: usize) {
+    ///
+    /// Returns the new count of consecutive failures since the last
+    /// success. Callers can use this to fire admin notifications at a
+    /// chosen threshold (see [`NOTIFY_FAILURE_THRESHOLD`]).
+    pub fn mark_failed(&self, i: usize) -> u64 {
         if self.accounts.is_empty() {
-            return;
+            return 0;
         }
+        let idx = i % self.accounts.len();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.last_failures[i % self.accounts.len()].store(now, Ordering::Relaxed);
+        self.last_failures[idx].store(now, Ordering::Relaxed);
+        self.consecutive_failures[idx].fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Mark the account at `i` (mod len) as healthy — clears the cooldown.
+    /// Mark the account at `i` (mod len) as healthy — clears the cooldown
+    /// and resets the consecutive-failure counter.
     pub fn mark_ok(&self, i: usize) {
         if self.accounts.is_empty() {
             return;
         }
-        self.last_failures[i % self.accounts.len()].store(0, Ordering::Relaxed);
+        let idx = i % self.accounts.len();
+        self.last_failures[idx].store(0, Ordering::Relaxed);
+        self.consecutive_failures[idx].store(0, Ordering::Relaxed);
+    }
+
+    /// Reset the consecutive-failure counter without clearing cooldown.
+    /// Used after firing an admin notification, so we re-alert if the
+    /// account fails another N times rather than spamming every request.
+    pub fn reset_failure_count(&self, i: usize) {
+        if self.accounts.is_empty() {
+            return;
+        }
+        self.consecutive_failures[i % self.accounts.len()].store(0, Ordering::Relaxed);
     }
 
     /// True if the account at `i` is currently in cooldown.
@@ -267,6 +327,35 @@ impl CookieJar {
 
     pub fn expired_labels(&self) -> Vec<String> {
         self.accounts.iter().filter(|a| a.any_expired()).map(|a| a.label.clone()).collect()
+    }
+
+    /// Account index previously known to succeed for this scope key.
+    pub fn affinity_for(&self, key: &str) -> Option<usize> {
+        self.affinity.lock().ok()?.get(key).copied()
+    }
+
+    /// Record `account_idx` as the preferred account for `key`. Bounded by
+    /// [`AFFINITY_CAP`] — past that, an arbitrary entry is evicted.
+    pub fn set_affinity(&self, key: String, account_idx: usize) {
+        if self.accounts.is_empty() {
+            return;
+        }
+        let Ok(mut m) = self.affinity.lock() else { return };
+        if m.len() >= AFFINITY_CAP && !m.contains_key(&key) {
+            if let Some(k) = m.keys().next().cloned() {
+                m.remove(&k);
+            }
+        }
+        m.insert(key, account_idx % self.accounts.len());
+    }
+
+    /// Forget the affinity mapping for `key`. Called when the pinned
+    /// account fails — we'd rather re-discover a working one than keep
+    /// paying the slow first-try cost.
+    pub fn forget_affinity(&self, key: &str) {
+        if let Ok(mut m) = self.affinity.lock() {
+            m.remove(key);
+        }
     }
 }
 
@@ -307,6 +396,39 @@ mod tests {
     }
 
     #[test]
+    fn affinity_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(
+            &main,
+            r#"{"accounts":[{"label":"x","entries":[{"name":"c_user","value":"1"}]},{"label":"y","entries":[{"name":"c_user","value":"2"}]}]}"#,
+        ).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        assert_eq!(jar.affinity_for("groups/123"), None);
+        jar.set_affinity("groups/123".into(), 1);
+        assert_eq!(jar.affinity_for("groups/123"), Some(1));
+        jar.forget_affinity("groups/123");
+        assert_eq!(jar.affinity_for("groups/123"), None);
+    }
+
+    #[test]
+    fn affinity_index_clamped_to_account_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        jar.set_affinity("user/alice".into(), 42);
+        assert_eq!(jar.affinity_for("user/alice"), Some(0));
+    }
+
+    #[test]
+    fn affinity_noop_on_empty_jar() {
+        let jar = CookieJar::empty();
+        jar.set_affinity("user/alice".into(), 0);
+        assert_eq!(jar.affinity_for("user/alice"), None);
+    }
+
+    #[test]
     fn multi_account_object_still_works() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("cookies.json");
@@ -317,5 +439,57 @@ mod tests {
         let jar = CookieJar::load(&main).unwrap();
         let labels: Vec<_> = jar.accounts.iter().map(|a| a.label.clone()).collect();
         assert_eq!(labels, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn user_agent_parsed_per_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(
+            &main,
+            r#"{"accounts":[
+                {"label":"x","user_agent":"UA-X","entries":[{"name":"c_user","value":"1"}]},
+                {"label":"y","entries":[{"name":"c_user","value":"2"}]}
+            ]}"#,
+        ).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        assert_eq!(jar.accounts[0].user_agent.as_deref(), Some("UA-X"));
+        assert_eq!(jar.accounts[1].user_agent, None);
+    }
+
+    #[test]
+    fn flat_array_has_no_user_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        assert_eq!(jar.accounts[0].user_agent, None);
+    }
+
+    #[test]
+    fn mark_failed_returns_consecutive_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        assert_eq!(jar.mark_failed(0), 1);
+        assert_eq!(jar.mark_failed(0), 2);
+        assert_eq!(jar.mark_failed(0), 3);
+        jar.mark_ok(0);
+        assert_eq!(jar.mark_failed(0), 1);
+    }
+
+    #[test]
+    fn reset_failure_count_does_not_clear_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        jar.mark_failed(0);
+        jar.mark_failed(0);
+        assert!(jar.in_cooldown(0));
+        jar.reset_failure_count(0);
+        assert!(jar.in_cooldown(0));
+        assert_eq!(jar.mark_failed(0), 1);
     }
 }
