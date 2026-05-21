@@ -153,6 +153,20 @@ impl CookieJar {
             Err(e) => warn!("could not scan {} for cookie files: {}", parent.display(), e),
         }
 
+        // Sidecar useragents.json: { "alice": "UA-string", ... }. Lets users
+        // attach a per-account UA without editing the Cookie-Editor JSON.
+        // Only fills accounts that don't already carry a nested user_agent.
+        let ua_map = load_useragents(&parent);
+        if !ua_map.is_empty() {
+            for acc in accounts.iter_mut() {
+                if acc.user_agent.is_none() {
+                    if let Some(ua) = ua_map.get(&acc.label) {
+                        acc.user_agent = Some(ua.clone());
+                    }
+                }
+            }
+        }
+
         for acc in &accounts {
             info!("loaded {} cookies for account '{}'", acc.entries.len(), acc.label);
             if acc.any_expired() {
@@ -228,6 +242,37 @@ impl CookieJar {
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
     }
+}
+
+/// Read an optional `useragents.json` sidecar from `dir`. Shape:
+/// `{ "<account-label>": "<user-agent>", ... }`. Missing file => empty map;
+/// parse errors are warned but non-fatal so a typo doesn't take the server
+/// down.
+fn load_useragents(dir: &Path) -> HashMap<String, String> {
+    let path = dir.join("useragents.json");
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("could not read {}: {}", path.display(), e);
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_str::<HashMap<String, String>>(&raw) {
+        Ok(m) => {
+            info!("loaded {} user-agent overrides from {}", m.len(), path.display());
+            m
+        }
+        Err(e) => {
+            warn!("failed to parse {}: {}", path.display(), e);
+            HashMap::new()
+        }
+    }
+}
+
+impl CookieJar {
 
     pub fn len(&self) -> usize {
         self.accounts.len()
@@ -442,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_parsed_per_account() {
+    fn nested_user_agent_parsed_per_account() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("cookies.json");
         fs::write(
@@ -458,10 +503,63 @@ mod tests {
     }
 
     #[test]
-    fn flat_array_has_no_user_agent() {
+    fn flat_array_has_no_user_agent_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("cookies.json");
         fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        assert_eq!(jar.accounts[0].user_agent, None);
+    }
+
+    #[test]
+    fn useragents_sidecar_fills_flat_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        let alice = dir.path().join("cookies-alice.json");
+        let ua = dir.path().join("useragents.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        fs::write(&alice, r#"[{"name":"c_user","value":"2"}]"#).unwrap();
+        fs::write(&ua, r#"{"default":"UA-DEFAULT","alice":"UA-ALICE"}"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        let by_label: std::collections::HashMap<_, _> = jar
+            .accounts
+            .iter()
+            .map(|a| (a.label.clone(), a.user_agent.clone()))
+            .collect();
+        assert_eq!(by_label["default"].as_deref(), Some("UA-DEFAULT"));
+        assert_eq!(by_label["alice"].as_deref(), Some("UA-ALICE"));
+    }
+
+    #[test]
+    fn sidecar_does_not_override_nested_user_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        let ua = dir.path().join("useragents.json");
+        fs::write(
+            &main,
+            r#"{"accounts":[{"label":"x","user_agent":"UA-NESTED","entries":[{"name":"c_user","value":"1"}]}]}"#,
+        ).unwrap();
+        fs::write(&ua, r#"{"x":"UA-SIDECAR"}"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        assert_eq!(jar.accounts[0].user_agent.as_deref(), Some("UA-NESTED"));
+    }
+
+    #[test]
+    fn missing_useragents_file_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+        assert_eq!(jar.accounts[0].user_agent, None);
+    }
+
+    #[test]
+    fn malformed_useragents_file_is_warn_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        let ua = dir.path().join("useragents.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        fs::write(&ua, "not json {{{").unwrap();
         let jar = CookieJar::load(&main).unwrap();
         assert_eq!(jar.accounts[0].user_agent, None);
     }

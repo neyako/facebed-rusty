@@ -82,7 +82,25 @@ in Docker, also add a matching volume mount in `docker-compose.yml` (commented e
 included).
 
 When any cookie is past its `expirationDate`, facebed posts a `@everyone cookies expired` alert
-to the Discord webhook configured in `notifier_webhook`.
+to the Discord webhook configured in `notifier_webhook`. The same webhook also fires after an
+account fails 3 fetches in a row (cookie likely checkpointed or invalidated mid-run), with the
+account label and last error attached so you know which file to re-export.
+
+### Per-account user agents (optional)
+
+Drop a `useragents.json` next to your cookies to make each account send a distinct UA — so a
+multi-account pool looks like several different browsers / devices rather than one scraper
+behind one Chrome UA. The keys are account labels (matching the `cookies-<label>.json`
+filename convention):
+
+```json
+{
+  "alice": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ...",
+  "bob":   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ..."
+}
+```
+
+Missing labels fall back to a default Chrome UA. See `useragents.example.json`.
 
 > [!WARNING]
 > Fetching with cookies will hit your account's rate limits and may trigger a Facebook
