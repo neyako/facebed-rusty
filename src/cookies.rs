@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -38,16 +38,30 @@ impl CookieAccount {
     }
 }
 
+/// Seconds an account stays in cooldown after a failure. While in cooldown
+/// the retry loop skips it on the *first* attempt so we don't waste a slow
+/// FB round-trip on an account that's checkpointed / has expired cookies.
+/// The account is still tried as a last resort if every other account is
+/// also in cooldown, so a transient blip doesn't lock everyone out.
+pub const ACCOUNT_COOLDOWN_SECS: u64 = 300;
+
 /// Pool of accounts. Empty pool = anonymous fetches.
 #[derive(Debug)]
 pub struct CookieJar {
     accounts: Vec<CookieAccount>,
     cursor: AtomicUsize,
+    /// Per-account "last failure" unix seconds. Parallel to `accounts`.
+    /// Zero means "never failed".
+    last_failures: Vec<AtomicU64>,
 }
 
 impl CookieJar {
     pub fn empty() -> Self {
-        Self { accounts: Vec::new(), cursor: AtomicUsize::new(0) }
+        Self {
+            accounts: Vec::new(),
+            cursor: AtomicUsize::new(0),
+            last_failures: Vec::new(),
+        }
     }
 
     /// Load cookies. The given `path` (default `./cookies.json`) is loaded if it exists,
@@ -122,7 +136,12 @@ impl CookieJar {
             warn!("no cookies loaded, non incognito-viewable posts will NOT work");
         }
 
-        Ok(Self { accounts, cursor: AtomicUsize::new(0) })
+        let last_failures = (0..accounts.len()).map(|_| AtomicU64::new(0)).collect();
+        Ok(Self {
+            accounts,
+            cursor: AtomicUsize::new(0),
+            last_failures,
+        })
     }
 
     fn load_file(path: &Path) -> anyhow::Result<Vec<CookieAccount>> {
@@ -199,6 +218,51 @@ impl CookieJar {
     /// Advance the round-robin cursor by one.
     pub fn advance_cursor(&self) {
         self.cursor.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark the account at `i` (mod len) as having just failed. Future
+    /// requests skip it on first attempt for [`ACCOUNT_COOLDOWN_SECS`].
+    pub fn mark_failed(&self, i: usize) {
+        if self.accounts.is_empty() {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_failures[i % self.accounts.len()].store(now, Ordering::Relaxed);
+    }
+
+    /// Mark the account at `i` (mod len) as healthy — clears the cooldown.
+    pub fn mark_ok(&self, i: usize) {
+        if self.accounts.is_empty() {
+            return;
+        }
+        self.last_failures[i % self.accounts.len()].store(0, Ordering::Relaxed);
+    }
+
+    /// True if the account at `i` is currently in cooldown.
+    pub fn in_cooldown(&self, i: usize) -> bool {
+        if self.accounts.is_empty() {
+            return false;
+        }
+        let last = self.last_failures[i % self.accounts.len()].load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(last) < ACCOUNT_COOLDOWN_SECS
+    }
+
+    /// Label of the account at `i` (for logging).
+    pub fn label_at(&self, i: usize) -> Option<&str> {
+        if self.accounts.is_empty() {
+            return None;
+        }
+        Some(&self.accounts[i % self.accounts.len()].label)
     }
 
     pub fn expired_labels(&self) -> Vec<String> {
