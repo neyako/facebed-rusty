@@ -245,6 +245,53 @@ pub fn video_link_in_node(node: &Value) -> Option<String> {
     None
 }
 
+/// Best-effort thumbnail/preview image URL for a video node. Walks the common
+/// shapes FB uses: `preferred_thumbnail.image.uri`, `image.uri`, and
+/// `thumbnailImage.uri`. Returns the first non-empty hit.
+pub fn thumbnail_in_node(node: &Value) -> Option<String> {
+    let candidates = [
+        &["preferred_thumbnail", "image", "uri"][..],
+        &["thumbnailImage", "uri"][..],
+        &["image", "uri"][..],
+    ];
+    for path in candidates {
+        let mut cur = node;
+        let mut ok = true;
+        for seg in path {
+            match cur.get(*seg) {
+                Some(v) => cur = v,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            if let Some(s) = cur.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_owned());
+                }
+            }
+        }
+    }
+    // Fallback: scan any nested `preferred_thumbnail` / `thumbnailImage`.
+    for key in ["preferred_thumbnail", "thumbnailImage"] {
+        if let Some(t) = jq::first(node, key) {
+            if let Some(uri) = t.get("image").and_then(|i| i.get("uri")).and_then(|s| s.as_str()) {
+                if !uri.is_empty() {
+                    return Some(uri.to_owned());
+                }
+            }
+            if let Some(uri) = t.get("uri").and_then(|s| s.as_str()) {
+                if !uri.is_empty() {
+                    return Some(uri.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn interaction_counts(post_json: &Value) -> Result<(String, String, String), FacebedError> {
     let pf = jq::first(post_json, "comet_ufi_summary_and_actions_renderer")
         .ok_or_else(|| FacebedError::parse("missing comet_ufi_summary_and_actions_renderer"))?;

@@ -41,6 +41,7 @@ impl Parser for PhotocomParser {
             comments: "null".into(),
             shares: "null".into(),
             video_links: Vec::new(),
+            thumbnail: None,
         })
     }
 }

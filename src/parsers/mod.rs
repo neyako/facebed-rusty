@@ -22,6 +22,9 @@ pub struct ParsedPost {
     pub comments: String,
     pub shares: String,
     pub video_links: Vec<String>,
+    /// Preview/thumbnail for a video. Used as the embed image when the video
+    /// itself is too big to inline (Discord's ~25 MB media proxy limit).
+    pub thumbnail: Option<String>,
 }
 
 pub struct ParserCtx {
@@ -47,6 +50,7 @@ pub fn banned_post(url: &str) -> ParsedPost {
         comments: "null".into(),
         shares: "null".into(),
         video_links: Vec::new(),
+        thumbnail: None,
     }
 }
 

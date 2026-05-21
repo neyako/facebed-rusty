@@ -52,6 +52,8 @@ impl Parser for JsonPostParser {
             return Ok(banned_post(&post_url));
         }
 
+        let thumbnail = crate::parsers::util::thumbnail_in_node(story_json);
+
         Ok(ParsedPost {
             author_name: link_header,
             text: post_content,
@@ -62,6 +64,7 @@ impl Parser for JsonPostParser {
             comments: cmts,
             shares,
             video_links: story.video_links,
+            thumbnail,
         })
     }
 }

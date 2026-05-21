@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::crawler;
 use crate::embed::{
-    format_error_embed, format_full_post_embed, format_redirect_page, format_reel_post_embed,
+    format_error_embed, format_full_post_embed, format_oversized_video_embed,
+    format_redirect_page, format_reel_post_embed,
 };
 use crate::error::FacebedError;
 use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
@@ -80,10 +81,14 @@ fn html_response(body: String) -> Response {
 
 static RE_REEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?reel/[0-9]+").unwrap());
 // Only match bare `videos/<id>` (no Page prefix). Page-scoped video posts like
-// `<page>/videos/<slug>/<id>` are real post pages, not reels — rewriting them to
-// `/reel/<id>` makes ReelsParser latch onto unrelated content on the served page.
-// Those route to JsonPost via [`is_facebook_url`] below.
+// `<page>/videos/<slug>/<id>` are real video viewer pages — not reels — and
+// FB serves them with a watch-style JSON shape that the JsonPost root walker
+// can't handle. Routed below to VideoWatchParser via [`RE_PAGE_VIDEO`].
 static RE_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?videos/(?:[^/]+/)?(\d+)").unwrap());
+// `<page>/videos/<slug?>/<id>/` — FB Page video post viewer. Same JSON shape
+// as /watch?v=<id>, so route to VideoWatchParser.
+static RE_PAGE_VIDEO: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/videos/(?:[^/]+/)?\d+").unwrap());
 static RE_PHOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
 static RE_WATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*watch").unwrap());
 static RE_SHARE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
@@ -99,9 +104,8 @@ fn is_facebook_url(path: &str) -> bool {
     let is_permalink = p.starts_with("/permalink.php");
     let is_story = p.starts_with("/story.php");
     let is_post = Regex::new(&format!("/{username_pat}/posts")).unwrap().is_match(p);
-    let is_video = Regex::new(&format!("/{username_pat}/videos")).unwrap().is_match(p);
     let is_photo = p.starts_with("/photo");
-    is_permalink || is_post || is_story || is_photo || is_group || is_video
+    is_permalink || is_post || is_story || is_photo || is_group
 }
 
 async fn catch_all(
@@ -173,6 +177,8 @@ async fn catch_all(
         ParserKind::SinglePhoto
     } else if path_only(&working).map(|p| RE_WATCH.is_match(&p)).unwrap_or(false) {
         ParserKind::Watch
+    } else if RE_PAGE_VIDEO.is_match(&working) {
+        ParserKind::Watch
     } else if is_facebook_url(&working) {
         ParserKind::JsonPost
     } else {
@@ -226,7 +232,8 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 if advance_cursor {
                     state.ctx.cookies.advance_cursor();
                 }
-                return html_response(render(&post, state.config.timezone, kind));
+                let body = render_with_size_check(state, &post, kind).await;
+                return html_response(body);
             }
             Err(e) if is_retryable(&e) && attempt + 1 < attempts => {
                 warn!(path = %path, attempt, error = %e, "retrying with next account");
@@ -267,6 +274,12 @@ fn is_retryable(e: &FacebedError) -> bool {
     matches!(e, FacebedError::NoData(_) | FacebedError::Parse { .. })
 }
 
+/// Discord's media proxy refuses to inline videos larger than ~25 MB, leaving
+/// the user with an empty player. We HEAD the first video URL and, if FB
+/// advertises a content length over this limit, fall back to a thumbnail +
+/// caption + link embed instead of an `og:video`.
+const DISCORD_VIDEO_BYTE_LIMIT: u64 = 25 * 1024 * 1024;
+
 fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
     // Reels/Watch always render as a video card. For mixed-media JsonPosts (video
     // + images), prefer the image-grid embed so Discord can show the photos and
@@ -279,6 +292,29 @@ fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
     } else {
         format_full_post_embed(post, tz)
     }
+}
+
+async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: ParserKind) -> String {
+    let tz = state.config.timezone;
+    let Some(video_url) = post.video_links.first() else {
+        return render(post, tz, kind);
+    };
+    let Some(size) = state.fetcher.head_content_length(video_url).await else {
+        // Server didn't advertise Content-Length — assume it's fine and let
+        // Discord try. Better to attempt the inline than silently downgrade
+        // every video where FB omits the header.
+        return render(post, tz, kind);
+    };
+    if size <= DISCORD_VIDEO_BYTE_LIMIT {
+        return render(post, tz, kind);
+    }
+    info!(
+        url = %post.url,
+        bytes = size,
+        limit = DISCORD_VIDEO_BYTE_LIMIT,
+        "video oversized for Discord media proxy — falling back to thumbnail embed"
+    );
+    format_oversized_video_embed(post, tz)
 }
 
 fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {

@@ -65,6 +65,24 @@ impl Fetcher {
         &self.client
     }
 
+    /// HEAD the URL and return `Content-Length` if the server advertises one.
+    /// Used to gate Discord embed size — Discord's media proxy refuses to
+    /// inline videos past ~25 MB, so we want to detect oversize before we
+    /// hand the URL off as an `og:video`. Returns `None` on transport error,
+    /// non-2xx response, or missing/unparseable header.
+    pub async fn head_content_length(&self, url: &str) -> Option<u64> {
+        let resp = self.client.head(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    }
+
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
         let url = ensure_absolute(post_path);

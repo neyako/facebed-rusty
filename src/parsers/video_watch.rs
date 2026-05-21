@@ -1,7 +1,7 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
-use crate::parsers::util::{human_format, val_str_at, video_link_in_node};
+use crate::parsers::util::{human_format, thumbnail_in_node, val_str_at, video_link_in_node};
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
 use once_cell::sync::Lazy;
@@ -52,6 +52,12 @@ impl Parser for VideoWatchParser {
         let date = find_creation_time(&html)
             .ok_or_else(|| FacebedError::parse_with("cannot find date", page.html.clone(), page.url.clone()))?;
 
+        let thumbnail = thumbnail_in_node(&content_node).or_else(|| {
+            get_json_blocks(&html, false)
+                .iter()
+                .find_map(|b| thumbnail_in_node(b))
+        });
+
         Ok(ParsedPost {
             author_name: op_name,
             text,
@@ -62,6 +68,7 @@ impl Parser for VideoWatchParser {
             comments: human_format(&cmts),
             shares: "null".into(),
             video_links: vec![video_link],
+            thumbnail,
         })
     }
 }
