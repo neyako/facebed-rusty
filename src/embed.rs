@@ -20,6 +20,23 @@ fn escape_attr(s: &str) -> String {
     encode_quoted_attribute(s).to_string()
 }
 
+/// Escape markdown control chars that Discord renders inside `og:description`.
+/// Without this, raw `*_~|>` `` ` `` `\` in post text accidentally bold/italic/
+/// quote/code-format segments of the embed body.
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '*' | '_' | '~' | '|' | '`' | '>' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn truncate_chars(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((i, _)) => &s[..i],
@@ -92,7 +109,7 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
 </html>"##,
         credit = CREDIT,
         title = escape_attr(&post.author_name),
-        desc = escape_attr(truncate_chars(&post.text, 4096)),
+        desc = escape_attr(&escape_markdown(truncate_chars(&post.text, 4096))),
         post_date = post_date,
         reactions = reactions,
         extra = extra,
@@ -145,7 +162,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
 </html>"##,
         credit = CREDIT,
         title = escape_attr(&post.author_name),
-        desc = escape_attr(truncate_chars(&post.text, 4096)),
+        desc = escape_attr(&escape_markdown(truncate_chars(&post.text, 4096))),
         post_date = post_date,
         reactions = reactions,
         url_q = url_q,
@@ -192,7 +209,7 @@ pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String
 </html>"##,
         credit = CREDIT,
         title = escape_attr(&post.author_name),
-        desc = escape_attr(truncate_chars(&post.text, 4096)),
+        desc = escape_attr(&escape_markdown(truncate_chars(&post.text, 4096))),
         post_date = post_date,
         reactions = reactions,
         url_q = url_q,
