@@ -80,10 +80,14 @@ fn html_response(body: String) -> Response {
 
 static RE_REEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?reel/[0-9]+").unwrap());
 // Only match bare `videos/<id>` (no Page prefix). Page-scoped video posts like
-// `<page>/videos/<slug>/<id>` are real post pages, not reels — rewriting them to
-// `/reel/<id>` makes ReelsParser latch onto unrelated content on the served page.
-// Those route to JsonPost via [`is_facebook_url`] below.
+// `<page>/videos/<slug>/<id>` are real video viewer pages — not reels — and
+// FB serves them with a watch-style JSON shape that the JsonPost root walker
+// can't handle. Routed below to VideoWatchParser via [`RE_PAGE_VIDEO`].
 static RE_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?videos/(?:[^/]+/)?(\d+)").unwrap());
+// `<page>/videos/<slug?>/<id>/` — FB Page video post viewer. Same JSON shape
+// as /watch?v=<id>, so route to VideoWatchParser.
+static RE_PAGE_VIDEO: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/videos/(?:[^/]+/)?\d+").unwrap());
 static RE_PHOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
 static RE_WATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*watch").unwrap());
 static RE_SHARE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
@@ -99,9 +103,8 @@ fn is_facebook_url(path: &str) -> bool {
     let is_permalink = p.starts_with("/permalink.php");
     let is_story = p.starts_with("/story.php");
     let is_post = Regex::new(&format!("/{username_pat}/posts")).unwrap().is_match(p);
-    let is_video = Regex::new(&format!("/{username_pat}/videos")).unwrap().is_match(p);
     let is_photo = p.starts_with("/photo");
-    is_permalink || is_post || is_story || is_photo || is_group || is_video
+    is_permalink || is_post || is_story || is_photo || is_group
 }
 
 async fn catch_all(
@@ -172,6 +175,8 @@ async fn catch_all(
     } else if path_only(&working).map(|p| RE_PHOTO.is_match(&p)).unwrap_or(false) {
         ParserKind::SinglePhoto
     } else if path_only(&working).map(|p| RE_WATCH.is_match(&p)).unwrap_or(false) {
+        ParserKind::Watch
+    } else if RE_PAGE_VIDEO.is_match(&working) {
         ParserKind::Watch
     } else if is_facebook_url(&working) {
         ParserKind::JsonPost
