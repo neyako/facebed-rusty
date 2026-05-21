@@ -1,9 +1,8 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
-use crate::parsers::util::{human_format, val_str_at, video_link_in_node};
+use crate::parsers::util::{human_format, thumbnail_in_node, val_str_at, video_link_in_node};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
-use scraper::Html;
 use serde_json::Value;
 
 pub struct ReelsParser;
@@ -50,6 +49,13 @@ impl Parser for ReelsParser {
             return Ok(banned_post(&post_url));
         }
 
+        let thumbnail = thumbnail_in_node(&content_node)
+            .or_else(|| {
+                blocks
+                    .iter()
+                    .find_map(|b| thumbnail_in_node(b))
+            });
+
         Ok(ParsedPost {
             author_name: op_name,
             text: post_text,
@@ -60,6 +66,7 @@ impl Parser for ReelsParser {
             comments: cmts,
             shares,
             video_links: vec![video_link],
+            thumbnail,
         })
     }
 }

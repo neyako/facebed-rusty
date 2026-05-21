@@ -93,6 +93,7 @@ impl Parser for StoriesParser {
             comments: "null".into(),
             shares: "null".into(),
             video_links,
+            thumbnail: None,
         })
     }
 }

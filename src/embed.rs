@@ -153,6 +153,53 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     )
 }
 
+/// Embed for videos that are too big for Discord's media proxy to inline
+/// (~25 MB). Shows the thumbnail as `og:image`, the post text as description,
+/// and a "video too big to embed" hint in the site name. Click-through goes
+/// to the canonical post URL.
+pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String {
+    let thumb = post.thumbnail.clone().unwrap_or_default();
+    let post_date = format_timestamp(post.date, tz_offset);
+    let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
+    let url_q = quote(&post.url);
+    let image_meta = if thumb.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<meta property="og:image" content="{}"/>"#,
+            escape_attr(&thumb)
+        )
+    };
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="">
+<head>
+    <title>{credit}</title>
+    <meta charset="UTF-8"/>
+    <meta property="og:title" content="{title}"/>
+    <meta property="og:description" content="{desc}"/>
+    <meta property="og:site_name" content="{credit}
+{post_date}
+{reactions}
+🎥 video too big to embed — click to watch on Facebook"/>
+    <meta property="og:url" content="{url_q}"/>
+    {image_meta}
+    <link rel="canonical" href="{url_q}"/>
+    <meta http-equiv="refresh" content="0;url={url_q}"/>
+    <meta name="twitter:card" content="summary_large_image"/>
+    <meta name="theme-color" content="#0866ff"/>
+</head>
+</html>"##,
+        credit = CREDIT,
+        title = escape_attr(&post.author_name),
+        desc = escape_attr(truncate_chars(&post.text, 4096)),
+        post_date = post_date,
+        reactions = reactions,
+        url_q = url_q,
+        image_meta = image_meta,
+    )
+}
+
 pub fn format_error_embed(original_url: &str, error_code: &str) -> String {
     let suffix = if error_code.is_empty() { String::new() } else { format!(" [{}]", error_code) };
     let url_q = quote(original_url);

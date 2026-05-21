@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::crawler;
 use crate::embed::{
-    format_error_embed, format_full_post_embed, format_redirect_page, format_reel_post_embed,
+    format_error_embed, format_full_post_embed, format_oversized_video_embed,
+    format_redirect_page, format_reel_post_embed,
 };
 use crate::error::FacebedError;
 use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
@@ -231,7 +232,8 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 if advance_cursor {
                     state.ctx.cookies.advance_cursor();
                 }
-                return html_response(render(&post, state.config.timezone, kind));
+                let body = render_with_size_check(state, &post, kind).await;
+                return html_response(body);
             }
             Err(e) if is_retryable(&e) && attempt + 1 < attempts => {
                 warn!(path = %path, attempt, error = %e, "retrying with next account");
@@ -272,6 +274,12 @@ fn is_retryable(e: &FacebedError) -> bool {
     matches!(e, FacebedError::NoData(_) | FacebedError::Parse { .. })
 }
 
+/// Discord's media proxy refuses to inline videos larger than ~25 MB, leaving
+/// the user with an empty player. We HEAD the first video URL and, if FB
+/// advertises a content length over this limit, fall back to a thumbnail +
+/// caption + link embed instead of an `og:video`.
+const DISCORD_VIDEO_BYTE_LIMIT: u64 = 25 * 1024 * 1024;
+
 fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
     // Reels/Watch always render as a video card. For mixed-media JsonPosts (video
     // + images), prefer the image-grid embed so Discord can show the photos and
@@ -284,6 +292,29 @@ fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
     } else {
         format_full_post_embed(post, tz)
     }
+}
+
+async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: ParserKind) -> String {
+    let tz = state.config.timezone;
+    let Some(video_url) = post.video_links.first() else {
+        return render(post, tz, kind);
+    };
+    let Some(size) = state.fetcher.head_content_length(video_url).await else {
+        // Server didn't advertise Content-Length — assume it's fine and let
+        // Discord try. Better to attempt the inline than silently downgrade
+        // every video where FB omits the header.
+        return render(post, tz, kind);
+    };
+    if size <= DISCORD_VIDEO_BYTE_LIMIT {
+        return render(post, tz, kind);
+    }
+    info!(
+        url = %post.url,
+        bytes = size,
+        limit = DISCORD_VIDEO_BYTE_LIMIT,
+        "video oversized for Discord media proxy — falling back to thumbnail embed"
+    );
+    format_oversized_video_embed(post, tz)
 }
 
 fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {

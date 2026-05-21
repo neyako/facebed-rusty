@@ -46,6 +46,7 @@ impl Parser for SinglePhotoParser {
             comments: cmts,
             shares,
             video_links: Vec::new(),
+            thumbnail: None,
         })
     }
 }
