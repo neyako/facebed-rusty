@@ -86,10 +86,15 @@ fn get_post_json(html: &Html, post_id: Option<&str>) -> Option<Value> {
                 return Some(bloc);
             }
         }
-        // No block matched the requested id — return None so the caller can raise
-        // NoData/Parse instead of serving a wrong-post embed. Falling back to any
-        // i18n_reaction_count block here is what produced the bug.
-        return None;
+        // No block matched a numeric requested id — return None so the caller can
+        // raise NoData/Parse instead of serving a wrong-post embed. Falling back
+        // to any i18n_reaction_count block here is what produced the bug.
+        //
+        // pfbid URLs can be rewritten by FB to a different canonical pfbid inside
+        // the JSON, so keep the older fallback for non-numeric ids.
+        if pid.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
     }
 
     // No id available (very old paths) — fall back to first reaction block.
@@ -104,12 +109,12 @@ fn get_post_json(html: &Html, post_id: Option<&str>) -> Option<Value> {
 static POST_ID_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?x)
-        /posts/(\d+)
-        | /permalink/(\d+)
-        | story_fbid=(\d+)
-        | multi_permalinks=(\d+)
-        | /videos/(?:[^/]+/)?(\d+)
-        | /reel/(\d+)
+        /posts/(?:[^/?]+/)?([A-Za-z0-9]+)
+        | /permalink/([A-Za-z0-9]+)
+        | [?&]story_fbid=([A-Za-z0-9]+)
+        | [?&]multi_permalinks=([A-Za-z0-9]+)
+        | /videos/(?:[^/?]+/)?([A-Za-z0-9]+)
+        | /reel/([A-Za-z0-9]+)
         ",
     )
     .unwrap()
@@ -157,4 +162,45 @@ fn get_group_name(html: &Html) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_post_id;
+
+    #[test]
+    fn extracts_numeric_post_id() {
+        assert_eq!(
+            extract_post_id("groups/ThinkPadViet/posts/2532721970496550/"),
+            Some("2532721970496550".into())
+        );
+    }
+
+    #[test]
+    fn extracts_slugged_page_post_id() {
+        assert_eq!(
+            extract_post_id("thongtinchinhphu/posts/-some-long-slug-/1458346319663477/"),
+            Some("1458346319663477".into())
+        );
+    }
+
+    #[test]
+    fn extracts_pfbid_post_id() {
+        assert_eq!(
+            extract_post_id("clark.leonard1406/posts/pfbid02XkxJdpbABcHdqmcA1Je8rNNYXVpt5QELruUEnrii5iU1fVGmt8qZECEcoHsbSDiBl"),
+            Some("pfbid02XkxJdpbABcHdqmcA1Je8rNNYXVpt5QELruUEnrii5iU1fVGmt8qZECEcoHsbSDiBl".into())
+        );
+    }
+
+    #[test]
+    fn extracts_query_post_ids() {
+        assert_eq!(
+            extract_post_id("groups/1030569618932119/?multi_permalinks=1349761413679603&x=1"),
+            Some("1349761413679603".into())
+        );
+        assert_eq!(
+            extract_post_id("story.php?story_fbid=pfbid02abc&id=123"),
+            Some("pfbid02abc".into())
+        );
+    }
 }

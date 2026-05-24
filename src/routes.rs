@@ -352,7 +352,11 @@ async fn run_parser(state: &AppState, path: &str, kind: ParserKind) -> Result<Pa
 }
 
 fn is_retryable(e: &FacebedError) -> bool {
-    matches!(e, FacebedError::NoData(_) | FacebedError::Parse { .. })
+    match e {
+        FacebedError::NoData(_) | FacebedError::Parse { .. } => true,
+        FacebedError::Http(err) => err.is_timeout() || err.is_connect(),
+        _ => false,
+    }
 }
 
 /// Discord's media proxy refuses to inline videos larger than ~25 MB, leaving

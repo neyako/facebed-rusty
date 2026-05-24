@@ -132,7 +132,8 @@ debug.*
 # macOS bullshit
 .DS_Store
 
-cookies.json
+cookies*.json
+!cookies.example.json
 samples
 jk
 test*

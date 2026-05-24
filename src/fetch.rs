@@ -8,6 +8,7 @@ use reqwest::Client;
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 
 tokio::task_local! {
     /// When set, [`Fetcher::fetch`] uses this account index (modulo account count)
@@ -71,7 +72,8 @@ impl Fetcher {
         let client = Client::builder()
             .gzip(true)
             .brotli(true)
-            .timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(8))
             .build()?;
         Ok(Self { client, cookies })
     }
