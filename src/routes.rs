@@ -3,7 +3,7 @@ use crate::cookies::NOTIFY_FAILURE_THRESHOLD;
 use crate::crawler;
 use crate::embed::{
     format_error_embed, format_full_post_embed, format_oversized_video_embed,
-    format_redirect_page, format_reel_post_embed,
+    format_redirect_page, format_reel_post_embed, format_timeout_embed,
 };
 use crate::error::FacebedError;
 use crate::fetch::{fetch_public_preview, resolve_share_link, Fetcher, OgPreview, ACCOUNT_OVERRIDE};
@@ -78,6 +78,20 @@ fn html_response(body: String) -> Response {
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    (StatusCode::OK, headers, body).into_response()
+}
+
+fn no_store_html_response(body: String) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers.insert(axum::http::header::PRAGMA, HeaderValue::from_static("no-cache"));
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -199,10 +213,7 @@ async fn catch_all(
     };
 
     info!(working = %working, kind = ?kind, "dispatch");
-    if matches!(kind, ParserKind::JsonPost) {
-        return process_with_preview_deadline(&state, &working, kind, preview, started).await;
-    }
-    process(&state, &working, kind).await
+    process_with_deadline(&state, &working, kind, preview, started).await
 }
 
 fn path_only(s: &str) -> Option<String> {
@@ -237,11 +248,17 @@ fn group_multi_permalink_path(s: &str) -> Option<String> {
 /// from the same group/profile lands we want to skip the round-robin
 /// warm-up and hit the account that worked last time.
 ///
-/// Returns None for shapes where the path can't identify a scope (raw
-/// reels, /watch?v=..., photo.php) — those fall back to plain round-robin.
+/// Returns None for shapes where the path can't identify a scope
+/// (photo.php, some watch URLs) — those fall back to plain round-robin.
 fn scope_key(path: &str) -> Option<String> {
     let p = path_only(path)?;
     let p = p.trim_start_matches('/');
+    if p.starts_with("reel/") {
+        return Some("kind/reels".into());
+    }
+    if p.starts_with("watch") {
+        return Some("kind/watch".into());
+    }
     if let Some(rest) = p.strip_prefix("groups/") {
         let id = rest.split('/').next()?;
         if !id.is_empty() {
@@ -379,14 +396,15 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
 const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(4500);
 const PUBLIC_PREVIEW_WAIT: Duration = Duration::from_millis(500);
 
-async fn process_with_preview_deadline(
+async fn process_with_deadline(
     state: &AppState,
     path: &str,
     kind: ParserKind,
     mut preview: Option<OgPreview>,
     started: Instant,
 ) -> Response {
-    let mut preview_task = if preview.is_none() {
+    let allow_public_preview = matches!(kind, ParserKind::JsonPost);
+    let mut preview_task = if preview.is_none() && allow_public_preview {
         let fetcher = state.fetcher.clone();
         let path = path.to_owned();
         Some(tokio::spawn(async move {
@@ -424,11 +442,10 @@ async fn process_with_preview_deadline(
     warn!(
         path = %path,
         elapsed_ms = started.elapsed().as_millis(),
-        "no public preview available; continuing full scrape instead of rendering error"
+        "no fast preview available; rendering timeout embed"
     );
-    let response = full_scrape.await;
     abort_preview(preview_task);
-    response
+    no_store_html_response(format_timeout_embed(&url_clean::ensure_absolute(path)))
 }
 
 async fn take_preview(
@@ -671,11 +688,15 @@ mod tests {
 
     #[test]
     fn unscoped_paths_return_none() {
-        assert_eq!(scope_key("reel/12345"), None);
-        assert_eq!(scope_key("watch?v=12345"), None);
         assert_eq!(scope_key("photo.php?fbid=1&id=2"), None);
         assert_eq!(scope_key("permalink.php?story_fbid=1&id=2"), None);
         assert_eq!(scope_key("alice"), None);
+    }
+
+    #[test]
+    fn video_routes_share_kind_affinity() {
+        assert_eq!(scope_key("reel/12345"), Some("kind/reels".into()));
+        assert_eq!(scope_key("watch?v=12345"), Some("kind/watch".into()));
     }
 
     #[test]

@@ -237,6 +237,27 @@ pub fn format_error_embed(original_url: &str, error_code: &str) -> String {
     )
 }
 
+pub fn format_timeout_embed(original_url: &str) -> String {
+    let url_q = quote(original_url);
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="">
+<head>
+<meta charset="UTF-8" />
+    <meta name="theme-color" content="#f59e0b" />
+    <meta property="og:title" content="Facebook took too long [T]"/>
+    <meta property="og:description" content="Facebed could not finish this embed before Discord's crawler timeout. Open the link, or retry in a moment."/>
+    <meta property="og:site_name" content="{credit}"/>
+    <meta property="og:url" content="{url_q}"/>
+    <link rel="canonical" href="{url_q}"/>
+    <meta http-equiv="refresh" content="0;url={url_q}"/>
+</head>
+</html>"##,
+        credit = CREDIT,
+        url_q = url_q,
+    )
+}
+
 pub fn format_redirect_page(url: &str) -> String {
     let q = quote(url);
     let esc = escape_attr(url);
