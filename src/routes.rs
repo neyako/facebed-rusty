@@ -421,7 +421,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     )
 }
 
-const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(4500);
+const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(5200);
 const PUBLIC_PREVIEW_WAIT: Duration = Duration::from_millis(500);
 
 async fn process_with_deadline(
@@ -431,7 +431,7 @@ async fn process_with_deadline(
     mut preview: Option<OgPreview>,
     started: Instant,
 ) -> Response {
-    let allow_public_preview = matches!(kind, ParserKind::JsonPost);
+    let allow_public_preview = matches!(kind, ParserKind::JsonPost) && !is_group_path(path);
     let mut preview_task = if preview.is_none() && allow_public_preview {
         let fetcher = state.fetcher.clone();
         let path = path.to_owned();
@@ -529,6 +529,12 @@ fn facebook_path_component(s: &str) -> Option<String> {
     Url::parse(&url_clean::ensure_absolute(s))
         .ok()
         .map(|u| u.path().trim_matches('/').to_owned())
+}
+
+fn is_group_path(path: &str) -> bool {
+    facebook_path_component(path)
+        .map(|p| p.starts_with("groups/"))
+        .unwrap_or(false)
 }
 
 fn group_post_id(path: &str) -> Option<String> {
@@ -707,7 +713,9 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_multi_permalink_path, preview_matches_path, scope_key, OgPreview};
+    use super::{
+        group_multi_permalink_path, is_group_path, preview_matches_path, scope_key, OgPreview,
+    };
 
     #[test]
     fn group_path_extracts_group_id() {
@@ -796,5 +804,13 @@ mod tests {
             &preview,
             "groups/sportsbook6vn/permalink/1351950440127367/"
         ));
+    }
+
+    #[test]
+    fn group_paths_do_not_use_public_preview() {
+        assert!(is_group_path(
+            "groups/sportsbook6vn/permalink/1352085323447212/"
+        ));
+        assert!(!is_group_path("alice/posts/123"));
     }
 }

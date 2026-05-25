@@ -4,7 +4,7 @@ use crate::jq;
 use crate::url_clean::ensure_absolute;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::sync::Arc;
@@ -258,15 +258,15 @@ impl Fetcher {
 /// share URL with a requests-like UA and use the redirect target.
 /// Browser/Discord UAs are slower or do not redirect reliably here.
 ///
-/// If HEAD cannot produce an off-/share/ target, fall back to a Discordbot
-/// GET and prefer `og:url` / canonical from the response body. share/v uses
-/// that fallback directly because FB can redirect Page videos to lossy
-/// reel-shaped URLs.
+/// If public HEAD/GET cannot produce an off-/share/ target, retry the share
+/// resolve with cookie accounts in configured priority order. Private groups
+/// can hide the share target from public crawlers even when the primary cookie
+/// can view the post.
 pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
     let is_share_v = is_share_v_path(path);
-    let head_path = resolve_share_link_head(fetcher, path).await;
+    let head_path = resolve_share_link_head(fetcher, path, None).await;
     if let Some(path) = head_path.as_deref() {
-        if !is_share_v || is_post_like_share_target(path) {
+        if head_target_usable(path, is_share_v) {
             return Ok(ResolvedShare {
                 path: path.to_owned(),
                 preview: None,
@@ -274,13 +274,23 @@ pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<
         }
     }
 
-    let resolved = resolve_share_link_body(fetcher, path).await?;
-    if (resolved.path.is_empty() || is_group_landing_target(&resolved.path)) && head_path.is_some()
-    {
-        return Ok(ResolvedShare {
-            path: head_path.unwrap(),
-            preview: None,
-        });
+    let resolved = match resolve_share_link_body(fetcher, path, None).await {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            if let Some(resolved) =
+                resolve_share_link_with_accounts(fetcher, path, is_share_v).await
+            {
+                return Ok(resolved);
+            }
+            return Err(e);
+        }
+    };
+    if share_resolution_usable(&resolved) {
+        return Ok(resolved);
+    }
+
+    if let Some(resolved) = resolve_share_link_with_accounts(fetcher, path, is_share_v).await {
+        return Ok(resolved);
     }
     Ok(resolved)
 }
@@ -301,6 +311,14 @@ fn is_post_like_share_target(path: &str) -> bool {
             && (path.contains("/permalink/") || path.contains("/posts/")))
 }
 
+fn head_target_usable(path: &str, is_share_v: bool) -> bool {
+    !is_group_landing_target(path) && (!is_share_v || is_post_like_share_target(path))
+}
+
+fn share_resolution_usable(resolved: &ResolvedShare) -> bool {
+    !resolved.path.is_empty() && !is_group_landing_target(&resolved.path)
+}
+
 fn is_group_landing_target(path: &str) -> bool {
     let parsed = Url::parse(&ensure_absolute(path)).ok();
     let path = parsed
@@ -310,14 +328,76 @@ fn is_group_landing_target(path: &str) -> bool {
     path.starts_with("groups/") && (path.ends_with("/about") || path.split('/').count() <= 2)
 }
 
-async fn resolve_share_link_body(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
+async fn resolve_share_link_with_accounts(
+    fetcher: &Fetcher,
+    path: &str,
+    is_share_v: bool,
+) -> Option<ResolvedShare> {
+    for account_index in share_account_order(fetcher) {
+        let label = fetcher
+            .cookies
+            .label_at(account_index)
+            .unwrap_or("?")
+            .to_owned();
+
+        if let Some(path) = resolve_share_link_head(fetcher, path, Some(account_index)).await {
+            if head_target_usable(&path, is_share_v) {
+                tracing::info!(account = %label, resolved = %path, "resolved share link with account head");
+                return Some(ResolvedShare {
+                    path,
+                    preview: None,
+                });
+            }
+        }
+
+        match resolve_share_link_body(fetcher, path, Some(account_index)).await {
+            Ok(resolved) if share_resolution_usable(&resolved) => {
+                tracing::info!(account = %label, resolved = %resolved.path, "resolved share link with account body");
+                return Some(resolved);
+            }
+            Ok(resolved) => {
+                tracing::warn!(
+                    account = %label,
+                    resolved = %resolved.path,
+                    "account share resolve did not produce post target"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(account = %label, error = %e, "account share resolve failed");
+            }
+        }
+    }
+    None
+}
+
+fn share_account_order(fetcher: &Fetcher) -> Vec<usize> {
+    let n = fetcher.cookies.len();
+    let mut healthy = Vec::new();
+    let mut cooled = Vec::new();
+    for i in 0..n {
+        if fetcher.cookies.in_cooldown(i) {
+            cooled.push(i);
+        } else {
+            healthy.push(i);
+        }
+    }
+    healthy.into_iter().chain(cooled).collect()
+}
+
+async fn resolve_share_link_body(
+    fetcher: &Fetcher,
+    path: &str,
+    account_index: Option<usize>,
+) -> FacebedResult<ResolvedShare> {
     let url = ensure_absolute(path);
     let mut req = fetcher.client().get(&url);
     for (k, v) in HEADERS {
         req = req.header(*k, *v);
     }
-    req = req.header(
-        "user-agent",
+    req = attach_share_identity(
+        fetcher,
+        req,
+        account_index,
         "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
     );
     let resp = req.send().await?;
@@ -357,19 +437,40 @@ async fn resolve_share_link_body(fetcher: &Fetcher, path: &str) -> FacebedResult
     })
 }
 
-async fn resolve_share_link_head(fetcher: &Fetcher, path: &str) -> Option<String> {
+async fn resolve_share_link_head(
+    fetcher: &Fetcher,
+    path: &str,
+    account_index: Option<usize>,
+) -> Option<String> {
     let url = ensure_absolute(path);
     let mut req = fetcher.client().head(&url);
     for (k, v) in HEADERS {
         req = req.header(*k, *v);
     }
-    req = req.header("user-agent", SHARE_HEAD_USER_AGENT);
+    req = attach_share_identity(fetcher, req, account_index, SHARE_HEAD_USER_AGENT);
     let resp = req.send().await.ok()?;
     let final_url = resp.url().to_string();
     if final_url == url {
         return None;
     }
     facebook_path_from_url(&final_url)
+}
+
+fn attach_share_identity(
+    fetcher: &Fetcher,
+    req: RequestBuilder,
+    account_index: Option<usize>,
+    fallback_ua: &'static str,
+) -> RequestBuilder {
+    let Some(account_index) = account_index else {
+        return req.header("user-agent", fallback_ua);
+    };
+    let Some(acc) = fetcher.cookies.account_at(account_index) else {
+        return req.header("user-agent", fallback_ua);
+    };
+    let ua = acc.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);
+    req.header("cookie", acc.header_value())
+        .header("user-agent", ua)
 }
 
 fn facebook_path_from_url(raw: &str) -> Option<String> {
@@ -703,7 +804,8 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
 mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
-        is_group_landing_target, is_post_like_share_target,
+        head_target_usable, is_group_landing_target, is_post_like_share_target,
+        share_resolution_usable, ResolvedShare,
     };
     use scraper::Html;
 
@@ -740,6 +842,26 @@ mod tests {
         assert!(!is_group_landing_target(
             "groups/sportsbook6vn/permalink/1351950440127367/"
         ));
+    }
+
+    #[test]
+    fn share_resolve_rejects_group_landing() {
+        assert!(!head_target_usable("groups/sportsbook6vn/about/", false));
+        let resolved = ResolvedShare {
+            path: "groups/sportsbook6vn/about/".into(),
+            preview: None,
+        };
+        assert!(!share_resolution_usable(&resolved));
+    }
+
+    #[test]
+    fn share_v_body_can_resolve_to_reel() {
+        assert!(!head_target_usable("reel/123", true));
+        let resolved = ResolvedShare {
+            path: "reel/123".into(),
+            preview: None,
+        };
+        assert!(share_resolution_usable(&resolved));
     }
 
     #[test]
