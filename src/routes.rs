@@ -416,7 +416,7 @@ async fn process_with_preview_deadline(
         }
     }
 
-    if let Some(preview) = take_preview(&mut preview, &mut preview_task).await {
+    if let Some(preview) = take_preview(path, &mut preview, &mut preview_task).await {
         info!(path = %path, elapsed_ms = started.elapsed().as_millis(), "rendering fast public preview");
         return html_response(render_preview(preview, state.config.timezone));
     }
@@ -432,22 +432,86 @@ async fn process_with_preview_deadline(
 }
 
 async fn take_preview(
+    path: &str,
     preview: &mut Option<OgPreview>,
     preview_task: &mut Option<tokio::task::JoinHandle<Option<OgPreview>>>,
 ) -> Option<OgPreview> {
-    if preview.is_some() {
-        return preview.take();
-    }
-    let Some(mut task) = preview_task.take() else {
-        return None;
+    let candidate = if preview.is_some() {
+        preview.take()
+    } else {
+        let Some(mut task) = preview_task.take() else {
+            return None;
+        };
+        tokio::select! {
+            result = &mut task => result.ok().flatten(),
+            _ = tokio::time::sleep(PUBLIC_PREVIEW_WAIT) => {
+                task.abort();
+                None
+            }
+        }
     };
-    tokio::select! {
-        result = &mut task => result.ok().flatten(),
-        _ = tokio::time::sleep(PUBLIC_PREVIEW_WAIT) => {
-            task.abort();
+
+    match candidate {
+        Some(preview) if preview_matches_path(&preview, path) => Some(preview),
+        Some(preview) => {
+            warn!(
+                path = %path,
+                preview_url = %preview.url,
+                "discarding public preview for different target"
+            );
             None
         }
+        None => None,
     }
+}
+
+fn preview_matches_path(preview: &OgPreview, path: &str) -> bool {
+    let Some(target_path) = facebook_path_component(path) else {
+        return true;
+    };
+    let Some(preview_path) = facebook_path_component(&preview.url) else {
+        return true;
+    };
+
+    if let Some(target_id) = group_post_id(&target_path) {
+        return group_post_id(&preview_path).as_deref() == Some(target_id.as_str());
+    }
+
+    !is_group_landing_path(&preview_path)
+}
+
+fn facebook_path_component(s: &str) -> Option<String> {
+    Url::parse(&url_clean::ensure_absolute(s))
+        .ok()
+        .map(|u| u.path().trim_matches('/').to_owned())
+}
+
+fn group_post_id(path: &str) -> Option<String> {
+    let mut parts = path.trim_matches('/').split('/');
+    if parts.next()? != "groups" {
+        return None;
+    }
+    parts.next()?;
+    match parts.next()? {
+        "posts" | "permalink" => {
+            let id = parts.next()?;
+            if id.chars().all(|c| c.is_ascii_digit()) {
+                Some(id.to_owned())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_group_landing_path(path: &str) -> bool {
+    let mut parts = path.trim_matches('/').split('/');
+    if parts.next() != Some("groups") {
+        return false;
+    }
+    parts.next();
+    matches!(parts.next(), None | Some("about"))
 }
 
 fn abort_preview(preview_task: Option<tokio::task::JoinHandle<Option<OgPreview>>>) {
@@ -587,7 +651,9 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_multi_permalink_path, scope_key};
+    use super::{
+        group_multi_permalink_path, preview_matches_path, scope_key, OgPreview,
+    };
 
     #[test]
     fn group_path_extracts_group_id() {
@@ -636,5 +702,33 @@ mod tests {
             group_multi_permalink_path("groups/12345/?multi_permalinks=../bad"),
             None
         );
+    }
+
+    #[test]
+    fn preview_for_group_about_does_not_match_group_post() {
+        let preview = OgPreview {
+            title: "Sportsbook 6Vn".into(),
+            description: String::new(),
+            image: "https://example.com/image.jpg".into(),
+            url: "https://www.facebook.com/groups/sportsbook6vn/about/".into(),
+        };
+        assert!(!preview_matches_path(
+            &preview,
+            "groups/sportsbook6vn/permalink/1351950440127367/"
+        ));
+    }
+
+    #[test]
+    fn preview_for_same_group_post_matches() {
+        let preview = OgPreview {
+            title: "Post".into(),
+            description: String::new(),
+            image: "https://example.com/image.jpg".into(),
+            url: "https://www.facebook.com/groups/sportsbook6vn/posts/1351950440127367/".into(),
+        };
+        assert!(preview_matches_path(
+            &preview,
+            "groups/sportsbook6vn/permalink/1351950440127367/"
+        ));
     }
 }

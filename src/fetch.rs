@@ -151,20 +151,53 @@ impl Fetcher {
 /// that fallback directly because FB can redirect Page videos to lossy
 /// reel-shaped URLs.
 pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
-    if !is_share_v_path(path) {
-        if let Some(path) = resolve_share_link_head(fetcher, path).await {
+    let is_share_v = is_share_v_path(path);
+    let head_path = resolve_share_link_head(fetcher, path).await;
+    if let Some(path) = head_path.as_deref() {
+        if !is_share_v || is_post_like_share_target(path) {
             return Ok(ResolvedShare {
-                path,
+                path: path.to_owned(),
                 preview: None,
             });
         }
     }
 
-    resolve_share_link_body(fetcher, path).await
+    let resolved = resolve_share_link_body(fetcher, path).await?;
+    if (resolved.path.is_empty() || is_group_landing_target(&resolved.path))
+        && head_path.is_some()
+    {
+        return Ok(ResolvedShare {
+            path: head_path.unwrap(),
+            preview: None,
+        });
+    }
+    Ok(resolved)
 }
 
 fn is_share_v_path(path: &str) -> bool {
     path.trim_start_matches('/').starts_with("share/v/")
+}
+
+fn is_post_like_share_target(path: &str) -> bool {
+    let parsed = Url::parse(&ensure_absolute(path)).ok();
+    let path = parsed
+        .as_ref()
+        .map(|u| u.path().trim_start_matches('/'))
+        .unwrap_or_else(|| path.trim_start_matches('/'));
+    path.starts_with("watch")
+        || path.contains("/videos/")
+        || (path.starts_with("groups/")
+            && (path.contains("/permalink/") || path.contains("/posts/")))
+}
+
+fn is_group_landing_target(path: &str) -> bool {
+    let parsed = Url::parse(&ensure_absolute(path)).ok();
+    let path = parsed
+        .as_ref()
+        .map(|u| u.path().trim_matches('/'))
+        .unwrap_or_else(|| path.trim_matches('/'));
+    path.starts_with("groups/")
+        && (path.ends_with("/about") || path.split('/').count() <= 2)
 }
 
 async fn resolve_share_link_body(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
@@ -427,7 +460,7 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::facebook_path_from_url;
+    use super::{facebook_path_from_url, is_group_landing_target, is_post_like_share_target};
 
     #[test]
     fn facebook_path_from_url_keeps_query_for_real_targets() {
@@ -443,5 +476,24 @@ mod tests {
             facebook_path_from_url("https://www.facebook.com/share/p/abc/"),
             None
         );
+    }
+
+    #[test]
+    fn share_v_head_accepts_group_permalink() {
+        assert!(is_post_like_share_target(
+            "groups/sportsbook6vn/permalink/1351950440127367/?rdid=x"
+        ));
+        assert!(!is_group_landing_target(
+            "groups/sportsbook6vn/permalink/1351950440127367/?rdid=x"
+        ));
+    }
+
+    #[test]
+    fn group_about_is_landing_target() {
+        assert!(is_group_landing_target("groups/sportsbook6vn/about/"));
+        assert!(is_group_landing_target("groups/sportsbook6vn/"));
+        assert!(!is_group_landing_target(
+            "groups/sportsbook6vn/permalink/1351950440127367/"
+        ));
     }
 }
