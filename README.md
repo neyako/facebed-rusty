@@ -65,8 +65,10 @@ serves plain HTTP on the configured port.
 facebed can fetch private content (friends-only posts, private groups, viewable stories) when
 authenticated. Cookies are loaded from `./cookies.json` AND any sibling file matching
 `cookies*.json` (e.g. `cookies-alice.json`, `cookies2.json`, `cookies-neyako.json`). Each file
-contributes one or more accounts to a round-robin pool; the account label is taken from the
-filename when it isn't supplied in the file itself.
+contributes one or more accounts to a priority fallback pool; the account label is taken from the
+filename when it isn't supplied in the file itself. `cookies.json` / `default` is tried first.
+Extra accounts are used when the primary fails, is cooling down, or is already known to work for
+that group/profile from a previous request.
 
 Two file shapes are accepted:
 
@@ -85,6 +87,10 @@ When any cookie is past its `expirationDate`, facebed posts a `@everyone cookies
 to the Discord webhook configured in `notifier_webhook`. The same webhook also fires after an
 account fails 3 fetches in a row (cookie likely checkpointed or invalidated mid-run), with the
 account label and last error attached so you know which file to re-export.
+
+On startup, facebed also probes each account at `facebook.com/me`. Logs show whether the account
+is alive, the visible account name, or the reason it looks bad (login wall, checkpoint, timeout,
+etc.).
 
 ### Per-account user agents (optional)
 

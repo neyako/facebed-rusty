@@ -20,15 +20,21 @@ mod tests {
 
     #[test]
     fn detects_common_crawlers() {
-        assert!(is_crawler("Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"));
+        assert!(is_crawler(
+            "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+        ));
         assert!(is_crawler("TelegramBot (like TwitterBot)"));
         assert!(is_crawler("facebookexternalhit/1.1"));
-        assert!(is_crawler("Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)"));
+        assert!(is_crawler(
+            "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)"
+        ));
     }
 
     #[test]
     fn ignores_real_browsers() {
-        assert!(!is_crawler("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/132.0.0.0"));
+        assert!(!is_crawler(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/132.0.0.0"
+        ));
         assert!(!is_crawler(""));
     }
 }

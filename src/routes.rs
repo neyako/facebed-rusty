@@ -2,11 +2,13 @@ use crate::config::Config;
 use crate::cookies::NOTIFY_FAILURE_THRESHOLD;
 use crate::crawler;
 use crate::embed::{
-    format_error_embed, format_full_post_embed, format_oversized_video_embed,
-    format_redirect_page, format_reel_post_embed, format_timeout_embed,
+    format_error_embed, format_full_post_embed, format_oversized_video_embed, format_redirect_page,
+    format_reel_post_embed, format_timeout_embed,
 };
 use crate::error::FacebedError;
-use crate::fetch::{fetch_public_preview, resolve_share_link, Fetcher, OgPreview, ACCOUNT_OVERRIDE};
+use crate::fetch::{
+    fetch_public_preview, resolve_share_link, Fetcher, OgPreview, ACCOUNT_OVERRIDE,
+};
 use crate::notifier::Notifier;
 use crate::parsers::{
     json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
@@ -65,7 +67,10 @@ async fn static_asset(path: &str, ct: &'static str) -> Response {
     match tokio::fs::read(path).await {
         Ok(bytes) => {
             let mut headers = HeaderMap::new();
-            headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(ct));
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static(ct),
+            );
             (StatusCode::OK, headers, bytes).into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, "").into_response(),
@@ -91,7 +96,10 @@ fn no_store_html_response(body: String) -> Response {
         axum::http::header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, max-age=0"),
     );
-    headers.insert(axum::http::header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        axum::http::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -108,18 +116,26 @@ static RE_PAGE_VIDEO: Lazy<Regex> =
 static RE_PHOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
 static RE_WATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*watch").unwrap());
 static RE_SHARE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
-static RE_SHARE_PR: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/([pr]/)?[a-zA-Z0-9\-._]*(/)?").unwrap());
-static RE_STORIES: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?stories/\d+/[A-Za-z0-9=_-]+").unwrap());
+static RE_SHARE_PR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(/)?share/([pr]/)?[a-zA-Z0-9\-._]*(/)?").unwrap());
+static RE_STORIES: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/?stories/\d+/[A-Za-z0-9=_-]+").unwrap());
 
 fn is_facebook_url(path: &str) -> bool {
     let username_pat = r"[a-zA-Z0-9\-._]*";
     let full = format!("https://www.facebook.com/{path}");
-    let Ok(parsed) = Url::parse(&full) else { return false };
+    let Ok(parsed) = Url::parse(&full) else {
+        return false;
+    };
     let p = parsed.path();
-    let is_group = Regex::new(&format!("^/groups/{username_pat}")).unwrap().is_match(p);
+    let is_group = Regex::new(&format!("^/groups/{username_pat}"))
+        .unwrap()
+        .is_match(p);
     let is_permalink = p.starts_with("/permalink.php");
     let is_story = p.starts_with("/story.php");
-    let is_post = Regex::new(&format!("/{username_pat}/posts")).unwrap().is_match(p);
+    let is_post = Regex::new(&format!("/{username_pat}/posts"))
+        .unwrap()
+        .is_match(p);
     let is_photo = p.starts_with("/photo");
     is_permalink || is_post || is_story || is_photo || is_group
 }
@@ -161,8 +177,14 @@ async fn catch_all(
         let target = url_clean::ensure_absolute(&path);
         let body = format_redirect_page(&target);
         let mut hdrs = HeaderMap::new();
-        hdrs.insert(axum::http::header::LOCATION, HeaderValue::from_str(&target).unwrap_or_else(|_| HeaderValue::from_static("/")));
-        hdrs.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+        hdrs.insert(
+            axum::http::header::LOCATION,
+            HeaderValue::from_str(&target).unwrap_or_else(|_| HeaderValue::from_static("/")),
+        );
+        hdrs.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
         return (StatusCode::MOVED_PERMANENTLY, hdrs, body).into_response();
     }
 
@@ -178,7 +200,10 @@ async fn catch_all(
                 if let Some(preview) = resolved.preview {
                     return html_response(render_preview(preview, state.config.timezone));
                 }
-                return html_response(format_error_embed(&url_clean::ensure_absolute(&working), "C"));
+                return html_response(format_error_embed(
+                    &url_clean::ensure_absolute(&working),
+                    "C",
+                ));
             }
             Err(e) => return error_response(&state, &working, e),
         }
@@ -200,9 +225,15 @@ async fn catch_all(
         ParserKind::Stories
     } else if RE_REEL.is_match(&working) {
         ParserKind::Reels
-    } else if path_only(&working).map(|p| RE_PHOTO.is_match(&p)).unwrap_or(false) {
+    } else if path_only(&working)
+        .map(|p| RE_PHOTO.is_match(&p))
+        .unwrap_or(false)
+    {
         ParserKind::SinglePhoto
-    } else if path_only(&working).map(|p| RE_WATCH.is_match(&p)).unwrap_or(false) {
+    } else if path_only(&working)
+        .map(|p| RE_WATCH.is_match(&p))
+        .unwrap_or(false)
+    {
         ParserKind::Watch
     } else if RE_PAGE_VIDEO.is_match(&working) {
         ParserKind::Watch
@@ -217,14 +248,20 @@ async fn catch_all(
 }
 
 fn path_only(s: &str) -> Option<String> {
-    Url::parse(&format!("https://www.facebook.com/{}", s.trim_start_matches('/')))
-        .ok()
-        .map(|u| u.path().to_owned())
+    Url::parse(&format!(
+        "https://www.facebook.com/{}",
+        s.trim_start_matches('/')
+    ))
+    .ok()
+    .map(|u| u.path().to_owned())
 }
 
 fn group_multi_permalink_path(s: &str) -> Option<String> {
-    let parsed = Url::parse(&format!("https://www.facebook.com/{}", s.trim_start_matches('/')))
-        .ok()?;
+    let parsed = Url::parse(&format!(
+        "https://www.facebook.com/{}",
+        s.trim_start_matches('/')
+    ))
+    .ok()?;
     let mut segments = parsed.path_segments()?;
     if segments.next()? != "groups" {
         return None;
@@ -245,11 +282,11 @@ fn group_multi_permalink_path(s: &str) -> Option<String> {
 
 /// Stable identifier for "this group" or "this user" used to pin a working
 /// cookie account. Discord embeds go stale fast, so the second time a link
-/// from the same group/profile lands we want to skip the round-robin
-/// warm-up and hit the account that worked last time.
+/// from the same group/profile lands we want to try the account that worked
+/// last time before walking the fallback list.
 ///
 /// Returns None for shapes where the path can't identify a scope
-/// (photo.php, some watch URLs) — those fall back to plain round-robin.
+/// (photo.php, some watch URLs) — those fall back to configured priority order.
 fn scope_key(path: &str) -> Option<String> {
     let p = path_only(path)?;
     let p = p.trim_start_matches('/');
@@ -290,11 +327,9 @@ enum ParserKind {
 }
 
 async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
-    // Retry across every cookie account. With multi-account setups, a given post
-    // may only be visible to some accounts — round-robin happily picks ones that
-    // can't view it. We loop deterministically through all accounts (seeded from
-    // the current round-robin cursor so cold requests still rotate fairly) and
-    // bail to error_response only after every account has failed.
+    // Retry across every cookie account in configured priority order. Primary
+    // account gets first chance; extra accounts are fallback/load-balancing
+    // hints via affinity, not blind per-request rotation.
     //
     // Cooldown: accounts that failed recently are skipped on the first pass so
     // we don't pay a slow FB round-trip on a checkpointed/expired account
@@ -302,12 +337,10 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     // account succeeded.
     let n = state.ctx.cookies.len();
     let attempts = n.max(1);
-    let start = state.ctx.cookies.cursor();
     let mut last_err: Option<FacebedError> = None;
-    let advance_cursor = n > 0;
     let key = scope_key(path);
 
-    // Build ordering: healthy accounts first (in round-robin order), then
+    // Build ordering: healthy accounts first (priority order), then
     // cooldowned ones as fallback. With n=0 (anonymous) we still loop once.
     // If we've previously seen an account succeed for this group/user, hoist
     // it to the front of the healthy list — Discord embeds expire if the
@@ -316,7 +349,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
         let mut healthy = Vec::new();
         let mut cooled = Vec::new();
         for attempt in 0..attempts {
-            let i = start.wrapping_add(attempt) % n;
+            let i = attempt % n;
             if state.ctx.cookies.in_cooldown(i) {
                 cooled.push(i);
             } else {
@@ -347,9 +380,8 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
 
         match result {
             Ok(post) => {
-                if advance_cursor {
+                if n > 0 {
                     state.ctx.cookies.mark_ok(account_index);
-                    state.ctx.cookies.advance_cursor();
                     if let Some(k) = key.as_deref() {
                         state.ctx.cookies.set_affinity(k.to_string(), account_index);
                     }
@@ -358,7 +390,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 return html_response(body);
             }
             Err(e) if is_retryable(&e) && loop_idx + 1 < order.len() => {
-                if advance_cursor {
+                if n > 0 {
                     let count = state.ctx.cookies.mark_failed(account_index);
                     maybe_notify_bad_account(state, account_index, count, &e);
                     if let Some(k) = key.as_deref() {
@@ -368,24 +400,20 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                     }
                 }
                 let label = state.ctx.cookies.label_at(account_index).unwrap_or("?");
-                warn!(path = %path, attempt = loop_idx, account = %label, error = %e, "retrying with next account");
+                warn!(path = %path, attempt = loop_idx, account = %label, error = %e, "retrying with fallback account");
                 last_err = Some(e);
                 continue;
             }
             Err(e) => {
-                if advance_cursor {
+                if n > 0 {
                     let count = state.ctx.cookies.mark_failed(account_index);
                     maybe_notify_bad_account(state, account_index, count, &e);
-                    state.ctx.cookies.advance_cursor();
                 }
                 return error_response(state, path, e);
             }
         }
     }
 
-    if advance_cursor {
-        state.ctx.cookies.advance_cursor();
-    }
     error_response(
         state,
         path,
@@ -553,7 +581,11 @@ fn render_preview(preview: OgPreview, tz: i32) -> String {
     format_full_post_embed(&post, tz)
 }
 
-async fn run_parser(state: &AppState, path: &str, kind: ParserKind) -> Result<ParsedPost, FacebedError> {
+async fn run_parser(
+    state: &AppState,
+    path: &str,
+    kind: ParserKind,
+) -> Result<ParsedPost, FacebedError> {
     match kind {
         ParserKind::JsonPost => JsonPostParser.process(&state.ctx, path).await,
         ParserKind::SinglePhoto => SinglePhotoParser.process(&state.ctx, path).await,
@@ -644,7 +676,11 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
         FacebedError::NoData(msg) => {
             info!(path = %path, "no data: {}", msg);
         }
-        FacebedError::Parse { message, html, url: u } => {
+        FacebedError::Parse {
+            message,
+            html,
+            url: u,
+        } => {
             error!(path = %path, error = %message, "parser bug");
             let page_url = u.clone().unwrap_or_else(|| url.clone());
             let warn_msg = format!("🚨 **ParseException** for `{path}`\n{page_url}\n`{message}`");
@@ -654,7 +690,10 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
                     .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
                     .take(80)
                     .collect::<String>();
-                state.notifier.warn(warn_msg, Some((format!("{safe}.html"), h.clone().into_bytes())));
+                state.notifier.warn(
+                    warn_msg,
+                    Some((format!("{safe}.html"), h.clone().into_bytes())),
+                );
             } else {
                 state.notifier.warn(warn_msg, None);
             }
@@ -668,13 +707,14 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        group_multi_permalink_path, preview_matches_path, scope_key, OgPreview,
-    };
+    use super::{group_multi_permalink_path, preview_matches_path, scope_key, OgPreview};
 
     #[test]
     fn group_path_extracts_group_id() {
-        assert_eq!(scope_key("groups/12345/posts/678"), Some("groups/12345".into()));
+        assert_eq!(
+            scope_key("groups/12345/posts/678"),
+            Some("groups/12345".into())
+        );
         assert_eq!(scope_key("/groups/foo.bar"), Some("groups/foo.bar".into()));
     }
 
@@ -682,7 +722,10 @@ mod tests {
     fn user_post_path_extracts_username() {
         assert_eq!(scope_key("alice/posts/123"), Some("user/alice".into()));
         assert_eq!(scope_key("zuck/videos/abc/456"), Some("user/zuck".into()));
-        assert_eq!(scope_key("page.name/photos/123"), Some("user/page.name".into()));
+        assert_eq!(
+            scope_key("page.name/photos/123"),
+            Some("user/page.name".into())
+        );
         assert_eq!(scope_key("u-name/reels/123"), Some("user/u-name".into()));
     }
 
@@ -710,7 +753,9 @@ mod tests {
     #[test]
     fn group_multi_permalink_rewrites_to_post_path() {
         assert_eq!(
-            group_multi_permalink_path("groups/364997627165697/?multi_permalinks=3055041888161244&x=1"),
+            group_multi_permalink_path(
+                "groups/364997627165697/?multi_permalinks=3055041888161244&x=1"
+            ),
             Some("groups/364997627165697/posts/3055041888161244/".into())
         );
     }

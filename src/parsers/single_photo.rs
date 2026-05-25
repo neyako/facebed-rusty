@@ -14,10 +14,20 @@ impl Parser for SinglePhotoParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
         let html = page.parse();
-        let content_node = get_content_node(&html)
-            .ok_or_else(|| FacebedError::parse_with("Cannot process post (cn)", page.html.clone(), page.url.clone()))?;
-        let interaction = get_interactions_node(&html)
-            .ok_or_else(|| FacebedError::parse_with("Cannot process post (in)", page.html.clone(), page.url.clone()))?;
+        let content_node = get_content_node(&html).ok_or_else(|| {
+            FacebedError::parse_with(
+                "Cannot process post (cn)",
+                page.html.clone(),
+                page.url.clone(),
+            )
+        })?;
+        let interaction = get_interactions_node(&html).ok_or_else(|| {
+            FacebedError::parse_with(
+                "Cannot process post (in)",
+                page.html.clone(),
+                page.url.clone(),
+            )
+        })?;
         let text = content_node
             .pointer("/message/text")
             .and_then(|v| v.as_str())
@@ -33,8 +43,13 @@ impl Parser for SinglePhotoParser {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let (likes, cmts, shares) = interaction_counts(&interaction)?;
-        let image = get_single_image(&html)
-            .ok_or_else(|| FacebedError::parse_with("cannot find single image", page.html.clone(), page.url.clone()))?;
+        let image = get_single_image(&html).ok_or_else(|| {
+            FacebedError::parse_with(
+                "cannot find single image",
+                page.html.clone(),
+                page.url.clone(),
+            )
+        })?;
 
         Ok(ParsedPost {
             author_name: author,

@@ -96,7 +96,10 @@ mod tests {
     #[test]
     fn all_collects() {
         let v = json!({"id": 1, "child": {"id": 2, "grandchild": {"id": 3}}});
-        let mut ids: Vec<i64> = all(&v, "id").into_iter().filter_map(|x| x.as_i64()).collect();
+        let mut ids: Vec<i64> = all(&v, "id")
+            .into_iter()
+            .filter_map(|x| x.as_i64())
+            .collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2, 3]);
     }

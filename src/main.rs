@@ -63,6 +63,39 @@ async fn main() -> anyhow::Result<()> {
                 None,
             );
         }
+        let check_fetcher = fetcher.clone();
+        let check_notifier = notifier.clone();
+        tokio::spawn(async move {
+            let checks = check_fetcher.check_cookie_accounts().await;
+            let mut bad = Vec::new();
+            for check in &checks {
+                if check.ok {
+                    info!(
+                        account_index = check.index,
+                        account = %check.label,
+                        name = %check.account_name.as_deref().unwrap_or("?"),
+                        status = ?check.status,
+                        "cookie account alive"
+                    );
+                } else {
+                    let reason = check.reason.as_deref().unwrap_or("unknown");
+                    warn!(
+                        account_index = check.index,
+                        account = %check.label,
+                        status = ?check.status,
+                        reason = %reason,
+                        "cookie account bad"
+                    );
+                    bad.push(format!("{} ({reason})", check.label));
+                }
+            }
+            if !bad.is_empty() {
+                check_notifier.warn(
+                    format!("@everyone cookie account check failed: {}", bad.join(", ")),
+                    None,
+                );
+            }
+        });
     }
 
     let ctx = Arc::new(ParserCtx {
@@ -81,9 +114,7 @@ async fn main() -> anyhow::Result<()> {
     let app = router(state).layer(
         tower_http::trace::TraceLayer::new_for_http()
             .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO))
-            .on_response(
-                tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
-            ),
+            .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO)),
     );
 
     info!("listening on {}", addr);

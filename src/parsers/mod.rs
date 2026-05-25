@@ -3,13 +3,13 @@ use crate::error::FacebedResult;
 use crate::fetch::Fetcher;
 use std::sync::Arc;
 
-pub mod util;
 pub mod json_post;
-pub mod single_photo;
 pub mod photocom;
 pub mod reels;
-pub mod video_watch;
+pub mod single_photo;
 pub mod stories;
+pub mod util;
+pub mod video_watch;
 
 #[derive(Debug, Clone)]
 pub struct ParsedPost {

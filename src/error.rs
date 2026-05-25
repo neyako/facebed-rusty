@@ -30,11 +30,19 @@ pub enum FacebedError {
 
 impl FacebedError {
     pub fn parse(msg: impl Into<String>) -> Self {
-        Self::Parse { message: msg.into(), html: None, url: None }
+        Self::Parse {
+            message: msg.into(),
+            html: None,
+            url: None,
+        }
     }
 
     pub fn parse_with(msg: impl Into<String>, html: String, url: String) -> Self {
-        Self::Parse { message: msg.into(), html: Some(html), url: Some(url) }
+        Self::Parse {
+            message: msg.into(),
+            html: Some(html),
+            url: Some(url),
+        }
     }
 
     pub fn no_data(msg: impl Into<String>) -> Self {

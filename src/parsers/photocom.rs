@@ -13,23 +13,49 @@ impl Parser for PhotocomParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
         let html = page.parse();
-        let content = get_content_node(&html)
-            .ok_or_else(|| FacebedError::parse_with("Cannot process photocom (cn)", page.html.clone(), page.url.clone()))?;
-        let data = content.get("data").ok_or_else(|| FacebedError::parse("missing data"))?;
-        let attached_comment = data.get("attached_comment").ok_or_else(|| FacebedError::parse("missing attached_comment"))?;
+        let content = get_content_node(&html).ok_or_else(|| {
+            FacebedError::parse_with(
+                "Cannot process photocom (cn)",
+                page.html.clone(),
+                page.url.clone(),
+            )
+        })?;
+        let data = content
+            .get("data")
+            .ok_or_else(|| FacebedError::parse("missing data"))?;
+        let attached_comment = data
+            .get("attached_comment")
+            .ok_or_else(|| FacebedError::parse("missing attached_comment"))?;
         let body = attached_comment.get("preferred_body");
-        let text = body.and_then(|b| b.get("text")).and_then(|t| t.as_str()).unwrap_or("").to_owned();
+        let text = body
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_owned();
         let owner_name = data
             .pointer("/owner/name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
-        let date = data.get("created_time").and_then(|v| v.as_i64()).unwrap_or(0);
+        let date = data
+            .get("created_time")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
-        let (image, url) = get_attached_image_and_url(&html)
-            .ok_or_else(|| FacebedError::parse_with("Cannot process photocom (iau)", page.html.clone(), page.url.clone()))?;
-        let reactions_count = get_reaction_count(&html)
-            .ok_or_else(|| FacebedError::parse_with("Cannot process photocom (rc)", page.html.clone(), page.url.clone()))?;
+        let (image, url) = get_attached_image_and_url(&html).ok_or_else(|| {
+            FacebedError::parse_with(
+                "Cannot process photocom (iau)",
+                page.html.clone(),
+                page.url.clone(),
+            )
+        })?;
+        let reactions_count = get_reaction_count(&html).ok_or_else(|| {
+            FacebedError::parse_with(
+                "Cannot process photocom (rc)",
+                page.html.clone(),
+                page.url.clone(),
+            )
+        })?;
 
         Ok(ParsedPost {
             author_name: format!("{} (💬)", owner_name),

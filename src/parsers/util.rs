@@ -22,7 +22,10 @@ pub fn human_format(num: &Value) -> String {
         magnitude += 1;
         f /= 1000.0;
     }
-    let suffix = ["", "K", "M", "B", "T"].get(magnitude).copied().unwrap_or("T");
+    let suffix = ["", "K", "M", "B", "T"]
+        .get(magnitude)
+        .copied()
+        .unwrap_or("T");
     let mut s = format!("{:.3}", (f * 1000.0).round() / 1000.0);
     while s.ends_with('0') {
         s.pop();
@@ -70,7 +73,9 @@ impl<'a> Story<'a> {
             .get("actors")
             .and_then(|a| a.as_array())
             .ok_or_else(|| FacebedError::parse("story.actors missing"))?;
-        let actor = actors.first().ok_or_else(|| FacebedError::parse("story.actors[0] missing"))?;
+        let actor = actors
+            .first()
+            .ok_or_else(|| FacebedError::parse("story.actors[0] missing"))?;
         let author_name = val_str_at(actor, "name").unwrap_or("").to_owned();
         let author_id = match actor.get("id") {
             Some(Value::String(s)) => s.clone(),
@@ -158,7 +163,11 @@ pub fn images_from_post(post_json: &Value) -> Vec<String> {
         let candidates: Vec<&Value> = sub
             .into_iter()
             .filter(|s| {
-                s.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()).unwrap_or(0) == max_count
+                s.get("nodes")
+                    .and_then(|n| n.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0)
+                    == max_count
                     && !jq::all(s, "viewer_image").is_empty()
             })
             .collect();
@@ -192,7 +201,11 @@ pub fn images_from_post(post_json: &Value) -> Vec<String> {
 
     // fallback: comet_photo_attachment_resolution_renderer.image.uri
     for aa in jq::all(post_json, "comet_photo_attachment_resolution_renderer") {
-        if let Some(uri) = aa.get("image").and_then(|i| i.get("uri")).and_then(|s| s.as_str()) {
+        if let Some(uri) = aa
+            .get("image")
+            .and_then(|i| i.get("uri"))
+            .and_then(|s| s.as_str())
+        {
             return vec![uri.to_owned()];
         }
     }
@@ -284,7 +297,11 @@ pub fn thumbnail_in_node(node: &Value) -> Option<String> {
     // Fallback: scan any nested `preferred_thumbnail` / `thumbnailImage`.
     for key in ["preferred_thumbnail", "thumbnailImage"] {
         if let Some(t) = jq::first(node, key) {
-            if let Some(uri) = t.get("image").and_then(|i| i.get("uri")).and_then(|s| s.as_str()) {
+            if let Some(uri) = t
+                .get("image")
+                .and_then(|i| i.get("uri"))
+                .and_then(|s| s.as_str())
+            {
                 if !uri.is_empty() {
                     return Some(uri.to_owned());
                 }
@@ -306,8 +323,12 @@ pub fn thumbnail_in_node(node: &Value) -> Option<String> {
 /// URL. Scan is recursive — same behavior as the upstream JS reference.
 pub fn extract_link_card(story_json: &Value) -> Option<(String, String)> {
     for attachment in jq::all(story_json, "attachment") {
-        let Some(target) = attachment.get("target") else { continue };
-        let Some(url) = target.get("external_url").and_then(|u| u.as_str()) else { continue };
+        let Some(target) = attachment.get("target") else {
+            continue;
+        };
+        let Some(url) = target.get("external_url").and_then(|u| u.as_str()) else {
+            continue;
+        };
         if url.is_empty() {
             continue;
         }
@@ -325,9 +346,17 @@ pub fn extract_link_card(story_json: &Value) -> Option<(String, String)> {
 pub fn interaction_counts(post_json: &Value) -> Result<(String, String, String), FacebedError> {
     let pf = jq::first(post_json, "comet_ufi_summary_and_actions_renderer")
         .ok_or_else(|| FacebedError::parse("missing comet_ufi_summary_and_actions_renderer"))?;
-    let fb = pf.get("feedback").ok_or_else(|| FacebedError::parse("missing feedback"))?;
-    let reactions = fb.get("i18n_reaction_count").map(val_str).unwrap_or_else(|| "0".into());
-    let shares = fb.get("i18n_share_count").map(val_str).unwrap_or_else(|| "0".into());
+    let fb = pf
+        .get("feedback")
+        .ok_or_else(|| FacebedError::parse("missing feedback"))?;
+    let reactions = fb
+        .get("i18n_reaction_count")
+        .map(val_str)
+        .unwrap_or_else(|| "0".into());
+    let shares = fb
+        .get("i18n_share_count")
+        .map(val_str)
+        .unwrap_or_else(|| "0".into());
     let comments = fb
         .get("comment_rendering_instance")
         .and_then(|c| c.get("comments"))

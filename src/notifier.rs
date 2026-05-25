@@ -14,7 +14,8 @@ impl Notifier {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.webhook.starts_with("https://discord.com/api/webhooks/")
+        self.webhook
+            .starts_with("https://discord.com/api/webhooks/")
     }
 
     /// Fire-and-forget. Spawns a tokio task; failures get logged.
@@ -45,7 +46,9 @@ async fn send(
                 .part("file", Part::bytes(bytes).file_name(filename));
             client.post(webhook).multipart(form)
         }
-        None => client.post(webhook).json(&serde_json::json!({"content": msg})),
+        None => client
+            .post(webhook)
+            .json(&serde_json::json!({"content": msg})),
     };
     let resp = req.send().await?;
     if !resp.status().is_success() {

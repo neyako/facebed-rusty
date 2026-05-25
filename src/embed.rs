@@ -7,10 +7,21 @@ const CREDIT: &str = "facebed on Rust";
 
 /// Match Python `quote()` — percent-encode the same special chars.
 const UNSAFE: &AsciiSet = &CONTROLS
-    .add(b'<').add(b'>').add(b'"').add(b'\'')
-    .add(b'#').add(b'%').add(b'{').add(b'}')
-    .add(b'[').add(b']').add(b'|').add(b'\\')
-    .add(b'^').add(b'~').add(b'`');
+    .add(b'<')
+    .add(b'>')
+    .add(b'"')
+    .add(b'\'')
+    .add(b'#')
+    .add(b'%')
+    .add(b'{')
+    .add(b'}')
+    .add(b'[')
+    .add(b']')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'~')
+    .add(b'`');
 
 pub fn quote(s: &str) -> String {
     utf8_percent_encode(s, UNSAFE).to_string()
@@ -58,14 +69,25 @@ fn format_timestamp(ts: i64, tz_offset: i32) -> String {
         None => return String::new(),
     };
     let sign = if tz_offset >= 0 { '+' } else { '-' };
-    format!("⌚ {} UTC{}{}", dt.format("%Y/%m/%d %H:%M:%S"), sign, tz_offset.abs())
+    format!(
+        "⌚ {} UTC{}{}",
+        dt.format("%Y/%m/%d %H:%M:%S"),
+        sign,
+        tz_offset.abs()
+    )
 }
 
 fn format_reactions(likes: &str, cmts: &str, shares: &str) -> String {
     let mut parts = Vec::new();
-    if likes != "null" { parts.push(format!("❤️ {}", likes)); }
-    if cmts != "null" { parts.push(format!("💬 {}", cmts)); }
-    if shares != "null" { parts.push(format!("🔁 {}", shares)); }
+    if likes != "null" {
+        parts.push(format!("❤️ {}", likes));
+    }
+    if cmts != "null" {
+        parts.push(format!("💬 {}", cmts));
+    }
+    if shares != "null" {
+        parts.push(format!("🔁 {}", shares));
+    }
     parts.join(" • ").replace(',', ".")
 }
 
@@ -81,7 +103,12 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     images.truncate(4);
     let image_meta = images
         .iter()
-        .map(|u| format!(r#"<meta property="og:image" content="{}"/>"#, escape_attr(u)))
+        .map(|u| {
+            format!(
+                r#"<meta property="og:image" content="{}"/>"#,
+                escape_attr(u)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let post_date = format_timestamp(post.date, tz_offset);
@@ -218,7 +245,11 @@ pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String
 }
 
 pub fn format_error_embed(original_url: &str, error_code: &str) -> String {
-    let suffix = if error_code.is_empty() { String::new() } else { format!(" [{}]", error_code) };
+    let suffix = if error_code.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", error_code)
+    };
     let url_q = quote(original_url);
     format!(
         r##"<!DOCTYPE html>

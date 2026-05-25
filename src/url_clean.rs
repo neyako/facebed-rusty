@@ -88,7 +88,10 @@ pub fn extract_share_url(input: &str) -> Option<String> {
     let absolute = ensure_absolute(input);
     let parsed = Url::parse(&absolute).ok()?;
     for (k, v) in parsed.query_pairs() {
-        if k == "share_url" && (v.starts_with("https://www.facebook.com/") || v.starts_with("http://www.facebook.com/")) {
+        if k == "share_url"
+            && (v.starts_with("https://www.facebook.com/")
+                || v.starts_with("http://www.facebook.com/"))
+        {
             return Some(clean_path(&v));
         }
     }
@@ -115,7 +118,9 @@ mod tests {
 
     #[test]
     fn share_url_extraction() {
-        let s = extract_share_url("reel/123/?share_url=https%3A%2F%2Fwww.facebook.com%2Fshare%2Fr%2Fabc%2F");
+        let s = extract_share_url(
+            "reel/123/?share_url=https%3A%2F%2Fwww.facebook.com%2Fshare%2Fr%2Fabc%2F",
+        );
         assert_eq!(s, Some("share/r/abc/".to_string()));
     }
 }

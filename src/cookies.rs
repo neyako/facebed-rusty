@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -38,8 +38,13 @@ impl CookieAccount {
     }
 
     pub fn any_expired(&self) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as f64).unwrap_or(0.0);
-        self.entries.iter().any(|c| c.expiration_date.map(|e| e <= now).unwrap_or(false))
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as f64)
+            .unwrap_or(0.0);
+        self.entries
+            .iter()
+            .any(|c| c.expiration_date.map(|e| e <= now).unwrap_or(false))
     }
 }
 
@@ -65,7 +70,6 @@ pub const NOTIFY_FAILURE_THRESHOLD: u64 = 3;
 #[derive(Debug)]
 pub struct CookieJar {
     accounts: Vec<CookieAccount>,
-    cursor: AtomicUsize,
     /// Per-account "last failure" unix seconds. Parallel to `accounts`.
     /// Zero means "never failed".
     last_failures: Vec<AtomicU64>,
@@ -74,18 +78,17 @@ pub struct CookieJar {
     /// broken (vs. a one-off transient blip).
     consecutive_failures: Vec<AtomicU64>,
     /// Scope key (e.g. `groups/123`, `user/alice`) -> last-successful account
-    /// index. Lets the retry loop skip the round-robin warm-up for repeat
-    /// requests against the same group/profile — important for Discord
-    /// embeds, where the link goes stale if the first fetch wastes time on
-    /// an account that can't see the post.
+    /// index. Lets repeat requests for the same group/profile try the known
+    /// working account first, while cold requests keep the configured account
+    /// priority order.
     affinity: Mutex<HashMap<String, usize>>,
 }
 
 impl CookieJar {
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             accounts: Vec::new(),
-            cursor: AtomicUsize::new(0),
             last_failures: Vec::new(),
             consecutive_failures: Vec::new(),
             affinity: Mutex::new(HashMap::new()),
@@ -150,7 +153,11 @@ impl CookieJar {
                     load_one(&p, &mut accounts);
                 }
             }
-            Err(e) => warn!("could not scan {} for cookie files: {}", parent.display(), e),
+            Err(e) => warn!(
+                "could not scan {} for cookie files: {}",
+                parent.display(),
+                e
+            ),
         }
 
         // Sidecar useragents.json: { "alice": "UA-string", ... }. Lets users
@@ -168,7 +175,11 @@ impl CookieJar {
         }
 
         for acc in &accounts {
-            info!("loaded {} cookies for account '{}'", acc.entries.len(), acc.label);
+            info!(
+                "loaded {} cookies for account '{}'",
+                acc.entries.len(),
+                acc.label
+            );
             if acc.any_expired() {
                 warn!("account '{}' has expired cookies", acc.label);
             }
@@ -182,7 +193,6 @@ impl CookieJar {
         let consecutive_failures = (0..accounts.len()).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             accounts,
-            cursor: AtomicUsize::new(0),
             last_failures,
             consecutive_failures,
             affinity: Mutex::new(HashMap::new()),
@@ -262,7 +272,11 @@ fn load_useragents(dir: &Path) -> HashMap<String, String> {
     };
     match serde_json::from_str::<HashMap<String, String>>(&raw) {
         Ok(m) => {
-            info!("loaded {} user-agent overrides from {}", m.len(), path.display());
+            info!(
+                "loaded {} user-agent overrides from {}",
+                m.len(),
+                path.display()
+            );
             m
         }
         Err(e) => {
@@ -273,18 +287,8 @@ fn load_useragents(dir: &Path) -> HashMap<String, String> {
 }
 
 impl CookieJar {
-
     pub fn len(&self) -> usize {
         self.accounts.len()
-    }
-
-    /// Round-robin select an account.
-    pub fn next_account(&self) -> Option<&CookieAccount> {
-        if self.accounts.is_empty() {
-            return None;
-        }
-        let i = self.cursor.fetch_add(1, Ordering::Relaxed) % self.accounts.len();
-        Some(&self.accounts[i])
     }
 
     /// Pick a specific account by index (modulo account count). Returns None for empty jar.
@@ -293,17 +297,6 @@ impl CookieJar {
             return None;
         }
         Some(&self.accounts[i % self.accounts.len()])
-    }
-
-    /// Current round-robin cursor (without advancing). Used to seed retry loops so the
-    /// first attempt matches the regular round-robin pick.
-    pub fn cursor(&self) -> usize {
-        self.cursor.load(Ordering::Relaxed)
-    }
-
-    /// Advance the round-robin cursor by one.
-    pub fn advance_cursor(&self) {
-        self.cursor.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Mark the account at `i` (mod len) as having just failed. Future
@@ -371,7 +364,11 @@ impl CookieJar {
     }
 
     pub fn expired_labels(&self) -> Vec<String> {
-        self.accounts.iter().filter(|a| a.any_expired()).map(|a| a.label.clone()).collect()
+        self.accounts
+            .iter()
+            .filter(|a| a.any_expired())
+            .map(|a| a.label.clone())
+            .collect()
     }
 
     /// Account index previously known to succeed for this scope key.
@@ -385,7 +382,9 @@ impl CookieJar {
         if self.accounts.is_empty() {
             return;
         }
-        let Ok(mut m) = self.affinity.lock() else { return };
+        let Ok(mut m) = self.affinity.lock() else {
+            return;
+        };
         if m.len() >= AFFINITY_CAP && !m.contains_key(&key) {
             if let Some(k) = m.keys().next().cloned() {
                 m.remove(&k);
@@ -496,7 +495,8 @@ mod tests {
                 {"label":"x","user_agent":"UA-X","entries":[{"name":"c_user","value":"1"}]},
                 {"label":"y","entries":[{"name":"c_user","value":"2"}]}
             ]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let jar = CookieJar::load(&main).unwrap();
         assert_eq!(jar.accounts[0].user_agent.as_deref(), Some("UA-X"));
         assert_eq!(jar.accounts[1].user_agent, None);

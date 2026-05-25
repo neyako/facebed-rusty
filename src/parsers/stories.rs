@@ -41,9 +41,15 @@ impl Parser for StoriesParser {
             .and_then(|o| val_str_at(o, "name"))
             .unwrap_or("")
             .to_owned();
-        let author_id = owner.and_then(|o| val_str_at(o, "id")).unwrap_or("").to_owned();
+        let author_id = owner
+            .and_then(|o| val_str_at(o, "id"))
+            .unwrap_or("")
+            .to_owned();
 
-        let date = node.get("creation_time").and_then(|v| v.as_i64()).unwrap_or(0);
+        let date = node
+            .get("creation_time")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
         let permalink = node
             .pointer("/story_card_info/permalink_info/uri")
@@ -51,16 +57,17 @@ impl Parser for StoriesParser {
             .map(str::to_owned)
             .unwrap_or_else(|| ensure_absolute(post_path));
 
-        let media = node
-            .pointer("/attachments/0/media")
-            .ok_or_else(|| {
-                FacebedError::parse_with("Invalid story (media)", page.html.clone(), page.url.clone())
-            })?;
+        let media = node.pointer("/attachments/0/media").ok_or_else(|| {
+            FacebedError::parse_with("Invalid story (media)", page.html.clone(), page.url.clone())
+        })?;
 
         let mut image_links = Vec::new();
         let mut video_links = Vec::new();
 
-        if let Some(playable) = media.get("playable_url_quality_hd").and_then(|v| v.as_str()) {
+        if let Some(playable) = media
+            .get("playable_url_quality_hd")
+            .and_then(|v| v.as_str())
+        {
             video_links.push(playable.to_owned());
         } else if let Some(playable) = media.get("playable_url").and_then(|v| v.as_str()) {
             video_links.push(playable.to_owned());

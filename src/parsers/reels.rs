@@ -15,17 +15,29 @@ impl Parser for ReelsParser {
         let blocks = get_json_blocks(&html, true);
 
         let content_node = find_content_node(&blocks).ok_or_else(|| {
-            FacebedError::parse_with("Invalid reels link (cn)", page.html.clone(), page.url.clone())
+            FacebedError::parse_with(
+                "Invalid reels link (cn)",
+                page.html.clone(),
+                page.url.clone(),
+            )
         })?;
 
         let video_link = find_video_link(&blocks, &content_node).ok_or_else(|| {
-            FacebedError::parse_with("Invalid reels link (vn)", page.html.clone(), page.url.clone())
+            FacebedError::parse_with(
+                "Invalid reels link (vn)",
+                page.html.clone(),
+                page.url.clone(),
+            )
         })?;
 
         let video_id = val_str_at(&content_node, "id").unwrap_or("").to_owned();
 
         let owner = find_owner_with_name(&blocks).ok_or_else(|| {
-            FacebedError::parse_with("Invalid reels link (own)", page.html.clone(), page.url.clone())
+            FacebedError::parse_with(
+                "Invalid reels link (own)",
+                page.html.clone(),
+                page.url.clone(),
+            )
         })?;
         let typename = val_str_at(&owner, "__typename").unwrap_or("");
         let is_ig = typename.starts_with("InstagramUser");
@@ -42,19 +54,18 @@ impl Parser for ReelsParser {
         let date = find_creation_time(&blocks).unwrap_or(0);
         let post_text = find_message_text(&blocks);
 
-        let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, &video_id)
-            .unwrap_or(("null".into(), "null".into(), "null".into()));
+        let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, &video_id).unwrap_or((
+            "null".into(),
+            "null".into(),
+            "null".into(),
+        ));
 
         if ctx.is_banned(&owner_id) {
             return Ok(banned_post(&post_url));
         }
 
         let thumbnail = thumbnail_in_node(&content_node)
-            .or_else(|| {
-                blocks
-                    .iter()
-                    .find_map(|b| thumbnail_in_node(b))
-            });
+            .or_else(|| blocks.iter().find_map(|b| thumbnail_in_node(b)));
 
         Ok(ParsedPost {
             author_name: op_name,
@@ -195,7 +206,10 @@ fn get_reaction_counts(
     let feedbacks = jq::all(bloc, "feedback");
     let first_fb = feedbacks.first().copied()?;
     let last_fb = feedbacks.last().copied()?;
-    let (first_fb, last_fb) = if first_fb.to_string().contains("cross_universe_feedback_info") {
+    let (first_fb, last_fb) = if first_fb
+        .to_string()
+        .contains("cross_universe_feedback_info")
+    {
         (last_fb, first_fb)
     } else {
         (first_fb, last_fb)

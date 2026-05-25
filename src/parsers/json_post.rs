@@ -18,28 +18,32 @@ impl Parser for JsonPostParser {
         let html = page.parse();
         let post_id = extract_post_id(post_path);
         let post_json = get_post_json(&html, post_id.as_deref()).ok_or_else(|| {
-            FacebedError::parse_with(
-                "cannot find post json",
-                page.html.clone(),
-                page.url.clone(),
-            )
+            FacebedError::parse_with("cannot find post json", page.html.clone(), page.url.clone())
         })?;
-        let root = get_root_node(&post_json)
-            .ok_or_else(|| FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone()))?;
+        let root = get_root_node(&post_json).ok_or_else(|| {
+            FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
+        })?;
         let (likes, cmts, shares) = interaction_counts(root)?;
 
         let post_date = root
             .pointer("/context_layout/story/comet_sections/metadata")
             .and_then(|m| jq::first(m, "creation_time"))
-            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0);
 
-        let story_json = root
-            .pointer("/content/story")
-            .ok_or_else(|| FacebedError::parse_with("missing content.story", page.html.clone(), page.url.clone()))?;
+        let story_json = root.pointer("/content/story").ok_or_else(|| {
+            FacebedError::parse_with("missing content.story", page.html.clone(), page.url.clone())
+        })?;
         let story = Story::from_json(story_json)?;
 
-        let post_url = if story.url.is_empty() { ensure_absolute(post_path) } else { story.url.clone() };
+        let post_url = if story.url.is_empty() {
+            ensure_absolute(post_path)
+        } else {
+            story.url.clone()
+        };
         let post_content = story.get_text().trim().to_owned();
         let group_name = get_group_name(&html);
         let mut link_header = story.author_name.clone();

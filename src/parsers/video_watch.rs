@@ -29,12 +29,20 @@ impl Parser for VideoWatchParser {
                 None
             })
             .ok_or_else(|| {
-                FacebedError::parse_with("Invalid watch link (vn)", page.html.clone(), page.url.clone())
+                FacebedError::parse_with(
+                    "Invalid watch link (vn)",
+                    page.html.clone(),
+                    page.url.clone(),
+                )
             })?;
 
         let post_url = ensure_absolute(post_path);
         let op_name = get_op_name(&html).ok_or_else(|| {
-            FacebedError::parse_with("Invalid watch link (opn)", page.html.clone(), page.url.clone())
+            FacebedError::parse_with(
+                "Invalid watch link (opn)",
+                page.html.clone(),
+                page.url.clone(),
+            )
         })?;
         let text = content_node
             .pointer("/title/text")
@@ -49,8 +57,9 @@ impl Parser for VideoWatchParser {
             .pointer("/feedback/total_comment_count")
             .cloned()
             .unwrap_or(Value::Null);
-        let date = find_creation_time(&html)
-            .ok_or_else(|| FacebedError::parse_with("cannot find date", page.html.clone(), page.url.clone()))?;
+        let date = find_creation_time(&html).ok_or_else(|| {
+            FacebedError::parse_with("cannot find date", page.html.clone(), page.url.clone())
+        })?;
 
         let thumbnail = thumbnail_in_node(&content_node).or_else(|| {
             get_json_blocks(&html, false)
@@ -93,7 +102,10 @@ fn get_op_name(html: &Html) -> Option<String> {
 
 fn get_content_node(html: &Html, raw_html: &str, url: &str) -> FacebedResult<Value> {
     for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["comment_rendering_instance", "video_view_count_renderer"]) {
+        if jq::has(
+            &bloc,
+            &["comment_rendering_instance", "video_view_count_renderer"],
+        ) {
             if let Some(d) = jq::first(&bloc, "result").and_then(|r| r.get("data")) {
                 return Ok(d.clone());
             }
@@ -109,14 +121,20 @@ fn get_content_node(html: &Html, raw_html: &str, url: &str) -> FacebedResult<Val
             }
         }
     }
-    Err(FacebedError::parse_with("Invalid watch link (cn)", raw_html.to_owned(), url.to_owned()))
+    Err(FacebedError::parse_with(
+        "Invalid watch link (cn)",
+        raw_html.to_owned(),
+        url.to_owned(),
+    ))
 }
 
 fn find_creation_time(html: &Html) -> Option<i64> {
     for bloc in get_json_blocks(html, true) {
         if jq::has(&bloc, &["creation_time"]) {
             let v = jq::first(&bloc, "creation_time")?;
-            return v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+            return v
+                .as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()));
         }
     }
     None
