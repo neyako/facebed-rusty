@@ -383,10 +383,10 @@ async fn process_with_preview_deadline(
     state: &AppState,
     path: &str,
     kind: ParserKind,
-    preview: Option<OgPreview>,
+    mut preview: Option<OgPreview>,
     started: Instant,
 ) -> Response {
-    let preview_task = if preview.is_none() {
+    let mut preview_task = if preview.is_none() {
         let fetcher = state.fetcher.clone();
         let path = path.to_owned();
         Some(tokio::spawn(async move {
@@ -397,54 +397,63 @@ async fn process_with_preview_deadline(
     };
 
     let elapsed = started.elapsed();
-    if elapsed >= DISCORD_RESPONSE_BUDGET {
-        let fallback = match preview {
-            Some(preview) => Some(preview),
-            None => await_preview(preview_task).await,
-        };
-        if let Some(preview) = fallback {
-            info!(path = %path, elapsed_ms = elapsed.as_millis(), "rendering fast public preview");
-            return html_response(render_preview(preview, state.config.timezone));
+    let full_scrape = process(state, path, kind);
+    tokio::pin!(full_scrape);
+
+    if let Some(remaining) = DISCORD_RESPONSE_BUDGET.checked_sub(elapsed) {
+        match tokio::time::timeout(remaining, &mut full_scrape).await {
+            Ok(response) => {
+                abort_preview(preview_task);
+                return response;
+            }
+            Err(_) => {
+                warn!(
+                    path = %path,
+                    budget_ms = DISCORD_RESPONSE_BUDGET.as_millis(),
+                    "full scrape exceeded Discord response budget"
+                );
+            }
         }
-        return html_response(format_error_embed(&url_clean::ensure_absolute(path), "U"));
     }
 
-    let remaining = DISCORD_RESPONSE_BUDGET - elapsed;
-    match tokio::time::timeout(remaining, process(state, path, kind)).await {
-        Ok(response) => {
-            if let Some(task) = preview_task {
-                task.abort();
-            }
-            response
-        }
-        Err(_) => {
-            warn!(
-                path = %path,
-                budget_ms = DISCORD_RESPONSE_BUDGET.as_millis(),
-                "full scrape exceeded Discord response budget; rendering fast public preview"
-            );
-            let fallback = match preview {
-                Some(preview) => Some(preview),
-                None => await_preview(preview_task).await,
-            };
-            if let Some(preview) = fallback {
-                html_response(render_preview(preview, state.config.timezone))
-            } else {
-                html_response(format_error_embed(&url_clean::ensure_absolute(path), "U"))
-            }
+    if let Some(preview) = take_preview(&mut preview, &mut preview_task).await {
+        info!(path = %path, elapsed_ms = started.elapsed().as_millis(), "rendering fast public preview");
+        return html_response(render_preview(preview, state.config.timezone));
+    }
+
+    warn!(
+        path = %path,
+        elapsed_ms = started.elapsed().as_millis(),
+        "no public preview available; continuing full scrape instead of rendering error"
+    );
+    let response = full_scrape.await;
+    abort_preview(preview_task);
+    response
+}
+
+async fn take_preview(
+    preview: &mut Option<OgPreview>,
+    preview_task: &mut Option<tokio::task::JoinHandle<Option<OgPreview>>>,
+) -> Option<OgPreview> {
+    if preview.is_some() {
+        return preview.take();
+    }
+    let Some(mut task) = preview_task.take() else {
+        return None;
+    };
+    tokio::select! {
+        result = &mut task => result.ok().flatten(),
+        _ = tokio::time::sleep(PUBLIC_PREVIEW_WAIT) => {
+            task.abort();
+            None
         }
     }
 }
 
-async fn await_preview(
-    preview_task: Option<tokio::task::JoinHandle<Option<OgPreview>>>,
-) -> Option<OgPreview> {
-    let task = preview_task?;
-    tokio::time::timeout(PUBLIC_PREVIEW_WAIT, task)
-        .await
-        .ok()?
-        .ok()
-        .flatten()
+fn abort_preview(preview_task: Option<tokio::task::JoinHandle<Option<OgPreview>>>) {
+    if let Some(task) = preview_task {
+        task.abort();
+    }
 }
 
 fn render_preview(preview: OgPreview, tz: i32) -> String {
