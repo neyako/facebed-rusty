@@ -37,17 +37,8 @@ pub struct FetchedPage {
 }
 
 #[derive(Debug, Clone)]
-pub struct OgPreview {
-    pub title: String,
-    pub description: String,
-    pub image: String,
-    pub url: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ResolvedShare {
     pub path: String,
-    pub preview: Option<OgPreview>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,44 +245,42 @@ impl Fetcher {
 /// Resolve a `/share/v/...` or `/share/[pr]/...` link to its canonical
 /// content path.
 ///
-/// Fast path mirrors upstream Python for share/p and share/r: HEAD the
-/// share URL with a requests-like UA and use the redirect target.
-/// Browser/Discord UAs are slower or do not redirect reliably here.
-///
-/// If public HEAD/GET cannot produce an off-/share/ target, retry the share
-/// resolve with cookie accounts in configured priority order. Private groups
-/// can hide the share target from public crawlers even when the primary cookie
-/// can view the post.
+/// Cookie accounts are tried first in configured priority order. Public
+/// fallback only exists for no-cookie dev deployments; prod uses the same
+/// cookie path for share resolution and content fetches.
 pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
     let is_share_v = is_share_v_path(path);
+    if fetcher.cookies.len() > 0 {
+        if let Some(resolved) = resolve_share_link_with_accounts(fetcher, path, is_share_v).await {
+            return Ok(resolved);
+        }
+        return Ok(ResolvedShare {
+            path: String::new(),
+        });
+    }
+
+    resolve_share_link_public(fetcher, path, is_share_v).await
+}
+
+async fn resolve_share_link_public(
+    fetcher: &Fetcher,
+    path: &str,
+    is_share_v: bool,
+) -> FacebedResult<ResolvedShare> {
     let head_path = resolve_share_link_head(fetcher, path, None).await;
     if let Some(path) = head_path.as_deref() {
         if head_target_usable(path, is_share_v) {
             return Ok(ResolvedShare {
                 path: path.to_owned(),
-                preview: None,
             });
         }
     }
 
-    let resolved = match resolve_share_link_body(fetcher, path, None).await {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            if let Some(resolved) =
-                resolve_share_link_with_accounts(fetcher, path, is_share_v).await
-            {
-                return Ok(resolved);
-            }
-            return Err(e);
-        }
-    };
+    let resolved = resolve_share_link_body(fetcher, path, None).await?;
     if share_resolution_usable(&resolved) {
         return Ok(resolved);
     }
 
-    if let Some(resolved) = resolve_share_link_with_accounts(fetcher, path, is_share_v).await {
-        return Ok(resolved);
-    }
     Ok(resolved)
 }
 
@@ -343,10 +332,7 @@ async fn resolve_share_link_with_accounts(
         if let Some(path) = resolve_share_link_head(fetcher, path, Some(account_index)).await {
             if head_target_usable(&path, is_share_v) {
                 tracing::info!(account = %label, resolved = %path, "resolved share link with account head");
-                return Some(ResolvedShare {
-                    path,
-                    preview: None,
-                });
+                return Some(ResolvedShare { path });
             }
         }
 
@@ -418,7 +404,6 @@ async fn resolve_share_link_body(
             if still_on_share {
                 return Ok(ResolvedShare {
                     path: String::new(),
-                    preview: extract_og_preview(&body),
                 });
             }
             final_url
@@ -431,10 +416,7 @@ async fn resolve_share_link_body(
             .trim_start_matches("http://www.facebook.com/")
             .to_owned()
     });
-    Ok(ResolvedShare {
-        path: stripped,
-        preview: extract_og_preview(&body),
-    })
+    Ok(ResolvedShare { path: stripped })
 }
 
 async fn resolve_share_link_head(
@@ -492,23 +474,6 @@ fn facebook_path_from_url(raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// Fetch Facebook's public crawler OG tags without cookies. This is much
-/// cheaper than authenticated Comet JSON scraping and is used as a deadline
-/// fallback so Discord gets *some* valid embed before it gives up.
-pub async fn fetch_public_preview(fetcher: &Fetcher, path: &str) -> Option<OgPreview> {
-    let url = ensure_absolute(path);
-    let mut req = fetcher.client().get(&url);
-    for (k, v) in HEADERS {
-        req = req.header(*k, *v);
-    }
-    req = req.header(
-        "user-agent",
-        "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
-    );
-    let body = req.send().await.ok()?.text().await.ok()?;
-    extract_og_preview(&body)
-}
-
 /// Pull the post's canonical URL out of an FB share-page HTML body. Tries
 /// `<link rel="canonical">` first, falls back to `<meta property="og:url">`.
 /// Skips values that point back at /share/ to avoid loops.
@@ -531,55 +496,6 @@ fn extract_canonical_url(body: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn extract_og_preview(body: &str) -> Option<OgPreview> {
-    let doc = Html::parse_document(body);
-    let title_sel = Selector::parse("title").unwrap();
-    let page_title = doc
-        .select(&title_sel)
-        .next()
-        .map(|el| el.text().collect::<String>())
-        .unwrap_or_default();
-    let og_title = meta_content(&doc, r#"meta[property="og:title"]"#).unwrap_or_default();
-    let og_description =
-        meta_content(&doc, r#"meta[property="og:description"]"#).unwrap_or_default();
-    let image = meta_content(&doc, r#"meta[property="og:image"]"#)?;
-    let url =
-        meta_content(&doc, r#"meta[property="og:url"]"#).or_else(|| extract_canonical_url(body))?;
-
-    let parts = page_title
-        .split(" | ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "Facebook")
-        .collect::<Vec<_>>();
-    let title = parts
-        .first()
-        .copied()
-        .unwrap_or(og_title.as_str())
-        .trim()
-        .to_owned();
-    let description = if !og_description.trim().is_empty() {
-        og_description.trim().to_owned()
-    } else {
-        parts
-            .get(1)
-            .copied()
-            .unwrap_or(og_title.as_str())
-            .trim()
-            .to_owned()
-    };
-
-    if title.is_empty() || image.is_empty() || url.is_empty() {
-        return None;
-    }
-
-    Some(OgPreview {
-        title,
-        description,
-        image,
-        url,
-    })
 }
 
 fn extract_account_name(doc: &Html, body: &str) -> Option<String> {
@@ -849,7 +765,6 @@ mod tests {
         assert!(!head_target_usable("groups/sportsbook6vn/about/", false));
         let resolved = ResolvedShare {
             path: "groups/sportsbook6vn/about/".into(),
-            preview: None,
         };
         assert!(!share_resolution_usable(&resolved));
     }
@@ -859,7 +774,6 @@ mod tests {
         assert!(!head_target_usable("reel/123", true));
         let resolved = ResolvedShare {
             path: "reel/123".into(),
-            preview: None,
         };
         assert!(share_resolution_usable(&resolved));
     }

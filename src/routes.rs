@@ -6,9 +6,7 @@ use crate::embed::{
     format_reel_post_embed, format_timeout_embed,
 };
 use crate::error::FacebedError;
-use crate::fetch::{
-    fetch_public_preview, resolve_share_link, Fetcher, OgPreview, ACCOUNT_OVERRIDE,
-};
+use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
 use crate::notifier::Notifier;
 use crate::parsers::{
     json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
@@ -158,7 +156,6 @@ async fn catch_all(
     let is_bot = crawler::is_crawler(ua);
     info!(path = %path, bot = is_bot, ua = %ua, "request");
     let started = Instant::now();
-    let mut preview: Option<OgPreview> = None;
 
     // image-in-comment priority
     if let Ok(parsed) = Url::parse(&format!("https://www.facebook.com/{path}")) {
@@ -194,12 +191,8 @@ async fn catch_all(
         match resolve_share_link(&state.fetcher, &working).await {
             Ok(resolved) if !resolved.path.is_empty() => {
                 working = resolved.path;
-                preview = resolved.preview;
             }
-            Ok(resolved) => {
-                if let Some(preview) = resolved.preview {
-                    return html_response(render_preview(preview, state.config.timezone));
-                }
+            Ok(_) => {
                 return html_response(format_error_embed(
                     &url_clean::ensure_absolute(&working),
                     "C",
@@ -244,7 +237,7 @@ async fn catch_all(
     };
 
     info!(working = %working, kind = ?kind, "dispatch");
-    process_with_deadline(&state, &working, kind, preview, started).await
+    process_with_deadline(&state, &working, kind, started).await
 }
 
 fn path_only(s: &str) -> Option<String> {
@@ -421,27 +414,14 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     )
 }
 
-const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(5200);
-const PUBLIC_PREVIEW_WAIT: Duration = Duration::from_millis(500);
+const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(5000);
 
 async fn process_with_deadline(
     state: &AppState,
     path: &str,
     kind: ParserKind,
-    mut preview: Option<OgPreview>,
     started: Instant,
 ) -> Response {
-    let allow_public_preview = matches!(kind, ParserKind::JsonPost) && !is_group_path(path);
-    let mut preview_task = if preview.is_none() && allow_public_preview {
-        let fetcher = state.fetcher.clone();
-        let path = path.to_owned();
-        Some(tokio::spawn(async move {
-            fetch_public_preview(&fetcher, &path).await
-        }))
-    } else {
-        None
-    };
-
     let elapsed = started.elapsed();
     let full_scrape = process(state, path, kind);
     tokio::pin!(full_scrape);
@@ -449,7 +429,6 @@ async fn process_with_deadline(
     if let Some(remaining) = DISCORD_RESPONSE_BUDGET.checked_sub(elapsed) {
         match tokio::time::timeout(remaining, &mut full_scrape).await {
             Ok(response) => {
-                abort_preview(preview_task);
                 return response;
             }
             Err(_) => {
@@ -462,129 +441,12 @@ async fn process_with_deadline(
         }
     }
 
-    if let Some(preview) = take_preview(path, &mut preview, &mut preview_task).await {
-        info!(path = %path, elapsed_ms = started.elapsed().as_millis(), "rendering fast public preview");
-        return html_response(render_preview(preview, state.config.timezone));
-    }
-
     warn!(
         path = %path,
         elapsed_ms = started.elapsed().as_millis(),
-        "no fast preview available; rendering timeout embed"
+        "rendering timeout embed"
     );
-    abort_preview(preview_task);
     no_store_html_response(format_timeout_embed(&url_clean::ensure_absolute(path)))
-}
-
-async fn take_preview(
-    path: &str,
-    preview: &mut Option<OgPreview>,
-    preview_task: &mut Option<tokio::task::JoinHandle<Option<OgPreview>>>,
-) -> Option<OgPreview> {
-    let candidate = if preview.is_some() {
-        preview.take()
-    } else {
-        let Some(mut task) = preview_task.take() else {
-            return None;
-        };
-        tokio::select! {
-            result = &mut task => result.ok().flatten(),
-            _ = tokio::time::sleep(PUBLIC_PREVIEW_WAIT) => {
-                task.abort();
-                None
-            }
-        }
-    };
-
-    match candidate {
-        Some(preview) if preview_matches_path(&preview, path) => Some(preview),
-        Some(preview) => {
-            warn!(
-                path = %path,
-                preview_url = %preview.url,
-                "discarding public preview for different target"
-            );
-            None
-        }
-        None => None,
-    }
-}
-
-fn preview_matches_path(preview: &OgPreview, path: &str) -> bool {
-    let Some(target_path) = facebook_path_component(path) else {
-        return true;
-    };
-    let Some(preview_path) = facebook_path_component(&preview.url) else {
-        return true;
-    };
-
-    if let Some(target_id) = group_post_id(&target_path) {
-        return group_post_id(&preview_path).as_deref() == Some(target_id.as_str());
-    }
-
-    !is_group_landing_path(&preview_path)
-}
-
-fn facebook_path_component(s: &str) -> Option<String> {
-    Url::parse(&url_clean::ensure_absolute(s))
-        .ok()
-        .map(|u| u.path().trim_matches('/').to_owned())
-}
-
-fn is_group_path(path: &str) -> bool {
-    facebook_path_component(path)
-        .map(|p| p.starts_with("groups/"))
-        .unwrap_or(false)
-}
-
-fn group_post_id(path: &str) -> Option<String> {
-    let mut parts = path.trim_matches('/').split('/');
-    if parts.next()? != "groups" {
-        return None;
-    }
-    parts.next()?;
-    match parts.next()? {
-        "posts" | "permalink" => {
-            let id = parts.next()?;
-            if id.chars().all(|c| c.is_ascii_digit()) {
-                Some(id.to_owned())
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn is_group_landing_path(path: &str) -> bool {
-    let mut parts = path.trim_matches('/').split('/');
-    if parts.next() != Some("groups") {
-        return false;
-    }
-    parts.next();
-    matches!(parts.next(), None | Some("about"))
-}
-
-fn abort_preview(preview_task: Option<tokio::task::JoinHandle<Option<OgPreview>>>) {
-    if let Some(task) = preview_task {
-        task.abort();
-    }
-}
-
-fn render_preview(preview: OgPreview, tz: i32) -> String {
-    let post = ParsedPost {
-        author_name: preview.title,
-        text: preview.description,
-        image_links: vec![preview.image],
-        url: preview.url,
-        date: -1,
-        likes: "null".into(),
-        comments: "null".into(),
-        shares: "null".into(),
-        video_links: Vec::new(),
-        thumbnail: None,
-    };
-    format_full_post_embed(&post, tz)
 }
 
 async fn run_parser(
@@ -713,9 +575,7 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        group_multi_permalink_path, is_group_path, preview_matches_path, scope_key, OgPreview,
-    };
+    use super::{group_multi_permalink_path, scope_key};
 
     #[test]
     fn group_path_extracts_group_id() {
@@ -776,41 +636,5 @@ mod tests {
             group_multi_permalink_path("groups/12345/?multi_permalinks=../bad"),
             None
         );
-    }
-
-    #[test]
-    fn preview_for_group_about_does_not_match_group_post() {
-        let preview = OgPreview {
-            title: "Sportsbook 6Vn".into(),
-            description: String::new(),
-            image: "https://example.com/image.jpg".into(),
-            url: "https://www.facebook.com/groups/sportsbook6vn/about/".into(),
-        };
-        assert!(!preview_matches_path(
-            &preview,
-            "groups/sportsbook6vn/permalink/1351950440127367/"
-        ));
-    }
-
-    #[test]
-    fn preview_for_same_group_post_matches() {
-        let preview = OgPreview {
-            title: "Post".into(),
-            description: String::new(),
-            image: "https://example.com/image.jpg".into(),
-            url: "https://www.facebook.com/groups/sportsbook6vn/posts/1351950440127367/".into(),
-        };
-        assert!(preview_matches_path(
-            &preview,
-            "groups/sportsbook6vn/permalink/1351950440127367/"
-        ));
-    }
-
-    #[test]
-    fn group_paths_do_not_use_public_preview() {
-        assert!(is_group_path(
-            "groups/sportsbook6vn/permalink/1352085323447212/"
-        ));
-        assert!(!is_group_path("alice/posts/123"));
     }
 }
