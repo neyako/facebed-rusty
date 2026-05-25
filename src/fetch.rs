@@ -9,6 +9,7 @@ use scraper::{Html, Selector};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
 
 tokio::task_local! {
     /// When set, [`Fetcher::fetch`] uses this account index (modulo account count)
@@ -35,6 +36,20 @@ pub struct FetchedPage {
     pub html: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct OgPreview {
+    pub title: String,
+    pub description: String,
+    pub image: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedShare {
+    pub path: String,
+    pub preview: Option<OgPreview>,
+}
+
 impl FetchedPage {
     pub fn parse(&self) -> Html {
         Html::parse_document(&self.html)
@@ -45,18 +60,6 @@ impl FetchedPage {
 /// and for anonymous (no-cookie) requests.
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 
-/// Append a `_cb=<unix-millis>` query param so FB's edge cache can't serve
-/// a stale snapshot of the post (reaction counts, comments, edits). FB
-/// silently ignores unknown params, so this is safe across all post shapes.
-fn with_cache_buster(url: &str) -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let sep = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{sep}_cb={ms}")
-}
-
 const HEADERS: &[(&str, &str)] = &[
     ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
     ("accept-language", "en-US,en;q=0.9"),
@@ -66,6 +69,7 @@ const HEADERS: &[(&str, &str)] = &[
     ("sec-fetch-mode", "navigate"),
     ("sec-fetch-site", "none"),
 ];
+const SHARE_HEAD_USER_AGENT: &str = "python-requests/2.32.3";
 
 impl Fetcher {
     pub fn new(cookies: Arc<CookieJar>) -> anyhow::Result<Self> {
@@ -102,7 +106,7 @@ impl Fetcher {
 
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
-        let url = with_cache_buster(&ensure_absolute(post_path));
+        let url = ensure_absolute(post_path);
         let mut req = self.client.get(&url);
         for (k, v) in HEADERS {
             req = req.header(*k, *v);
@@ -138,20 +142,32 @@ impl Fetcher {
 /// Resolve a `/share/v/...` or `/share/[pr]/...` link to its canonical
 /// content path.
 ///
-/// We send a Discordbot UA here (not our Chrome UA from [`HEADERS`]) on
-/// purpose: FB serves the share page differently per UA. With a normal
-/// browser UA, FB sometimes HTTP-redirects share/v/ to `/reel/<id>` even
-/// when the underlying content is a Page video post (`<page>/videos/<slug>/<id>`)
-/// — trusting that redirect drags ReelsParser onto unrelated content on
-/// the served `/reel/<id>` page. With a Discordbot UA, FB consistently
-/// returns the share page as 200 with a `og:url` pointing at the real
-/// canonical path (the `/videos/` URL for page videos, `/reel/<id>` for
-/// true reels), which is what we want.
+/// Fast path mirrors upstream Python for share/p and share/r: HEAD the
+/// share URL with a requests-like UA and use the redirect target.
+/// Browser/Discord UAs are slower or do not redirect reliably here.
 ///
-/// `og:url` is preferred over the HTTP redirect target for the same
-/// reason. Returns the resolved path (no host), or empty if nothing
-/// off-/share/ could be derived.
-pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<String> {
+/// If HEAD cannot produce an off-/share/ target, fall back to a Discordbot
+/// GET and prefer `og:url` / canonical from the response body. share/v uses
+/// that fallback directly because FB can redirect Page videos to lossy
+/// reel-shaped URLs.
+pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
+    if !is_share_v_path(path) {
+        if let Some(path) = resolve_share_link_head(fetcher, path).await {
+            return Ok(ResolvedShare {
+                path,
+                preview: None,
+            });
+        }
+    }
+
+    resolve_share_link_body(fetcher, path).await
+}
+
+fn is_share_v_path(path: &str) -> bool {
+    path.trim_start_matches('/').starts_with("share/v/")
+}
+
+async fn resolve_share_link_body(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
     let url = ensure_absolute(path);
     let mut req = fetcher.client().get(&url);
     for (k, v) in HEADERS {
@@ -177,17 +193,76 @@ pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<
                 || final_url.starts_with("https://www.facebook.com/share")
                 || final_url.starts_with("http://www.facebook.com/share");
             if still_on_share {
-                return Ok(String::new());
+                return Ok(ResolvedShare {
+                    path: String::new(),
+                    preview: extract_og_preview(&body),
+                });
             }
             final_url
         }
     };
 
-    let stripped = resolved
-        .trim_start_matches("https://www.facebook.com/")
-        .trim_start_matches("http://www.facebook.com/")
-        .to_owned();
-    Ok(stripped)
+    let stripped = facebook_path_from_url(&resolved).unwrap_or_else(|| {
+        resolved
+            .trim_start_matches("https://www.facebook.com/")
+            .trim_start_matches("http://www.facebook.com/")
+            .to_owned()
+    });
+    Ok(ResolvedShare {
+        path: stripped,
+        preview: extract_og_preview(&body),
+    })
+}
+
+async fn resolve_share_link_head(fetcher: &Fetcher, path: &str) -> Option<String> {
+    let url = ensure_absolute(path);
+    let mut req = fetcher.client().head(&url);
+    for (k, v) in HEADERS {
+        req = req.header(*k, *v);
+    }
+    req = req.header("user-agent", SHARE_HEAD_USER_AGENT);
+    let resp = req.send().await.ok()?;
+    let final_url = resp.url().to_string();
+    if final_url == url {
+        return None;
+    }
+    facebook_path_from_url(&final_url)
+}
+
+fn facebook_path_from_url(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw).ok()?;
+    let host = parsed.host_str()?;
+    if !matches!(host, "www.facebook.com" | "facebook.com" | "m.facebook.com") {
+        return None;
+    }
+    let path = parsed.path().trim_start_matches('/');
+    if path.is_empty() || path.starts_with("share/") {
+        return None;
+    }
+
+    let mut out = path.to_owned();
+    if let Some(q) = parsed.query().filter(|q| !q.is_empty()) {
+        out.push('?');
+        out.push_str(q);
+    }
+    Some(out)
+}
+
+/// Fetch Facebook's public crawler OG tags without cookies. This is much
+/// cheaper than authenticated Comet JSON scraping and is used as a deadline
+/// fallback so Discord gets *some* valid embed before it gives up.
+pub async fn fetch_public_preview(fetcher: &Fetcher, path: &str) -> Option<OgPreview> {
+    let url = ensure_absolute(path);
+    let mut req = fetcher.client().get(&url);
+    for (k, v) in HEADERS {
+        req = req.header(*k, *v);
+    }
+    req = req.header(
+        "user-agent",
+        "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+    );
+    let body = req.send().await.ok()?.text().await.ok()?;
+    extract_og_preview(&body)
 }
 
 /// Pull the post's canonical URL out of an FB share-page HTML body. Tries
@@ -212,6 +287,51 @@ fn extract_canonical_url(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_og_preview(body: &str) -> Option<OgPreview> {
+    let doc = Html::parse_document(body);
+    let title_sel = Selector::parse("title").unwrap();
+    let page_title = doc
+        .select(&title_sel)
+        .next()
+        .map(|el| el.text().collect::<String>())
+        .unwrap_or_default();
+    let og_title = meta_content(&doc, r#"meta[property="og:title"]"#).unwrap_or_default();
+    let og_description = meta_content(&doc, r#"meta[property="og:description"]"#).unwrap_or_default();
+    let image = meta_content(&doc, r#"meta[property="og:image"]"#)?;
+    let url = meta_content(&doc, r#"meta[property="og:url"]"#).or_else(|| extract_canonical_url(body))?;
+
+    let parts = page_title
+        .split(" | ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "Facebook")
+        .collect::<Vec<_>>();
+    let title = parts.first().copied().unwrap_or(og_title.as_str()).trim().to_owned();
+    let description = if !og_description.trim().is_empty() {
+        og_description.trim().to_owned()
+    } else {
+        parts.get(1).copied().unwrap_or(og_title.as_str()).trim().to_owned()
+    };
+
+    if title.is_empty() || image.is_empty() || url.is_empty() {
+        return None;
+    }
+
+    Some(OgPreview {
+        title,
+        description,
+        image,
+        url,
+    })
+}
+
+fn meta_content(doc: &Html, selector: &str) -> Option<String> {
+    let sel = Selector::parse(selector).ok()?;
+    doc.select(&sel)
+        .next()
+        .and_then(|el| el.value().attr("content"))
+        .map(str::to_owned)
 }
 
 static LOGIN_HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"/login\b").unwrap());
@@ -303,4 +423,25 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
         .into_iter()
         .filter_map(|(_, txt)| serde_json::from_str(&txt).ok())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::facebook_path_from_url;
+
+    #[test]
+    fn facebook_path_from_url_keeps_query_for_real_targets() {
+        assert_eq!(
+            facebook_path_from_url("https://www.facebook.com/watch/?v=123&rdid=x"),
+            Some("watch/?v=123&rdid=x".into())
+        );
+    }
+
+    #[test]
+    fn facebook_path_from_url_skips_share_urls() {
+        assert_eq!(
+            facebook_path_from_url("https://www.facebook.com/share/p/abc/"),
+            None
+        );
+    }
 }

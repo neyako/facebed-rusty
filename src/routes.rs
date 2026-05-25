@@ -6,7 +6,7 @@ use crate::embed::{
     format_redirect_page, format_reel_post_embed,
 };
 use crate::error::FacebedError;
-use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
+use crate::fetch::{fetch_public_preview, resolve_share_link, Fetcher, OgPreview, ACCOUNT_OVERRIDE};
 use crate::notifier::Notifier;
 use crate::parsers::{
     json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
@@ -22,6 +22,7 @@ use axum::Router;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use url::Url;
 
@@ -126,6 +127,8 @@ async fn catch_all(
         .unwrap_or("");
     let is_bot = crawler::is_crawler(ua);
     info!(path = %path, bot = is_bot, ua = %ua, "request");
+    let started = Instant::now();
+    let mut preview: Option<OgPreview> = None;
 
     // image-in-comment priority
     if let Ok(parsed) = Url::parse(&format!("https://www.facebook.com/{path}")) {
@@ -153,8 +156,14 @@ async fn catch_all(
     let mut working = path.clone();
     if RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working) {
         match resolve_share_link(&state.fetcher, &working).await {
-            Ok(p) if !p.is_empty() => working = p,
-            Ok(_) => {
+            Ok(resolved) if !resolved.path.is_empty() => {
+                working = resolved.path;
+                preview = resolved.preview;
+            }
+            Ok(resolved) => {
+                if let Some(preview) = resolved.preview {
+                    return html_response(render_preview(preview, state.config.timezone));
+                }
                 return html_response(format_error_embed(&url_clean::ensure_absolute(&working), "C"));
             }
             Err(e) => return error_response(&state, &working, e),
@@ -163,6 +172,9 @@ async fn catch_all(
 
     // strip tracking AFTER share resolve
     working = url_clean::clean_path(&working);
+    if let Some(group_post) = group_multi_permalink_path(&working) {
+        working = group_post;
+    }
 
     // /videos/<id> → reel/<id>
     if let Some(caps) = RE_VIDEOS.captures(&working) {
@@ -187,6 +199,9 @@ async fn catch_all(
     };
 
     info!(working = %working, kind = ?kind, "dispatch");
+    if matches!(kind, ParserKind::JsonPost) {
+        return process_with_preview_deadline(&state, &working, kind, preview, started).await;
+    }
     process(&state, &working, kind).await
 }
 
@@ -194,6 +209,27 @@ fn path_only(s: &str) -> Option<String> {
     Url::parse(&format!("https://www.facebook.com/{}", s.trim_start_matches('/')))
         .ok()
         .map(|u| u.path().to_owned())
+}
+
+fn group_multi_permalink_path(s: &str) -> Option<String> {
+    let parsed = Url::parse(&format!("https://www.facebook.com/{}", s.trim_start_matches('/')))
+        .ok()?;
+    let mut segments = parsed.path_segments()?;
+    if segments.next()? != "groups" {
+        return None;
+    }
+    let group = segments.next()?;
+    if group.is_empty() {
+        return None;
+    }
+    let post = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "multi_permalinks")
+        .map(|(_, v)| v.into_owned())?;
+    if post.is_empty() || !post.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(format!("groups/{group}/posts/{post}/"))
 }
 
 /// Stable identifier for "this group" or "this user" used to pin a working
@@ -340,6 +376,93 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     )
 }
 
+const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(4500);
+const PUBLIC_PREVIEW_WAIT: Duration = Duration::from_millis(500);
+
+async fn process_with_preview_deadline(
+    state: &AppState,
+    path: &str,
+    kind: ParserKind,
+    preview: Option<OgPreview>,
+    started: Instant,
+) -> Response {
+    let preview_task = if preview.is_none() {
+        let fetcher = state.fetcher.clone();
+        let path = path.to_owned();
+        Some(tokio::spawn(async move {
+            fetch_public_preview(&fetcher, &path).await
+        }))
+    } else {
+        None
+    };
+
+    let elapsed = started.elapsed();
+    if elapsed >= DISCORD_RESPONSE_BUDGET {
+        let fallback = match preview {
+            Some(preview) => Some(preview),
+            None => await_preview(preview_task).await,
+        };
+        if let Some(preview) = fallback {
+            info!(path = %path, elapsed_ms = elapsed.as_millis(), "rendering fast public preview");
+            return html_response(render_preview(preview, state.config.timezone));
+        }
+        return html_response(format_error_embed(&url_clean::ensure_absolute(path), "U"));
+    }
+
+    let remaining = DISCORD_RESPONSE_BUDGET - elapsed;
+    match tokio::time::timeout(remaining, process(state, path, kind)).await {
+        Ok(response) => {
+            if let Some(task) = preview_task {
+                task.abort();
+            }
+            response
+        }
+        Err(_) => {
+            warn!(
+                path = %path,
+                budget_ms = DISCORD_RESPONSE_BUDGET.as_millis(),
+                "full scrape exceeded Discord response budget; rendering fast public preview"
+            );
+            let fallback = match preview {
+                Some(preview) => Some(preview),
+                None => await_preview(preview_task).await,
+            };
+            if let Some(preview) = fallback {
+                html_response(render_preview(preview, state.config.timezone))
+            } else {
+                html_response(format_error_embed(&url_clean::ensure_absolute(path), "U"))
+            }
+        }
+    }
+}
+
+async fn await_preview(
+    preview_task: Option<tokio::task::JoinHandle<Option<OgPreview>>>,
+) -> Option<OgPreview> {
+    let task = preview_task?;
+    tokio::time::timeout(PUBLIC_PREVIEW_WAIT, task)
+        .await
+        .ok()?
+        .ok()
+        .flatten()
+}
+
+fn render_preview(preview: OgPreview, tz: i32) -> String {
+    let post = ParsedPost {
+        author_name: preview.title,
+        text: preview.description,
+        image_links: vec![preview.image],
+        url: preview.url,
+        date: -1,
+        likes: "null".into(),
+        comments: "null".into(),
+        shares: "null".into(),
+        video_links: Vec::new(),
+        thumbnail: None,
+    };
+    format_full_post_embed(&post, tz)
+}
+
 async fn run_parser(state: &AppState, path: &str, kind: ParserKind) -> Result<ParsedPost, FacebedError> {
     match kind {
         ParserKind::JsonPost => JsonPostParser.process(&state.ctx, path).await,
@@ -455,7 +578,7 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::scope_key;
+    use super::{group_multi_permalink_path, scope_key};
 
     #[test]
     fn group_path_extracts_group_id() {
@@ -485,6 +608,24 @@ mod tests {
         assert_eq!(
             scope_key("groups/12345/posts/678?some=tracker"),
             Some("groups/12345".into())
+        );
+    }
+
+    #[test]
+    fn group_multi_permalink_rewrites_to_post_path() {
+        assert_eq!(
+            group_multi_permalink_path("groups/364997627165697/?multi_permalinks=3055041888161244&x=1"),
+            Some("groups/364997627165697/posts/3055041888161244/".into())
+        );
+    }
+
+    #[test]
+    fn group_multi_permalink_ignores_invalid_shapes() {
+        assert_eq!(group_multi_permalink_path("groups/12345/posts/678"), None);
+        assert_eq!(group_multi_permalink_path("alice?multi_permalinks=1"), None);
+        assert_eq!(
+            group_multi_permalink_path("groups/12345/?multi_permalinks=../bad"),
+            None
         );
     }
 }
