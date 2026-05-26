@@ -22,6 +22,7 @@ pub struct CookieEntry {
 pub struct CookieAccount {
     pub label: String,
     pub entries: Vec<CookieEntry>,
+    cookie_header: String,
     /// Optional UA override for this account. Lets each account look like a
     /// different browser/device to FB, which makes a multi-account setup
     /// look less like a single scraper hammering with rotated cookies.
@@ -29,12 +30,22 @@ pub struct CookieAccount {
 }
 
 impl CookieAccount {
-    pub fn header_value(&self) -> String {
-        self.entries
+    fn new(label: String, entries: Vec<CookieEntry>, user_agent: Option<String>) -> Self {
+        let cookie_header = entries
             .iter()
             .map(|c| format!("{}={}", c.name, c.value))
             .collect::<Vec<_>>()
-            .join("; ")
+            .join("; ");
+        Self {
+            label,
+            entries,
+            cookie_header,
+            user_agent,
+        }
+    }
+
+    pub fn header_value(&self) -> &str {
+        &self.cookie_header
     }
 
     pub fn any_expired(&self) -> bool {
@@ -219,11 +230,7 @@ impl CookieJar {
                 if entries.is_empty() {
                     Ok(Vec::new())
                 } else {
-                    Ok(vec![CookieAccount {
-                        label: fname_label,
-                        entries,
-                        user_agent: None,
-                    }])
+                    Ok(vec![CookieAccount::new(fname_label, entries, None)])
                 }
             }
             serde_json::Value::Object(_) => {
@@ -238,11 +245,7 @@ impl CookieJar {
                 let arr: Vec<AccountIn> = serde_json::from_value(raw_accs)?;
                 Ok(arr
                     .into_iter()
-                    .map(|a| CookieAccount {
-                        label: a.label,
-                        entries: a.entries,
-                        user_agent: a.user_agent,
-                    })
+                    .map(|a| CookieAccount::new(a.label, a.entries, a.user_agent))
                     .collect())
             }
             _ => anyhow::bail!("unsupported cookies file shape"),

@@ -4,7 +4,6 @@ use crate::jq;
 use crate::parsers::util::{interaction_counts, val_str_at};
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
-use scraper::Html;
 use serde_json::Value;
 
 pub struct SinglePhotoParser;
@@ -13,15 +12,16 @@ pub struct SinglePhotoParser;
 impl Parser for SinglePhotoParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.parse();
-        let content_node = get_content_node(&html).ok_or_else(|| {
+        let html = page.document();
+        let blocks = get_json_blocks(html, true);
+        let content_node = get_content_node(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "Cannot process post (cn)",
                 page.html.clone(),
                 page.url.clone(),
             )
         })?;
-        let interaction = get_interactions_node(&html).ok_or_else(|| {
+        let interaction = get_interactions_node(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "Cannot process post (in)",
                 page.html.clone(),
@@ -43,7 +43,7 @@ impl Parser for SinglePhotoParser {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let (likes, cmts, shares) = interaction_counts(&interaction)?;
-        let image = get_single_image(&html).ok_or_else(|| {
+        let image = get_single_image(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "cannot find single image",
                 page.html.clone(),
@@ -66,28 +66,28 @@ impl Parser for SinglePhotoParser {
     }
 }
 
-fn get_content_node(html: &Html) -> Option<Value> {
-    for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["message_preferred_body", "container_story"]) {
-            return jq::first(&bloc, "data").cloned();
+fn get_content_node(blocks: &[Value]) -> Option<Value> {
+    for bloc in blocks {
+        if jq::has(bloc, &["message_preferred_body", "container_story"]) {
+            return jq::first(bloc, "data").cloned();
         }
     }
     None
 }
 
-fn get_interactions_node(html: &Html) -> Option<Value> {
-    for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["comet_ufi_summary_and_actions_renderer"]) {
-            return Some(bloc);
+fn get_interactions_node(blocks: &[Value]) -> Option<Value> {
+    for bloc in blocks {
+        if jq::has(bloc, &["comet_ufi_summary_and_actions_renderer"]) {
+            return Some(bloc.clone());
         }
     }
     None
 }
 
-fn get_single_image(html: &Html) -> Option<String> {
-    for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["prefetch_uris_v2"]) {
-            let first = jq::first(&bloc, "prefetch_uris_v2")?.as_array()?.first()?;
+fn get_single_image(blocks: &[Value]) -> Option<String> {
+    for bloc in blocks {
+        if jq::has(bloc, &["prefetch_uris_v2"]) {
+            let first = jq::first(bloc, "prefetch_uris_v2")?.as_array()?.first()?;
             return val_str_at(first, "uri").map(str::to_owned);
         }
     }

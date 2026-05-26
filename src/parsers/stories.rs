@@ -18,7 +18,6 @@ use crate::jq;
 use crate::parsers::util::val_str_at;
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
-use scraper::Html;
 use serde_json::Value;
 
 pub struct StoriesParser;
@@ -27,8 +26,9 @@ pub struct StoriesParser;
 impl Parser for StoriesParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.parse();
-        let (bucket, node) = find_story_bucket_and_node(&html).ok_or_else(|| {
+        let html = page.document();
+        let blocks = get_json_blocks(html, true);
+        let (bucket, node) = find_story_bucket_and_node(&blocks).ok_or_else(|| {
             // No bucket = expired or login wall. Treat as NoData (24h-old stories vanish).
             FacebedError::no_data(format!(
                 "story unavailable for {} (expired or restricted)",
@@ -107,16 +107,16 @@ impl Parser for StoriesParser {
 
 /// Find the `(bucket, story_node)` pair for the requested story.
 /// First match wins — FB usually puts the relevant bucket in the largest block.
-fn find_story_bucket_and_node(html: &Html) -> Option<(Value, Value)> {
-    for bloc in get_json_blocks(html, true) {
-        for usn in jq::all(&bloc, "unified_stories_with_notes") {
+fn find_story_bucket_and_node(blocks: &[Value]) -> Option<(Value, Value)> {
+    for bloc in blocks {
+        for usn in jq::all(bloc, "unified_stories_with_notes") {
             let edges = usn.get("edges").and_then(|e| e.as_array())?;
             let node = edges.first()?.get("node")?;
             if node.get("attachments").is_none() {
                 continue;
             }
             // walk up: the bucket is the parent containing usn + owner
-            let bucket = find_bucket_containing(&bloc, usn)?;
+            let bucket = find_bucket_containing(bloc, usn)?;
             return Some((bucket.clone(), node.clone()));
         }
     }

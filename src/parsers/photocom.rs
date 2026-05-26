@@ -3,7 +3,6 @@ use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::util::{human_format, val_str_at};
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
-use scraper::Html;
 use serde_json::Value;
 
 pub struct PhotocomParser;
@@ -12,8 +11,9 @@ pub struct PhotocomParser;
 impl Parser for PhotocomParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.parse();
-        let content = get_content_node(&html).ok_or_else(|| {
+        let html = page.document();
+        let blocks = get_json_blocks(html, true);
+        let content = get_content_node(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "Cannot process photocom (cn)",
                 page.html.clone(),
@@ -42,14 +42,14 @@ impl Parser for PhotocomParser {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
 
-        let (image, url) = get_attached_image_and_url(&html).ok_or_else(|| {
+        let (image, url) = get_attached_image_and_url(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "Cannot process photocom (iau)",
                 page.html.clone(),
                 page.url.clone(),
             )
         })?;
-        let reactions_count = get_reaction_count(&html).ok_or_else(|| {
+        let reactions_count = get_reaction_count(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "Cannot process photocom (rc)",
                 page.html.clone(),
@@ -72,28 +72,28 @@ impl Parser for PhotocomParser {
     }
 }
 
-fn get_content_node(html: &Html) -> Option<Value> {
-    for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["attached_comment"]) && !jq::has(&bloc, &["unified_reactors"]) {
-            return jq::first(&bloc, "result").cloned();
+fn get_content_node(blocks: &[Value]) -> Option<Value> {
+    for bloc in blocks {
+        if jq::has(bloc, &["attached_comment"]) && !jq::has(bloc, &["unified_reactors"]) {
+            return jq::first(bloc, "result").cloned();
         }
     }
     None
 }
 
-fn get_reaction_count(html: &Html) -> Option<i64> {
-    for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["attached_comment", "unified_reactors"]) {
-            return jq::first(&bloc, "unified_reactors")?.get("count")?.as_i64();
+fn get_reaction_count(blocks: &[Value]) -> Option<i64> {
+    for bloc in blocks {
+        if jq::has(bloc, &["attached_comment", "unified_reactors"]) {
+            return jq::first(bloc, "unified_reactors")?.get("count")?.as_i64();
         }
     }
     None
 }
 
-fn get_attached_image_and_url(html: &Html) -> Option<(String, String)> {
-    for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["attached_comment", "unified_reactors"]) {
-            let cur = jq::first(&bloc, "currMedia")?;
+fn get_attached_image_and_url(blocks: &[Value]) -> Option<(String, String)> {
+    for bloc in blocks {
+        if jq::has(bloc, &["attached_comment", "unified_reactors"]) {
+            let cur = jq::first(bloc, "currMedia")?;
             let image = val_str_at(cur.get("image")?, "uri")?.to_owned();
             let url = val_str_at(cur.get("attached_comment")?.get("feedback")?, "url")?.to_owned();
             return Some((image, url));

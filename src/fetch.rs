@@ -30,10 +30,10 @@ pub enum PageType {
     Unknown,
 }
 
-#[derive(Debug)]
 pub struct FetchedPage {
     pub url: String,
     pub html: String,
+    document: Html,
 }
 
 #[derive(Debug, Clone)]
@@ -52,8 +52,8 @@ pub struct CookieAccountCheck {
 }
 
 impl FetchedPage {
-    pub fn parse(&self) -> Html {
-        Html::parse_document(&self.html)
+    pub fn document(&self) -> &Html {
+        &self.document
     }
 }
 
@@ -71,6 +71,7 @@ const HEADERS: &[(&str, &str)] = &[
     ("sec-fetch-site", "none"),
 ];
 const SHARE_HEAD_USER_AGENT: &str = "python-requests/2.32.3";
+const VIDEO_HEAD_TIMEOUT: Duration = Duration::from_millis(750);
 
 impl Fetcher {
     pub fn new(cookies: Arc<CookieJar>) -> anyhow::Result<Self> {
@@ -195,7 +196,13 @@ impl Fetcher {
     /// hand the URL off as an `og:video`. Returns `None` on transport error,
     /// non-2xx response, or missing/unparseable header.
     pub async fn head_content_length(&self, url: &str) -> Option<u64> {
-        let resp = self.client.head(url).send().await.ok()?;
+        let resp = self
+            .client
+            .head(url)
+            .timeout(VIDEO_HEAD_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -210,7 +217,50 @@ impl Fetcher {
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
         let url = ensure_absolute(post_path);
-        let mut req = self.client.get(&url);
+        let (req, account_label) = self.request_for(&url, use_cookies);
+        let resp = req.send().await?;
+        let status = resp.status();
+        let final_url = resp.url().to_string();
+        let html = resp.text().await?;
+        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, "fetch done");
+        self.page_from_html(url, html, post_path)
+    }
+
+    /// Fetch a Facebook path, stopping early once `should_stop` says the
+    /// downloaded prefix contains enough data for the caller. If it never
+    /// matches, this behaves like [`fetch`].
+    pub async fn fetch_until<F>(
+        &self,
+        post_path: &str,
+        use_cookies: bool,
+        should_stop: F,
+    ) -> FacebedResult<FetchedPage>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut should_stop = should_stop;
+        let url = ensure_absolute(post_path);
+        let (req, account_label) = self.request_for(&url, use_cookies);
+        let mut resp = req.send().await?;
+        let status = resp.status();
+        let final_url = resp.url().to_string();
+        let mut body = Vec::new();
+        let mut stopped_early = false;
+        while let Some(chunk) = resp.chunk().await? {
+            body.extend_from_slice(&chunk);
+            let html = String::from_utf8_lossy(&body);
+            if should_stop(&html) {
+                stopped_early = true;
+                break;
+            }
+        }
+        let html = String::from_utf8_lossy(&body).into_owned();
+        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early, "fetch done");
+        self.page_from_html(url, html, post_path)
+    }
+
+    fn request_for(&self, url: &str, use_cookies: bool) -> (RequestBuilder, String) {
+        let mut req = self.client.get(url);
         for (k, v) in HEADERS {
             req = req.header(*k, *v);
         }
@@ -230,13 +280,21 @@ impl Fetcher {
                 }
             }
         }
-        req = req.header("user-agent", user_agent);
-        let resp = req.send().await?;
-        let status = resp.status();
-        let final_url = resp.url().to_string();
-        let html = resp.text().await?;
-        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), "fetch done");
-        let page = FetchedPage { url, html };
+        (req.header("user-agent", user_agent), account_label)
+    }
+
+    fn page_from_html(
+        &self,
+        url: String,
+        html: String,
+        post_path: &str,
+    ) -> FacebedResult<FetchedPage> {
+        let document = Html::parse_document(&html);
+        let page = FetchedPage {
+            url,
+            html,
+            document,
+        };
         check_or_raise(&page, post_path)?;
         Ok(page)
     }
@@ -479,16 +537,14 @@ fn facebook_path_from_url(raw: &str) -> Option<String> {
 /// Skips values that point back at /share/ to avoid loops.
 fn extract_canonical_url(body: &str) -> Option<String> {
     let doc = Html::parse_document(body);
-    let canon_sel = Selector::parse(r#"link[rel="canonical"]"#).unwrap();
-    if let Some(el) = doc.select(&canon_sel).next() {
+    if let Some(el) = doc.select(&CANONICAL_LINK_SEL).next() {
         if let Some(href) = el.value().attr("href") {
             if !href.contains("/share/") {
                 return Some(href.to_owned());
             }
         }
     }
-    let og_sel = Selector::parse(r#"meta[property="og:url"]"#).unwrap();
-    for el in doc.select(&og_sel) {
+    for el in doc.select(&OG_URL_SEL) {
         if let Some(content) = el.value().attr("content") {
             if !content.contains("/share/") {
                 return Some(content.to_owned());
@@ -507,8 +563,7 @@ fn extract_account_name(doc: &Html, body: &str) -> Option<String> {
 }
 
 fn page_title(doc: &Html) -> Option<String> {
-    let title_sel = Selector::parse("title").ok()?;
-    doc.select(&title_sel)
+    doc.select(&TITLE_SEL)
         .next()
         .map(|el| el.text().collect::<String>())
 }
@@ -626,18 +681,26 @@ fn meta_content(doc: &Html, selector: &str) -> Option<String> {
 
 static LOGIN_HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"/login\b").unwrap());
 static LOGIN_META_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)URL\s*=\s*/login[/?]").unwrap());
+static CANONICAL_LINK_SEL: Lazy<Selector> =
+    Lazy::new(|| Selector::parse(r#"link[rel="canonical"]"#).unwrap());
+static REFRESH_META_SEL: Lazy<Selector> =
+    Lazy::new(|| Selector::parse(r#"meta[http-equiv="refresh"]"#).unwrap());
+static JSON_SCRIPT_SEL: Lazy<Selector> = Lazy::new(|| {
+    Selector::parse(r#"script[type="application/json"][data-content-len][data-sjs]"#).unwrap()
+});
+static OG_URL_SEL: Lazy<Selector> =
+    Lazy::new(|| Selector::parse(r#"meta[property="og:url"]"#).unwrap());
+static TITLE_SEL: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
 
-pub fn probe_page_type(html: &Html) -> PageType {
-    let canonical_sel = Selector::parse("link[rel=canonical]").unwrap();
-    if let Some(el) = html.select(&canonical_sel).next() {
+pub fn probe_page_type(html: &Html, body: &str) -> PageType {
+    if let Some(el) = html.select(&CANONICAL_LINK_SEL).next() {
         if let Some(href) = el.value().attr("href") {
             if LOGIN_HREF_RE.is_match(href) {
                 return PageType::LoginWall;
             }
         }
     }
-    let meta_sel = Selector::parse(r#"meta[http-equiv="refresh"]"#).unwrap();
-    if let Some(el) = html.select(&meta_sel).next() {
+    if let Some(el) = html.select(&REFRESH_META_SEL).next() {
         if let Some(content) = el.value().attr("content") {
             if LOGIN_META_RE.is_match(content) {
                 return PageType::LoginWall;
@@ -645,34 +708,9 @@ pub fn probe_page_type(html: &Html) -> PageType {
         }
     }
 
-    let mut has_login_preloader = false;
-    let mut has_post_data = false;
-
-    for bloc in get_json_blocks(html, false) {
-        if !has_login_preloader {
-            if let Some(v) = jq::first(&bloc, "login_data") {
-                if v.is_object() {
-                    has_login_preloader = true;
-                }
-            }
-            if !has_login_preloader {
-                let mut tmp = Vec::new();
-                jq::enumerate(&bloc, &mut tmp);
-                for obj in tmp {
-                    if let Some(qn) = obj.get("queryName") {
-                        if qn.as_str() == Some("useCometLogInFormQuery") {
-                            has_login_preloader = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if jq::has(&bloc, &["i18n_reaction_count"]) {
-            has_post_data = true;
-            break;
-        }
-    }
+    let has_post_data = body.contains("i18n_reaction_count");
+    let has_login_preloader =
+        body.contains("login_data") || body.contains("useCometLogInFormQuery");
 
     if has_post_data {
         PageType::HasData
@@ -684,8 +722,7 @@ pub fn probe_page_type(html: &Html) -> PageType {
 }
 
 pub fn check_or_raise(page: &FetchedPage, post_path: &str) -> FacebedResult<()> {
-    let html = page.parse();
-    match probe_page_type(&html) {
+    match probe_page_type(page.document(), &page.html) {
         PageType::LoginWall => Err(FacebedError::no_data(format!(
             "Facebook served a login wall for {post_path} - content requires authentication"
         ))),
@@ -693,13 +730,15 @@ pub fn check_or_raise(page: &FetchedPage, post_path: &str) -> FacebedResult<()> 
     }
 }
 
+pub struct JsonBlockText {
+    pub text: String,
+}
+
 /// Extract every `<script type=application/json data-content-len=X data-sjs>` JSON blob.
 /// Sorted by `data-content-len` desc when `sort=true` (Python behavior).
-pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
-    let sel =
-        Selector::parse(r#"script[type="application/json"][data-content-len][data-sjs]"#).unwrap();
+pub fn get_json_block_texts(html: &Html, sort: bool) -> Vec<JsonBlockText> {
     let mut entries: Vec<(i64, String)> = html
-        .select(&sel)
+        .select(&JSON_SCRIPT_SEL)
         .filter_map(|el| {
             let len: i64 = el.value().attr("data-content-len")?.parse().ok()?;
             Some((len, el.text().collect::<String>()))
@@ -712,7 +751,14 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
 
     entries
         .into_iter()
-        .filter_map(|(_, txt)| serde_json::from_str(&txt).ok())
+        .map(|(_, text)| JsonBlockText { text })
+        .collect()
+}
+
+pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
+    get_json_block_texts(html, sort)
+        .into_iter()
+        .filter_map(|block| serde_json::from_str(&block.text).ok())
         .collect()
 }
 
@@ -720,8 +766,8 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
 mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
-        head_target_usable, is_group_landing_target, is_post_like_share_target,
-        share_resolution_usable, ResolvedShare,
+        head_target_usable, is_group_landing_target, is_post_like_share_target, probe_page_type,
+        share_resolution_usable, PageType, ResolvedShare,
     };
     use scraper::Html;
 
@@ -801,6 +847,20 @@ mod tests {
             cookie_probe_blocked_reason("https://www.facebook.com/checkpoint/", "", &doc),
             Some("checkpoint redirect")
         );
+    }
+
+    #[test]
+    fn probe_page_type_uses_raw_post_data_fast_path() {
+        let body = r#"<script type="application/json">{"i18n_reaction_count":"1K"}</script>"#;
+        let doc = Html::parse_document(body);
+        assert_eq!(probe_page_type(&doc, body), PageType::HasData);
+    }
+
+    #[test]
+    fn probe_page_type_detects_raw_login_preloader() {
+        let body = r#"<script>{"queryName":"useCometLogInFormQuery","login_data":{}}</script>"#;
+        let doc = Html::parse_document(body);
+        assert_eq!(probe_page_type(&doc, body), PageType::LoginWall);
     }
 
     #[test]

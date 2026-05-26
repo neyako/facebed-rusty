@@ -11,8 +11,8 @@ pub struct ReelsParser;
 impl Parser for ReelsParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.parse();
-        let blocks = get_json_blocks(&html, true);
+        let html = page.document();
+        let blocks = get_json_blocks(html, true);
 
         let content_node = find_content_node(&blocks).ok_or_else(|| {
             FacebedError::parse_with(

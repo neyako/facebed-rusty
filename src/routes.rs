@@ -120,20 +120,28 @@ static RE_STORIES: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^/?stories/\d+/[A-Za-z0-9=_-]+").unwrap());
 
 fn is_facebook_url(path: &str) -> bool {
-    let username_pat = r"[a-zA-Z0-9\-._]*";
     let full = format!("https://www.facebook.com/{path}");
     let Ok(parsed) = Url::parse(&full) else {
         return false;
     };
     let p = parsed.path();
-    let is_group = Regex::new(&format!("^/groups/{username_pat}"))
-        .unwrap()
-        .is_match(p);
+    let is_group = p.starts_with("/groups/");
     let is_permalink = p.starts_with("/permalink.php");
     let is_story = p.starts_with("/story.php");
-    let is_post = Regex::new(&format!("/{username_pat}/posts"))
-        .unwrap()
-        .is_match(p);
+    let mut prev = "";
+    let mut is_post = false;
+    for segment in p.trim_start_matches('/').split('/') {
+        if segment == "posts"
+            && !prev.is_empty()
+            && prev
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        {
+            is_post = true;
+            break;
+        }
+        prev = segment;
+    }
     let is_photo = p.starts_with("/photo");
     is_permalink || is_post || is_story || is_photo || is_group
 }
@@ -575,7 +583,7 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_multi_permalink_path, scope_key};
+    use super::{group_multi_permalink_path, is_facebook_url, scope_key};
 
     #[test]
     fn group_path_extracts_group_id() {
@@ -636,5 +644,15 @@ mod tests {
             group_multi_permalink_path("groups/12345/?multi_permalinks=../bad"),
             None
         );
+    }
+
+    #[test]
+    fn facebook_url_dispatch_matches_supported_post_shapes() {
+        assert!(is_facebook_url("groups/12345/posts/678"));
+        assert!(is_facebook_url("alice/posts/678"));
+        assert!(is_facebook_url("permalink.php?story_fbid=1&id=2"));
+        assert!(is_facebook_url("story.php?story_fbid=1&id=2"));
+        assert!(is_facebook_url("photo.php?fbid=1&id=2"));
+        assert!(!is_facebook_url("share/p/abc"));
     }
 }

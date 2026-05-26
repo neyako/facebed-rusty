@@ -1,12 +1,11 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::get_json_blocks;
+use crate::fetch::{get_json_block_texts, JsonBlockText};
 use crate::jq;
 use crate::parsers::util::{interaction_counts, val_str_at, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use scraper::Html;
 use serde_json::Value;
 
 pub struct JsonPostParser;
@@ -14,10 +13,20 @@ pub struct JsonPostParser;
 #[async_trait::async_trait]
 impl Parser for JsonPostParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.parse();
         let post_id = extract_post_id(post_path);
-        let post_json = get_post_json(&html, post_id.as_deref()).ok_or_else(|| {
+        let page = if should_try_partial_fetch(post_path, post_id.as_deref()) {
+            let pid = post_id.clone().unwrap_or_default();
+            ctx.fetcher
+                .fetch_until(post_path, true, |html| {
+                    has_completed_matching_post_block(html, &pid)
+                })
+                .await?
+        } else {
+            ctx.fetcher.fetch(post_path, true).await?
+        };
+        let html = page.document();
+        let blocks = get_json_block_texts(html, true);
+        let post_json = get_post_json(&blocks, post_id.as_deref()).ok_or_else(|| {
             FacebedError::parse_with("cannot find post json", page.html.clone(), page.url.clone())
         })?;
         let root = get_root_node(&post_json).ok_or_else(|| {
@@ -45,7 +54,7 @@ impl Parser for JsonPostParser {
             story.url.clone()
         };
         let post_content = story.get_text().trim().to_owned();
-        let group_name = get_group_name(&html);
+        let group_name = get_group_name(&blocks);
         let mut link_header = story.author_name.clone();
         if !group_name.is_empty() {
             link_header.push_str(" • ");
@@ -78,17 +87,20 @@ impl Parser for JsonPostParser {
 /// FB feeds (group landing pages, ad-injected feeds) cause the parser to latch onto
 /// whichever featured/suggested post happens to be the biggest block, returning a
 /// completely unrelated embed (e.g. a Meta-for-Business ad).
-fn get_post_json(html: &Html, post_id: Option<&str>) -> Option<Value> {
+fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Value> {
     // First pass: id-aware match.
     if let Some(pid) = post_id {
-        for bloc in get_json_blocks(html, true) {
+        for block in blocks {
+            if !block.text.contains("i18n_reaction_count") || !block.text.contains(pid) {
+                continue;
+            }
+            let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
+                continue;
+            };
             if !jq::has(&bloc, &["i18n_reaction_count"]) {
                 continue;
             }
-            let s = serde_json::to_string(&bloc).unwrap_or_default();
-            if s.contains(pid) {
-                return Some(bloc);
-            }
+            return Some(bloc);
         }
         // No block matched a numeric requested id — return None so the caller can
         // raise NoData/Parse instead of serving a wrong-post embed. Falling back
@@ -102,12 +114,55 @@ fn get_post_json(html: &Html, post_id: Option<&str>) -> Option<Value> {
     }
 
     // No id available (very old paths) — fall back to first reaction block.
-    for bloc in get_json_blocks(html, true) {
+    for block in blocks {
+        if !block.text.contains("i18n_reaction_count") {
+            continue;
+        }
+        let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
+            continue;
+        };
         if jq::has(&bloc, &["i18n_reaction_count"]) {
             return Some(bloc);
         }
     }
     None
+}
+
+fn should_try_partial_fetch(post_path: &str, post_id: Option<&str>) -> bool {
+    let Some(pid) = post_id else {
+        return false;
+    };
+    if !pid.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    !post_path.trim_start_matches('/').starts_with("groups/")
+}
+
+fn has_completed_matching_post_block(html: &str, post_id: &str) -> bool {
+    let mut offset = 0;
+    while let Some(script_rel) = html[offset..].find("<script") {
+        let start = offset + script_rel;
+        let Some(open_end_rel) = html[start..].find('>') else {
+            return false;
+        };
+        let open_end = start + open_end_rel + 1;
+        let open_tag = &html[start..open_end];
+        let Some(close_rel) = html[open_end..].find("</script>") else {
+            return false;
+        };
+        let close_start = open_end + close_rel;
+        if open_tag.contains(r#"type="application/json""#)
+            && open_tag.contains("data-content-len")
+            && open_tag.contains("data-sjs")
+        {
+            let body = &html[open_end..close_start];
+            if body.contains("i18n_reaction_count") && body.contains(post_id) {
+                return true;
+            }
+        }
+        offset = close_start + "</script>".len();
+    }
+    false
 }
 
 static POST_ID_RE: Lazy<Regex> = Lazy::new(|| {
@@ -155,8 +210,16 @@ fn get_root_node(post_json: &Value) -> Option<&Value> {
     Some(cs)
 }
 
-fn get_group_name(html: &Html) -> String {
-    for bloc in get_json_blocks(html, true) {
+fn get_group_name(blocks: &[JsonBlockText]) -> String {
+    for block in blocks {
+        if !block.text.contains("group_member_profiles")
+            || !block.text.contains("formatted_count_text")
+        {
+            continue;
+        }
+        let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
+            continue;
+        };
         if jq::has(&bloc, &["group_member_profiles", "formatted_count_text"]) {
             for group in jq::all(&bloc, "group") {
                 if let Some(name) = val_str_at(group, "name") {
@@ -170,7 +233,7 @@ fn get_group_name(html: &Html) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_post_id;
+    use super::{extract_post_id, has_completed_matching_post_block, should_try_partial_fetch};
 
     #[test]
     fn extracts_numeric_post_id() {
@@ -206,5 +269,36 @@ mod tests {
             extract_post_id("story.php?story_fbid=pfbid02abc&id=123"),
             Some("pfbid02abc".into())
         );
+    }
+
+    #[test]
+    fn partial_fetch_only_for_numeric_non_group_posts() {
+        assert!(should_try_partial_fetch(
+            "story.php?story_fbid=123&id=456",
+            Some("123")
+        ));
+        assert!(!should_try_partial_fetch(
+            "story.php?story_fbid=pfbid02abc&id=456",
+            Some("pfbid02abc")
+        ));
+        assert!(!should_try_partial_fetch("groups/1/posts/123", Some("123")));
+    }
+
+    #[test]
+    fn matching_post_block_requires_completed_script() {
+        let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
+        let body = r#"{"i18n_reaction_count":"1K","id":"123"}"#;
+        assert!(!has_completed_matching_post_block(
+            &format!("{open}{body}"),
+            "123"
+        ));
+        assert!(has_completed_matching_post_block(
+            &format!("{open}{body}</script><div>later</div>"),
+            "123"
+        ));
+        assert!(!has_completed_matching_post_block(
+            &format!("{open}{body}</script>"),
+            "456"
+        ));
     }
 }

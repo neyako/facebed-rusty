@@ -17,12 +17,13 @@ static WATCH_FEED_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^https?://[^/]+/wa
 impl Parser for VideoWatchParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.parse();
-        let content_node = get_content_node(&html, &page.html, &page.url)?;
+        let html = page.document();
+        let blocks = get_json_blocks(html, true);
+        let content_node = get_content_node(&blocks, html, &page.html, &page.url)?;
         let video_link = video_link_in_node(&content_node)
             .or_else(|| {
-                for bloc in get_json_blocks(&html, false) {
-                    if let Some(l) = video_link_in_node(&bloc) {
+                for bloc in &blocks {
+                    if let Some(l) = video_link_in_node(bloc) {
                         return Some(l);
                     }
                 }
@@ -37,7 +38,7 @@ impl Parser for VideoWatchParser {
             })?;
 
         let post_url = ensure_absolute(post_path);
-        let op_name = get_op_name(&html).ok_or_else(|| {
+        let op_name = get_op_name(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid watch link (opn)",
                 page.html.clone(),
@@ -57,15 +58,12 @@ impl Parser for VideoWatchParser {
             .pointer("/feedback/total_comment_count")
             .cloned()
             .unwrap_or(Value::Null);
-        let date = find_creation_time(&html).ok_or_else(|| {
+        let date = find_creation_time(&blocks).ok_or_else(|| {
             FacebedError::parse_with("cannot find date", page.html.clone(), page.url.clone())
         })?;
 
-        let thumbnail = thumbnail_in_node(&content_node).or_else(|| {
-            get_json_blocks(&html, false)
-                .iter()
-                .find_map(|b| thumbnail_in_node(b))
-        });
+        let thumbnail = thumbnail_in_node(&content_node)
+            .or_else(|| blocks.iter().find_map(|b| thumbnail_in_node(b)));
 
         Ok(ParsedPost {
             author_name: op_name,
@@ -82,14 +80,14 @@ impl Parser for VideoWatchParser {
     }
 }
 
-fn get_op_name(html: &Html) -> Option<String> {
-    for bloc in get_json_blocks(html, false) {
-        if jq::has(&bloc, &["is_additional_profile_plus"]) {
-            return val_str_at(jq::first(&bloc, "owner")?, "name").map(str::to_owned);
+fn get_op_name(blocks: &[Value]) -> Option<String> {
+    for bloc in blocks {
+        if jq::has(bloc, &["is_additional_profile_plus"]) {
+            return val_str_at(jq::first(bloc, "owner")?, "name").map(str::to_owned);
         }
     }
-    for bloc in get_json_blocks(html, false) {
-        if let Some(owner) = jq::first(&bloc, "owner") {
+    for bloc in blocks {
+        if let Some(owner) = jq::first(bloc, "owner") {
             if owner.is_object() {
                 if let Some(name) = val_str_at(owner, "name") {
                     return Some(name.to_owned());
@@ -100,13 +98,18 @@ fn get_op_name(html: &Html) -> Option<String> {
     None
 }
 
-fn get_content_node(html: &Html, raw_html: &str, url: &str) -> FacebedResult<Value> {
-    for bloc in get_json_blocks(html, true) {
+fn get_content_node(
+    blocks: &[Value],
+    html: &Html,
+    raw_html: &str,
+    url: &str,
+) -> FacebedResult<Value> {
+    for bloc in blocks {
         if jq::has(
-            &bloc,
+            bloc,
             &["comment_rendering_instance", "video_view_count_renderer"],
         ) {
-            if let Some(d) = jq::first(&bloc, "result").and_then(|r| r.get("data")) {
+            if let Some(d) = jq::first(bloc, "result").and_then(|r| r.get("data")) {
                 return Ok(d.clone());
             }
         }
@@ -128,10 +131,10 @@ fn get_content_node(html: &Html, raw_html: &str, url: &str) -> FacebedResult<Val
     ))
 }
 
-fn find_creation_time(html: &Html) -> Option<i64> {
-    for bloc in get_json_blocks(html, true) {
-        if jq::has(&bloc, &["creation_time"]) {
-            let v = jq::first(&bloc, "creation_time")?;
+fn find_creation_time(blocks: &[Value]) -> Option<i64> {
+    for bloc in blocks {
+        if jq::has(bloc, &["creation_time"]) {
+            let v = jq::first(bloc, "creation_time")?;
             return v
                 .as_i64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()));
