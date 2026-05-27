@@ -1,5 +1,5 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::{get_json_block_texts, JsonBlockText};
+use crate::fetch::{get_json_block_texts, FetchedPage, JsonBlockText};
 use crate::jq;
 use crate::parsers::util::{interaction_counts, val_str_at, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
@@ -14,72 +14,89 @@ pub struct JsonPostParser;
 impl Parser for JsonPostParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let post_id = extract_post_id(post_path);
-        let page = if should_try_partial_fetch(post_path, post_id.as_deref()) {
+        if should_try_partial_fetch(post_id.as_deref()) {
             let pid = post_id.clone().unwrap_or_default();
-            ctx.fetcher
+            let page = ctx
+                .fetcher
                 .fetch_until(post_path, true, |html| {
                     has_completed_matching_post_block(html, &pid)
                 })
-                .await?
-        } else {
-            ctx.fetcher.fetch(post_path, true).await?
-        };
-        let html = page.document();
-        let blocks = get_json_block_texts(html, true);
-        let post_json = get_post_json(&blocks, post_id.as_deref()).ok_or_else(|| {
-            FacebedError::parse_with("cannot find post json", page.html.clone(), page.url.clone())
-        })?;
-        let root = get_root_node(&post_json).ok_or_else(|| {
-            FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
-        })?;
-        let (likes, cmts, shares) = interaction_counts(root)?;
-
-        let post_date = root
-            .pointer("/context_layout/story/comet_sections/metadata")
-            .and_then(|m| jq::first(m, "creation_time"))
-            .and_then(|v| {
-                v.as_i64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            })
-            .unwrap_or(0);
-
-        let story_json = root.pointer("/content/story").ok_or_else(|| {
-            FacebedError::parse_with("missing content.story", page.html.clone(), page.url.clone())
-        })?;
-        let story = Story::from_json(story_json)?;
-
-        let post_url = if story.url.is_empty() {
-            ensure_absolute(post_path)
-        } else {
-            story.url.clone()
-        };
-        let post_content = story.get_text().trim().to_owned();
-        let group_name = get_group_name(&blocks);
-        let mut link_header = story.author_name.clone();
-        if !group_name.is_empty() {
-            link_header.push_str(" • ");
-            link_header.push_str(&group_name);
+                .await?;
+            match parse_page(ctx, post_path, post_id.as_deref(), &page) {
+                Ok(post) => return Ok(post),
+                Err(e) if page.is_partial() => {
+                    tracing::warn!(path = %post_path, error = %e, "partial post parse failed; retrying full fetch");
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        if ctx.is_banned(&story.author_id) {
-            return Ok(banned_post(&post_url));
-        }
-
-        let thumbnail = crate::parsers::util::thumbnail_in_node(story_json);
-
-        Ok(ParsedPost {
-            author_name: link_header,
-            text: post_content,
-            image_links: story.image_links,
-            url: post_url,
-            date: post_date,
-            likes,
-            comments: cmts,
-            shares,
-            video_links: story.video_links,
-            thumbnail,
-        })
+        let page = ctx.fetcher.fetch(post_path, true).await?;
+        parse_page(ctx, post_path, post_id.as_deref(), &page)
     }
+}
+
+fn parse_page(
+    ctx: &ParserCtx,
+    post_path: &str,
+    post_id: Option<&str>,
+    page: &FetchedPage,
+) -> FacebedResult<ParsedPost> {
+    let html = page.document();
+    let blocks = get_json_block_texts(html, true);
+    let post_json = get_post_json(&blocks, post_id).ok_or_else(|| {
+        FacebedError::parse_with("cannot find post json", page.html.clone(), page.url.clone())
+    })?;
+    let root = get_root_node(&post_json).ok_or_else(|| {
+        FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
+    })?;
+    let (likes, cmts, shares) = interaction_counts(root)?;
+
+    let post_date = root
+        .pointer("/context_layout/story/comet_sections/metadata")
+        .and_then(|m| jq::first(m, "creation_time"))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0);
+
+    let story_json = root.pointer("/content/story").ok_or_else(|| {
+        FacebedError::parse_with("missing content.story", page.html.clone(), page.url.clone())
+    })?;
+    let story = Story::from_json(story_json)?;
+
+    let post_url = if story.url.is_empty() {
+        ensure_absolute(post_path)
+    } else {
+        story.url.clone()
+    };
+    let post_content = story.get_text().trim().to_owned();
+    let group_name = get_group_name(&blocks);
+    let mut link_header = story.author_name.clone();
+    if !group_name.is_empty() {
+        link_header.push_str(" • ");
+        link_header.push_str(&group_name);
+    }
+
+    if ctx.is_banned(&story.author_id) {
+        return Ok(banned_post(&post_url));
+    }
+
+    let thumbnail = crate::parsers::util::thumbnail_in_node(story_json);
+
+    Ok(ParsedPost {
+        author_name: link_header,
+        text: post_content,
+        image_links: story.image_links,
+        url: post_url,
+        date: post_date,
+        likes,
+        comments: cmts,
+        shares,
+        video_links: story.video_links,
+        thumbnail,
+    })
 }
 
 /// Find the JSON block describing the requested post. When `post_id` is provided, only
@@ -128,14 +145,11 @@ fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Valu
     None
 }
 
-fn should_try_partial_fetch(post_path: &str, post_id: Option<&str>) -> bool {
+fn should_try_partial_fetch(post_id: Option<&str>) -> bool {
     let Some(pid) = post_id else {
         return false;
     };
-    if !pid.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    !post_path.trim_start_matches('/').starts_with("groups/")
+    pid.chars().all(|c| c.is_ascii_digit())
 }
 
 fn has_completed_matching_post_block(html: &str, post_id: &str) -> bool {
@@ -272,16 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_fetch_only_for_numeric_non_group_posts() {
-        assert!(should_try_partial_fetch(
-            "story.php?story_fbid=123&id=456",
-            Some("123")
-        ));
-        assert!(!should_try_partial_fetch(
-            "story.php?story_fbid=pfbid02abc&id=456",
-            Some("pfbid02abc")
-        ));
-        assert!(!should_try_partial_fetch("groups/1/posts/123", Some("123")));
+    fn partial_fetch_only_for_numeric_posts() {
+        assert!(should_try_partial_fetch(Some("123")));
+        assert!(!should_try_partial_fetch(Some("pfbid02abc")));
+        assert!(!should_try_partial_fetch(None));
     }
 
     #[test]

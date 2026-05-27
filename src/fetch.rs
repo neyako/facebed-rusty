@@ -34,6 +34,7 @@ pub struct FetchedPage {
     pub url: String,
     pub html: String,
     document: Html,
+    partial: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,10 @@ pub struct CookieAccountCheck {
 impl FetchedPage {
     pub fn document(&self) -> &Html {
         &self.document
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.partial
     }
 }
 
@@ -223,7 +228,7 @@ impl Fetcher {
         let final_url = resp.url().to_string();
         let html = resp.text().await?;
         tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, "fetch done");
-        self.page_from_html(url, html, post_path)
+        self.page_from_html(url, html, post_path, false)
     }
 
     /// Fetch a Facebook path, stopping early once `should_stop` says the
@@ -256,7 +261,7 @@ impl Fetcher {
         }
         let html = String::from_utf8_lossy(&body).into_owned();
         tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early, "fetch done");
-        self.page_from_html(url, html, post_path)
+        self.page_from_html(url, html, post_path, stopped_early)
     }
 
     fn request_for(&self, url: &str, use_cookies: bool) -> (RequestBuilder, String) {
@@ -288,12 +293,14 @@ impl Fetcher {
         url: String,
         html: String,
         post_path: &str,
+        partial: bool,
     ) -> FacebedResult<FetchedPage> {
         let document = Html::parse_document(&html);
         let page = FetchedPage {
             url,
             html,
             document,
+            partial,
         };
         check_or_raise(&page, post_path)?;
         Ok(page)
