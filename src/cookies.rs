@@ -192,7 +192,10 @@ impl CookieJar {
                 acc.label
             );
             if acc.any_expired() {
-                warn!("account '{}' has expired cookies", acc.label);
+                info!(
+                    "account '{}' has stale cookie expiration timestamps; live account check decides usability",
+                    acc.label
+                );
             }
         }
 
@@ -364,14 +367,6 @@ impl CookieJar {
             return None;
         }
         Some(&self.accounts[i % self.accounts.len()].label)
-    }
-
-    pub fn expired_labels(&self) -> Vec<String> {
-        self.accounts
-            .iter()
-            .filter(|a| a.any_expired())
-            .map(|a| a.label.clone())
-            .collect()
     }
 
     /// Account index previously known to succeed for this scope key.

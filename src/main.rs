@@ -56,13 +56,6 @@ async fn main() -> anyhow::Result<()> {
     let notifier = Notifier::new(config.notifier_webhook.clone(), fetcher.client().clone());
 
     if !cookies.is_empty() {
-        let expired = cookies.expired_labels();
-        if !expired.is_empty() {
-            notifier.warn(
-                format!("@everyone cookies expired for: {}", expired.join(", ")),
-                None,
-            );
-        }
         let check_fetcher = fetcher.clone();
         let check_notifier = notifier.clone();
         tokio::spawn(async move {
