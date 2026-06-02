@@ -360,6 +360,7 @@ fn is_post_like_share_target(path: &str) -> bool {
         .map(|u| u.path().trim_start_matches('/'))
         .unwrap_or_else(|| path.trim_start_matches('/'));
     path.starts_with("watch")
+        || path.starts_with("reel/")
         || path.contains("/videos/")
         || (path.starts_with("groups/")
             && (path.contains("/permalink/") || path.contains("/posts/")))
@@ -823,8 +824,9 @@ mod tests {
     }
 
     #[test]
-    fn share_v_body_can_resolve_to_reel() {
-        assert!(!head_target_usable("reel/123", true));
+    fn share_v_head_accepts_reel() {
+        assert!(head_target_usable("reel/123", true));
+        assert!(head_target_usable("reel/123/?rdid=x&share_url=y", true));
         let resolved = ResolvedShare {
             path: "reel/123".into(),
         };

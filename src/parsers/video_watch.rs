@@ -38,7 +38,8 @@ impl Parser for VideoWatchParser {
             })?;
 
         let post_url = ensure_absolute(post_path);
-        let op_name = get_op_name(&blocks).ok_or_else(|| {
+        let video_id = val_str_at(&content_node, "id").unwrap_or("").to_owned();
+        let op_name = get_op_name(&blocks, &content_node, &video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid watch link (opn)",
                 page.html.clone(),
@@ -80,7 +81,19 @@ impl Parser for VideoWatchParser {
     }
 }
 
-fn get_op_name(blocks: &[Value]) -> Option<String> {
+fn get_op_name(blocks: &[Value], content_node: &Value, video_id: &str) -> Option<String> {
+    if let Some(name) = owner_name_in_node(content_node) {
+        return Some(name);
+    }
+    if !video_id.is_empty() {
+        for bloc in blocks {
+            if block_mentions_id(bloc, video_id) {
+                if let Some(name) = owner_name_in_node(bloc) {
+                    return Some(name);
+                }
+            }
+        }
+    }
     for bloc in blocks {
         if jq::has(bloc, &["is_additional_profile_plus"]) {
             return val_str_at(jq::first(bloc, "owner")?, "name").map(str::to_owned);
@@ -96,6 +109,38 @@ fn get_op_name(blocks: &[Value]) -> Option<String> {
         }
     }
     None
+}
+
+fn owner_name_in_node(node: &Value) -> Option<String> {
+    for key in ["video_owner", "owner"] {
+        if let Some(owner) = node.get(key) {
+            if let Some(name) = val_str_at(owner, "name").filter(|s| !s.is_empty()) {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    for key in ["video_owner", "owner"] {
+        for owner in jq::all(node, key) {
+            if let Some(name) = val_str_at(owner, "name").filter(|s| !s.is_empty()) {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn block_mentions_id(block: &Value, needle: &str) -> bool {
+    jq::all(block, "id")
+        .into_iter()
+        .any(|value| value_matches_id(value, needle))
+}
+
+fn value_matches_id(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(s) => s == needle,
+        Value::Number(n) => n.to_string() == needle,
+        _ => false,
+    }
 }
 
 fn get_content_node(
@@ -141,4 +186,43 @@ fn find_creation_time(blocks: &[Value]) -> Option<i64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_op_name;
+    use serde_json::json;
+
+    #[test]
+    fn op_name_prefers_content_node_owner() {
+        let blocks = vec![json!({"owner": {"id": "wrong", "name": "Wrong Sidebar"}})];
+        let content = json!({
+            "id": "123",
+            "owner": {"id": "right", "name": "Right Creator"}
+        });
+
+        assert_eq!(
+            get_op_name(&blocks, &content, "123").as_deref(),
+            Some("Right Creator")
+        );
+    }
+
+    #[test]
+    fn op_name_uses_matching_video_block_before_page_owner() {
+        let content = json!({"id": "123"});
+        let blocks = vec![
+            json!({"owner": {"id": "wrong", "name": "Wrong Sidebar"}}),
+            json!({
+                "id": "123",
+                "payload": {
+                    "video_owner": {"id": "right", "name": "Right Creator"}
+                }
+            }),
+        ];
+
+        assert_eq!(
+            get_op_name(&blocks, &content, "123").as_deref(),
+            Some("Right Creator")
+        );
+    }
 }

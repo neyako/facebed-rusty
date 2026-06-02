@@ -32,7 +32,7 @@ impl Parser for ReelsParser {
 
         let video_id = val_str_at(&content_node, "id").unwrap_or("").to_owned();
 
-        let owner = find_owner_with_name(&blocks).ok_or_else(|| {
+        let owner = find_owner_with_name(&blocks, &content_node, &video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid reels link (own)",
                 page.html.clone(),
@@ -42,7 +42,10 @@ impl Parser for ReelsParser {
         let typename = val_str_at(&owner, "__typename").unwrap_or("");
         let is_ig = typename.starts_with("InstagramUser");
         let op_name = if is_ig {
-            format!("📷 @{}", val_str_at(&owner, "username").unwrap_or(""))
+            val_str_at(&owner, "username")
+                .filter(|s| !s.is_empty())
+                .map(|username| format!("📷 @{username}"))
+                .unwrap_or_else(|| val_str_at(&owner, "name").unwrap_or("").to_owned())
         } else {
             val_str_at(&owner, "name").unwrap_or("").to_owned()
         };
@@ -112,28 +115,72 @@ fn find_video_link(blocks: &[Value], content_node: &Value) -> Option<String> {
     None
 }
 
-/// Search every block for an `owner` object that has a `name` field
-/// (i.e. the "rich" owner, not just `{id, __typename}`).
-fn find_owner_with_name(blocks: &[Value]) -> Option<Value> {
-    for bloc in blocks {
-        // prefer short_form_video_context.video_owner (always has name)
-        if let Some(o) = bloc.pointer_path_first(&["short_form_video_context", "video_owner"]) {
-            return Some(o.clone());
+/// Prefer the owner attached to the matched video node. FB pages include
+/// unrelated owner objects for sidebars, comments, and recommendations.
+fn find_owner_with_name(blocks: &[Value], content_node: &Value, video_id: &str) -> Option<Value> {
+    if let Some(owner) = owner_from_node(content_node) {
+        return Some(owner);
+    }
+    if !video_id.is_empty() {
+        for bloc in blocks {
+            if block_mentions_id(bloc, video_id) {
+                if let Some(owner) = owner_from_node(bloc) {
+                    return Some(owner);
+                }
+            }
         }
     }
     for bloc in blocks {
-        for o in jq::all(bloc, "video_owner") {
-            if o.get("name").and_then(|v| v.as_str()).is_some() {
-                return Some(o.clone());
+        if let Some(owner) = owner_from_node(bloc) {
+            return Some(owner);
+        }
+    }
+    None
+}
+
+fn owner_from_node(node: &Value) -> Option<Value> {
+    if let Some(owner) = node.pointer_path_first(&["short_form_video_context", "video_owner"]) {
+        if owner_has_name(owner) {
+            return Some(owner.clone());
+        }
+    }
+    for key in ["video_owner", "owner"] {
+        if let Some(owner) = node.get(key) {
+            if owner_has_name(owner) {
+                return Some(owner.clone());
             }
         }
-        for o in jq::all(bloc, "owner") {
-            if o.get("name").and_then(|v| v.as_str()).is_some() {
-                return Some(o.clone());
+    }
+    for key in ["video_owner", "owner"] {
+        for owner in jq::all(node, key) {
+            if owner_has_name(owner) {
+                return Some(owner.clone());
             }
         }
     }
     None
+}
+
+fn owner_has_name(owner: &Value) -> bool {
+    owner
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+fn block_mentions_id(block: &Value, needle: &str) -> bool {
+    jq::all(block, "id")
+        .into_iter()
+        .any(|value| value_matches_id(value, needle))
+}
+
+fn value_matches_id(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(s) => s == needle,
+        Value::Number(n) => n.to_string() == needle,
+        _ => false,
+    }
 }
 
 fn find_shareable_url(blocks: &[Value]) -> Option<String> {
@@ -281,5 +328,54 @@ impl ValueExt for Value {
             }
         }
         walk(self, segments)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_owner_with_name;
+    use serde_json::json;
+
+    #[test]
+    fn owner_lookup_prefers_matched_content_node() {
+        let blocks = vec![json!({
+            "short_form_video_context": {
+                "video_owner": {"id": "wrong", "name": "Wrong Page"}
+            }
+        })];
+        let content = json!({
+            "id": "123",
+            "short_form_video_context": {
+                "video_owner": {"id": "right", "name": "Right Creator"}
+            }
+        });
+
+        let owner = find_owner_with_name(&blocks, &content, "123").unwrap();
+
+        assert_eq!(
+            owner.get("name").and_then(|v| v.as_str()),
+            Some("Right Creator")
+        );
+    }
+
+    #[test]
+    fn owner_lookup_uses_matching_video_block_before_page_fallback() {
+        let content = json!({"id": "123"});
+        let blocks = vec![
+            json!({"owner": {"id": "wrong", "name": "Wrong Sidebar"}}),
+            json!({
+                "id": "123",
+                "payload": {
+                    "owner": {"id": "right", "name": "Right Creator"}
+                }
+            }),
+        ];
+
+        let owner = find_owner_with_name(&blocks, &content, "123").unwrap();
+
+        assert_eq!(
+            owner.get("name").and_then(|v| v.as_str()),
+            Some("Right Creator")
+        );
     }
 }
