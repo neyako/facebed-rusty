@@ -8,6 +8,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use scraper::{Html, Selector};
 use serde_json::Value;
+use url::Url;
 
 pub struct VideoWatchParser;
 
@@ -19,16 +20,15 @@ impl Parser for VideoWatchParser {
         let page = ctx.fetcher.fetch(post_path, true).await?;
         let html = page.document();
         let blocks = get_json_blocks(html, true);
-        let content_node = get_content_node(&blocks, html, &page.html, &page.url)?;
-        let video_link = video_link_in_node(&content_node)
-            .or_else(|| {
-                for bloc in &blocks {
-                    if let Some(l) = video_link_in_node(bloc) {
-                        return Some(l);
-                    }
-                }
-                None
-            })
+        let target_video_id = target_video_id(post_path);
+        let content_node = get_content_node(
+            &blocks,
+            html,
+            &page.html,
+            &page.url,
+            target_video_id.as_deref(),
+        )?;
+        let video_link = get_video_link(&blocks, &content_node, target_video_id.as_deref())
             .ok_or_else(|| {
                 FacebedError::parse_with(
                     "Invalid watch link (vn)",
@@ -38,7 +38,10 @@ impl Parser for VideoWatchParser {
             })?;
 
         let post_url = ensure_absolute(post_path);
-        let video_id = val_str_at(&content_node, "id").unwrap_or("").to_owned();
+        let video_id = val_str_at(&content_node, "id")
+            .map(str::to_owned)
+            .or(target_video_id)
+            .unwrap_or_default();
         let op_name = get_op_name(&blocks, &content_node, &video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid watch link (opn)",
@@ -64,6 +67,7 @@ impl Parser for VideoWatchParser {
         })?;
 
         let thumbnail = thumbnail_in_node(&content_node)
+            .or_else(|| thumbnail_in_target_blocks(&blocks, &video_id))
             .or_else(|| blocks.iter().find_map(|b| thumbnail_in_node(b)));
 
         Ok(ParsedPost {
@@ -81,6 +85,52 @@ impl Parser for VideoWatchParser {
     }
 }
 
+fn target_video_id(post_path: &str) -> Option<String> {
+    let parsed = Url::parse(&ensure_absolute(post_path)).ok()?;
+    if parsed.path().trim_start_matches('/').starts_with("watch") {
+        if let Some(v) = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "v")
+            .map(|(_, v)| v.into_owned())
+            .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Some(v);
+        }
+    }
+    parsed
+        .path_segments()?
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .last()
+        .map(str::to_owned)
+}
+
+fn get_video_link(
+    blocks: &[Value],
+    content_node: &Value,
+    target_video_id: Option<&str>,
+) -> Option<String> {
+    video_link_in_node(content_node)
+        .or_else(|| video_link_in_target_blocks(blocks, target_video_id?))
+        .or_else(|| blocks.iter().find_map(video_link_in_node))
+}
+
+fn video_link_in_target_blocks(blocks: &[Value], video_id: &str) -> Option<String> {
+    blocks
+        .iter()
+        .filter(|block| block_mentions_id(block, video_id))
+        .find_map(video_link_in_node)
+}
+
+fn thumbnail_in_target_blocks(blocks: &[Value], video_id: &str) -> Option<String> {
+    if video_id.is_empty() {
+        return None;
+    }
+    blocks
+        .iter()
+        .filter(|block| block_mentions_id(block, video_id))
+        .find_map(thumbnail_in_node)
+}
+
 fn get_op_name(blocks: &[Value], content_node: &Value, video_id: &str) -> Option<String> {
     if let Some(name) = owner_name_in_node(content_node) {
         return Some(name);
@@ -96,14 +146,16 @@ fn get_op_name(blocks: &[Value], content_node: &Value, video_id: &str) -> Option
     }
     for bloc in blocks {
         if jq::has(bloc, &["is_additional_profile_plus"]) {
-            return val_str_at(jq::first(bloc, "owner")?, "name").map(str::to_owned);
+            if let Some(name) = jq::first(bloc, "owner").and_then(owner_name_from_candidate) {
+                return Some(name);
+            }
         }
     }
     for bloc in blocks {
         if let Some(owner) = jq::first(bloc, "owner") {
             if owner.is_object() {
-                if let Some(name) = val_str_at(owner, "name") {
-                    return Some(name.to_owned());
+                if let Some(name) = owner_name_from_candidate(owner) {
+                    return Some(name);
                 }
             }
         }
@@ -112,19 +164,42 @@ fn get_op_name(blocks: &[Value], content_node: &Value, video_id: &str) -> Option
 }
 
 fn owner_name_in_node(node: &Value) -> Option<String> {
-    for key in ["video_owner", "owner"] {
+    for key in ["video_owner", "owner", "owning_profile", "owner_as_page"] {
         if let Some(owner) = node.get(key) {
-            if let Some(name) = val_str_at(owner, "name").filter(|s| !s.is_empty()) {
-                return Some(name.to_owned());
+            if let Some(name) = owner_name_from_candidate(owner) {
+                return Some(name);
             }
         }
     }
-    for key in ["video_owner", "owner"] {
+    for key in ["video_owner", "owner", "owning_profile", "owner_as_page"] {
         for owner in jq::all(node, key) {
-            if let Some(name) = val_str_at(owner, "name").filter(|s| !s.is_empty()) {
-                return Some(name.to_owned());
+            if let Some(name) = owner_name_from_candidate(owner) {
+                return Some(name);
             }
         }
+    }
+    for actors in jq::all(node, "actors") {
+        if let Some(arr) = actors.as_array() {
+            for actor in arr {
+                if let Some(name) = owner_name_from_candidate(actor) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn owner_name_from_candidate(owner: &Value) -> Option<String> {
+    if let Some(name) = val_str_at(owner, "name").filter(|s| !s.is_empty()) {
+        return Some(name.to_owned());
+    }
+    if let Some(name) = owner
+        .get("owner_as_page")
+        .and_then(|v| val_str_at(v, "name"))
+        .filter(|s| !s.is_empty())
+    {
+        return Some(name.to_owned());
     }
     None
 }
@@ -148,7 +223,21 @@ fn get_content_node(
     html: &Html,
     raw_html: &str,
     url: &str,
+    target_video_id: Option<&str>,
 ) -> FacebedResult<Value> {
+    if let Some(video_id) = target_video_id {
+        if let Some(data) = blocks.iter().find_map(|bloc| {
+            result_data(bloc).filter(|data| {
+                block_mentions_id(data, video_id)
+                    && jq::has(
+                        data,
+                        &["comment_rendering_instance", "video_view_count_renderer"],
+                    )
+            })
+        }) {
+            return Ok(data.clone());
+        }
+    }
     for bloc in blocks {
         if jq::has(
             bloc,
@@ -176,6 +265,10 @@ fn get_content_node(
     ))
 }
 
+fn result_data(block: &Value) -> Option<&Value> {
+    jq::first(block, "result")?.get("data")
+}
+
 fn find_creation_time(blocks: &[Value]) -> Option<i64> {
     for bloc in blocks {
         if jq::has(bloc, &["creation_time"]) {
@@ -190,7 +283,8 @@ fn find_creation_time(blocks: &[Value]) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_op_name;
+    use super::{get_content_node, get_op_name, get_video_link, target_video_id};
+    use scraper::Html;
     use serde_json::json;
 
     #[test]
@@ -223,6 +317,92 @@ mod tests {
         assert_eq!(
             get_op_name(&blocks, &content, "123").as_deref(),
             Some("Right Creator")
+        );
+    }
+
+    #[test]
+    fn op_name_uses_owner_as_page_inside_content_owner() {
+        let blocks = vec![];
+        let content = json!({
+            "id": "123",
+            "owner": {
+                "__isVideoOwner": "Video",
+                "id": "owner-id",
+                "owner_as_page": {"id": "page-id", "name": "Right Page"}
+            }
+        });
+
+        assert_eq!(
+            get_op_name(&blocks, &content, "123").as_deref(),
+            Some("Right Page")
+        );
+    }
+
+    #[test]
+    fn content_node_prefers_requested_video_over_related_feed_item() {
+        let blocks = vec![
+            json!({
+                "result": {"data": {
+                    "id": "999",
+                    "feedback": {
+                        "comment_rendering_instance": {},
+                        "video_view_count_renderer": {}
+                    }
+                }}
+            }),
+            json!({
+                "result": {"data": {
+                    "id": "123",
+                    "feedback": {
+                        "comment_rendering_instance": {},
+                        "video_view_count_renderer": {}
+                    }
+                }}
+            }),
+        ];
+        let html = Html::parse_document("");
+        let content = get_content_node(&blocks, &html, "", "", Some("123")).unwrap();
+
+        assert_eq!(content.get("id").and_then(|v| v.as_str()), Some("123"));
+    }
+
+    #[test]
+    fn video_link_prefers_requested_video_over_related_feed_item() {
+        let content = json!({"id": "123"});
+        let blocks = vec![
+            json!({
+                "id": "999",
+                "videoDeliveryResponseFragment": {
+                    "videoDeliveryResponseResult": {
+                        "progressive_urls": [{"progressive_url": "https://wrong.example/video.mp4"}]
+                    }
+                }
+            }),
+            json!({
+                "id": "123",
+                "videoDeliveryResponseFragment": {
+                    "videoDeliveryResponseResult": {
+                        "progressive_urls": [{"progressive_url": "https://right.example/video.mp4"}]
+                    }
+                }
+            }),
+        ];
+
+        assert_eq!(
+            get_video_link(&blocks, &content, Some("123")).as_deref(),
+            Some("https://right.example/video.mp4")
+        );
+    }
+
+    #[test]
+    fn target_video_id_reads_watch_query_and_page_video_path() {
+        assert_eq!(
+            target_video_id("watch?v=2000020650901604").as_deref(),
+            Some("2000020650901604")
+        );
+        assert_eq!(
+            target_video_id("some.page/videos/some-title/123456/").as_deref(),
+            Some("123456")
         );
     }
 }
