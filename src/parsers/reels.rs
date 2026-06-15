@@ -73,6 +73,7 @@ impl Parser for ReelsParser {
         Ok(ParsedPost {
             author_name: op_name,
             text: post_text,
+            allow_discord_markdown: false,
             image_links: Vec::new(),
             url: post_url,
             date,

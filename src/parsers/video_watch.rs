@@ -73,6 +73,7 @@ impl Parser for VideoWatchParser {
         Ok(ParsedPost {
             author_name: op_name,
             text,
+            allow_discord_markdown: false,
             image_links: Vec::new(),
             url: post_url,
             date,

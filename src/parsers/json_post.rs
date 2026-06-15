@@ -88,6 +88,7 @@ fn parse_page(
     Ok(ParsedPost {
         author_name: link_header,
         text: post_content,
+        allow_discord_markdown: is_group_post_path(post_path),
         image_links: story.image_links,
         url: post_url,
         date: post_date,
@@ -201,6 +202,10 @@ fn extract_post_id(post_path: &str) -> Option<String> {
         .find_map(|m| m.map(|x| x.as_str().to_owned()))
 }
 
+fn is_group_post_path(post_path: &str) -> bool {
+    post_path.trim_start_matches('/').starts_with("groups/")
+}
+
 fn get_root_node(post_json: &Value) -> Option<&Value> {
     // normal: data has comet_ufi_summary..., node_v2 or node
     let data = jq::first(post_json, "data")?;
@@ -247,7 +252,10 @@ fn get_group_name(blocks: &[JsonBlockText]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_post_id, has_completed_matching_post_block, should_try_partial_fetch};
+    use super::{
+        extract_post_id, has_completed_matching_post_block, is_group_post_path,
+        should_try_partial_fetch,
+    };
 
     #[test]
     fn extracts_numeric_post_id() {
@@ -255,6 +263,17 @@ mod tests {
             extract_post_id("groups/ThinkPadViet/posts/2532721970496550/"),
             Some("2532721970496550".into())
         );
+    }
+
+    #[test]
+    fn detects_group_post_path() {
+        assert!(is_group_post_path(
+            "groups/sportsbook6vn/posts/1372570601398684/"
+        ));
+        assert!(is_group_post_path(
+            "/groups/sportsbook6vn/posts/1372570601398684/"
+        ));
+        assert!(!is_group_post_path("some.page/posts/1372570601398684/"));
     }
 
     #[test]

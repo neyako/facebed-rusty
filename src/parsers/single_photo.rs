@@ -54,6 +54,7 @@ impl Parser for SinglePhotoParser {
         Ok(ParsedPost {
             author_name: author,
             text: text.trim().to_owned(),
+            allow_discord_markdown: false,
             image_links: vec![image],
             url: ensure_absolute(post_path),
             date,
