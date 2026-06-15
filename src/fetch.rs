@@ -315,7 +315,7 @@ impl Fetcher {
 /// cookie path for share resolution and content fetches.
 pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
     let is_share_v = is_share_v_path(path);
-    if fetcher.cookies.len() > 0 {
+    if !fetcher.cookies.is_empty() {
         if let Some(resolved) = resolve_share_link_with_accounts(fetcher, path, is_share_v).await {
             return Ok(resolved);
         }
