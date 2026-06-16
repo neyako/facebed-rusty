@@ -1,7 +1,9 @@
-name: Build and Push Docker Image
+name: CI/CD
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "rust"]
+  pull_request:
+    branches: ["main", "rust"]
   workflow_dispatch:
 
 env:
@@ -9,8 +11,29 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked
+
   # Build per-arch on a native runner. No QEMU = ~5-10x faster than emulated Rust musl builds.
   build:
+    if: github.event_name != 'pull_request'
+    needs: ci
     strategy:
       fail-fast: false
       matrix:
