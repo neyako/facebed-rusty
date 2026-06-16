@@ -1,29 +1,47 @@
-# facebed
+# facebed-rusty
 
-Facebook URL -> OpenGraph embed proxy for Discord and other messaging apps.
+Self-hosted Facebook OpenGraph embed proxy for Discord, Slack, Telegram, and other messaging
+apps.
 
 ![facebed embed preview](assets/readme-preview.png)
 
-Replace `www.facebook.com` with `facebed.com`. Crawlers get a small HTML page with OpenGraph
-metadata; people using a normal browser get redirected back to Facebook.
+Facebook often gives chat apps a plain login wall instead of a useful link preview. facebed
+fetches the Facebook page from your server, extracts the post data, and returns a tiny HTML page
+with OpenGraph tags. Crawlers see the preview. Normal browser users get redirected back to
+Facebook.
 
-facebed is not affiliated with Meta or Facebook.
+This project is not affiliated with Meta or Facebook.
 
-## For users
+## Why self-host it?
 
-Change this:
+Run your own copy on your own domain, for example `facebed.example.com`, then replace:
 
 ```text
 https://www.facebook.com/example/posts/123
 ```
 
-to this:
+with:
 
 ```text
-https://facebed.com/example/posts/123
+https://facebed.example.com/example/posts/123
 ```
 
-Supported link shapes:
+Self-hosting also lets you provide your own Facebook cookies for posts that are visible to your
+account but not visible to an incognito browser, such as private groups, friends-only posts, and
+some stories.
+
+## Features
+
+- Works as a small HTTP service behind nginx, Caddy, Traefik, Cloudflare Tunnel, or any reverse
+  proxy that can forward HTTPS traffic to a local port.
+- Humans are redirected to Facebook with a `301`; crawlers get OG/Twitter meta tags.
+- Optional Cookie-Editor JSON support for cookie-viewable posts.
+- Multiple cookie accounts via `cookies*.json`, with cooldowns, fallback retries, and per-group or
+  per-profile account affinity.
+- Discord webhook alerts for parser failures and unhealthy cookie accounts.
+- Rust binary, async `axum`/`reqwest` server, and a small `scratch` Docker image.
+
+Supported Facebook link shapes:
 
 - Public and cookie-viewable posts, group posts, `story.php`, and `permalink.php`.
 - Single photos: `/photo` and `/photo.php`.
@@ -33,144 +51,128 @@ Supported link shapes:
 - 24-hour stories: `/stories/<author_id>/<media_id>`.
 - Mobile share links: `/share/r/...`, `/share/p/...`, and `/share/v/...`.
 
-The public `facebed.com` instance can only resolve links that Facebook exposes to an
-incognito/no-login browser. For friends-only posts, private groups, restricted stories, and other
-cookie-only content, self-host facebed and bring your own Facebook cookies.
+## Quick start with Docker
 
-<details>
-<summary>Vencord settings</summary>
+Prerequisites:
 
-Using regex:
+- A Linux server or VPS with Docker and Docker Compose.
+- A domain or subdomain pointing at that server.
+- Ports `80` and `443` open if you want Discord and other external crawlers to reach it.
 
-- Find: `https://(www.)?facebook.com/(.*)`
-- Replace: `https://facebed.com/$2`
-
-</details>
-
-## What changed from the old Python script
-
-The original public project was a Python/Bottle app. This branch is a Rust port built with
-axum, reqwest, scraper, tokio, and serde. The Python implementation has been removed from the
-tree; use `git log` if you need to inspect it.
-
-| Area | Python script | Rust port |
-| --- | --- | --- |
-| Runtime | Python 3.12+ plus Bottle, BeautifulSoup, requests, yattag, crawler UA packages, and helper start scripts. | Single Rust binary with async axum server and reqwest client. |
-| Deploy artifact | Python files, virtualenv, and runtime dependencies. | Multi-stage musl build into a `scratch` image, non-root uid/gid 65532. |
-| Update model | Included a remote `/update` hook protected by config credentials. | No remote self-update endpoint; deploy through normal image or process replacement. |
-| Parser layout | One large `facebed.py` file. | Small parser modules for posts, photos, photo comments, reels, watch videos, and stories. |
-| URL coverage | Posts, photos, reels, watch, share links, and photo comments. | Keeps those and adds story support, Page-video routing, group multi-permalink cleanup, and more mobile-share handling. |
-| Cookie support | One `cookies.json`; expired timestamps disabled cookies and warned. | Priority account pool from `cookies*.json`, optional multi-account JSON, live startup checks, per-account user agents, cooldown, retries, and group/profile affinity. |
-| Share links | Public HEAD redirect resolution. | Cookie-aware HEAD/body resolution, group-landing rejection, and Discord-budget timeout handling. |
-| Facebook JSON extraction | Recursive helpers inside the single script. | Shared `jq` helpers plus parser-local matching, with tests around recent schema/routing failures. |
-| Discord behavior | Basic OG image/video embeds and error embeds. | Markdown-safe descriptions, link-card text fallback, mixed-media handling, oversized-video thumbnail fallback, timeout embeds, and stable error codes. |
-| Failure triage | Parser errors could post HTML to Discord. | Preserves parser HTML attachments, adds account-health alerts, status/final-url/body-size logs, and explicit `C/P/U/X/T` embed states. |
-
-## How it works
-
-1. `routes.rs` receives every request through axum.
-2. Human user agents get a `301` and a tiny redirect page.
-3. Bot/crawler user agents continue to embed generation.
-4. Mobile share links are resolved to the real Facebook target.
-5. Tracking parameters are stripped.
-6. The cleaned path is dispatched to a parser.
-7. The parser fetches Facebook HTML, extracts JSON blocks, and returns a `ParsedPost`.
-8. `embed.rs` renders minimal OG/Twitter meta tags for Discord and other preview crawlers.
-
-Parser dispatch:
-
-- `?type=3` -> photo comment parser.
-- `/stories/<author>/<media>` -> stories parser.
-- `/reel/<id>` -> reels parser.
-- `/photo` and `/photo.php` -> single-photo parser.
-- `/watch` and Page video URLs -> watch-video parser.
-- Supported post/group/permalink/story paths -> JSON post parser.
-
-## Error embeds
-
-The suffix in an error embed is intentional and user-visible:
-
-- `C` - no data: login wall, restricted content, expired story, or unsupported URL.
-- `P` - parser failure: likely Facebook changed JSON shape; HTML is sent to the webhook when enabled.
-- `U` - HTTP, IO, JSON, or YAML failure.
-- `X` - unexpected error.
-- `T` - Facebook did not finish within the Discord crawler budget.
-
-Do not rename these codes without coordinating with maintainers; they are useful in screenshots
-and production triage.
-
-Discord note: embeds have been reliable in servers during production use. Some DMs may still fail
-to show a preview even when the same link embeds elsewhere; this appears to be Discord-side preview
-behavior rather than a facebed parser failure.
-
-## Deploy with Docker
+Clone and create local config files:
 
 ```bash
+git clone https://github.com/neyako/facebed-rusty.git
+cd facebed-rusty
 cp config.example.yaml config.yaml
-cp cookies.example.json cookies.json
-$EDITOR config.yaml
-$EDITOR cookies.json
-docker compose up -d --build
+printf '[]\n' > cookies.json
 ```
 
-The container serves plain HTTP on port `9812`. Put nginx, Caddy, Traefik, or another reverse
-proxy in front of it for TLS.
+Edit `config.yaml` first. It works as-is for most installs:
 
-Common commands:
+```yaml
+host: 0.0.0.0
+port: 9812
+timezone: 7
+banned_users: []
+notifier_webhook: ""
+```
+
+The empty `cookies.json` is enough for public-only testing. Replace it with real Facebook cookies
+later if you need private groups, friends-only posts, or stories.
+
+Start the service:
 
 ```bash
 docker compose up -d --build
 docker compose logs -f
-docker compose down
 ```
 
-## Local development
+The app now listens on plain HTTP at `http://127.0.0.1:9812` or `http://SERVER_IP:9812`. Put a
+reverse proxy in front of it for HTTPS.
 
-Requires Rust 1.75 or newer.
+## nginx reverse proxy example
+
+Example setup:
+
+- Your public domain is `facebed.example.com`.
+- facebed is running on the same server at `127.0.0.1:9812`.
+- You use Let's Encrypt certificates from Certbot.
+
+Install nginx and Certbot on Ubuntu/Debian:
 
 ```bash
-cargo run -- -c config.yaml
+sudo apt update
+sudo apt install nginx certbot python3-certbot-nginx
 ```
 
-With defaults only:
+Create `/etc/nginx/sites-available/facebed`:
+
+```nginx
+server {
+    listen 80;
+    server_name facebed.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:9812;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 10s;
+        proxy_read_timeout 10s;
+    }
+}
+```
+
+Enable it:
 
 ```bash
-cargo run
+sudo ln -s /etc/nginx/sites-available/facebed /etc/nginx/sites-enabled/facebed
+sudo nginx -t
+sudo systemctl reload nginx
 ```
 
-Release build:
+Get HTTPS:
 
 ```bash
-cargo build --release
-./target/release/facebed -c config.yaml --cookies cookies.json
+sudo certbot --nginx -d facebed.example.com
 ```
 
-Verbose logs:
+After Certbot finishes, test from outside the server:
 
 ```bash
-RUST_LOG=debug cargo run -- -c config.yaml
+curl -I https://facebed.example.com/
 ```
 
-## Config
+For Cloudflare users: set SSL/TLS mode to `Full` or `Full (strict)`. `Flexible` can create redirect
+loops because nginx sees HTTP from Cloudflare while users see HTTPS.
 
-Config is YAML. Pass it with `-c <path>`. Missing keys use defaults.
+## Using it in Discord or Vencord
 
-| Key | Default | Notes |
-| --- | --- | --- |
-| `host` | `0.0.0.0` | Bind address. |
-| `port` | `9812` | HTTP port. |
-| `timezone` | `7` | UTC offset for embed timestamps. Valid range: `-12` to `14`. |
-| `banned_users` | `[]` | Facebook author IDs that return a placeholder embed. |
-| `notifier_webhook` | `""` | Discord webhook for parser failures and cookie-account health alerts. |
+Once your domain works, replace Facebook links manually:
 
-## Cookies and account pool
+```text
+https://www.facebook.com/example/posts/123
+https://facebed.example.com/example/posts/123
+```
 
-Cookies are optional, but private groups, friends-only posts, and some stories need them.
+Vencord regex replacement:
 
-The server loads the requested cookie path, defaulting to `./cookies.json`, and also scans the
-same directory for sibling `cookies*.json` files. `cookies.example.json` is ignored.
+- Find: `https://(?:www\.)?facebook\.com/(.*)`
+- Replace: `https://facebed.example.com/$1`
 
-Accepted cookie shapes:
+Use your own domain in the replacement string.
+
+## Cookies
+
+Cookies are optional for fully public posts. You need cookies for private groups, friends-only
+posts, restricted stories, and any page Facebook only shows to a logged-in account.
+
+Basic Cookie-Editor export:
 
 ```json
 [
@@ -179,7 +181,18 @@ Accepted cookie shapes:
 ]
 ```
 
-or:
+Save it as `cookies.json` next to `docker-compose.yml`. Do not commit real cookies.
+
+Multi-account options:
+
+- `cookies.json` -> account label `default`
+- `cookies-alice.json` -> account label `alice`
+- `cookies-bob.json` -> account label `bob`
+
+The server automatically loads sibling files matching `cookies*.json`, except
+`cookies.example.json`.
+
+You can also use one multi-account file:
 
 ```json
 {
@@ -195,26 +208,7 @@ or:
 }
 ```
 
-For flat Cookie-Editor exports, the account label comes from the filename:
-
-- `cookies.json` -> `default`
-- `cookies-alice.json` -> `alice`
-- `cookies2.json` -> `2`
-
-At runtime, accounts are tried in priority order. Accounts that fail are cooled down for a short
-period, and a group/profile affinity map remembers which account worked last time. This keeps
-repeat embeds fast without making every request rotate blindly.
-
-On startup, facebed probes each cookie account with `facebook.com/me`. It logs the visible account
-name when the account is healthy, and posts to the webhook when one or more accounts look blocked,
-checkpointed, logged out, or unreadable.
-
-After three consecutive fetch failures for the same account, facebed sends another webhook alert
-with the account label so the operator knows which cookie file needs attention.
-
-### Per-account user agents
-
-Create `useragents.json` next to the cookie files:
+Optional per-account user agents go in `useragents.json`:
 
 ```json
 {
@@ -223,44 +217,144 @@ Create `useragents.json` next to the cookie files:
 }
 ```
 
-Missing labels use the default Chrome-like user agent. A `user_agent` field inside a multi-account
-cookie object takes precedence over the sidecar file.
+Warning: cookie-backed scraping can trigger Facebook checkpoints or rate limits. Use a dedicated
+account, not your primary personal account.
 
-Warning: cookie-backed scraping can hit rate limits or trigger Facebook checkpoints. Use dedicated
-accounts, not a primary personal account.
+## Config reference
 
-## Verification
+`config.yaml` is optional when running the binary directly, but the Docker example mounts one for
+clarity. Missing keys use defaults.
 
-Run the unit tests:
+| Key | Default | Notes |
+| --- | --- | --- |
+| `host` | `0.0.0.0` | Bind address inside the container or process. |
+| `port` | `9812` | HTTP port facebed listens on. |
+| `timezone` | `7` | UTC offset for embed timestamps. Valid range: `-12` to `14`. |
+| `banned_users` | `[]` | Facebook author IDs that return a placeholder embed. |
+| `notifier_webhook` | `""` | Discord webhook for parser bugs and cookie-account health alerts. |
+
+## Verify your install
+
+Check that the service is alive:
+
+```bash
+curl http://127.0.0.1:9812/
+```
+
+Check crawler output:
+
+```bash
+curl -A 'Discordbot/2.0' 'http://127.0.0.1:9812/<facebook-path>'
+```
+
+The returned HTML should contain tags like:
+
+```html
+<meta property="og:title" content="..."/>
+<meta property="og:description" content="..."/>
+<meta property="og:image" content="..."/>
+```
+
+Check human redirect behavior:
+
+```bash
+curl -I 'http://127.0.0.1:9812/<facebook-path>'
+```
+
+Without a crawler user agent, you should see a `301` redirect to Facebook.
+
+## Troubleshooting
+
+No Discord preview:
+
+- Make sure your domain is reachable over public HTTPS.
+- Use `curl -A 'Discordbot/2.0'` to confirm facebed returns OG tags.
+- Discord caches previews. Try a different URL or wait before retesting.
+- Some Discord DMs may not show a preview even when the same link embeds in a server.
+
+Error embed codes:
+
+- `C` - no data: login wall, restricted content, expired story, or unsupported URL.
+- `P` - parser failure: likely Facebook changed its JSON shape. If a webhook is configured, raw
+  HTML is attached for debugging.
+- `U` - HTTP, IO, JSON, or YAML failure.
+- `X` - unexpected error.
+- `T` - Facebook did not finish within the Discord crawler response budget.
+
+Cookie problems:
+
+- Watch startup logs for `cookie account alive` or `cookie account bad`.
+- Re-export cookies if the account is logged out, checkpointed, or blocked.
+- If one account fails repeatedly, facebed cools it down and tries other configured accounts.
+
+## Small benchmark vs the original Python project
+
+The original project, [facebed/facebed](https://github.com/facebed/facebed), is a Python/Bottle
+app. This repo is a Rust port.
+
+One small crawl benchmark was run on June 16, 2026 from a residential IP in Vietnam, against one
+cookie-viewable group post. Both apps ran on the same local machine and returned a valid embed with
+the same title/image. The archived Python app's stale Cookie-Editor timestamp check was bypassed
+locally so it could use the same cookie export.
+
+| Implementation | Runs | Min | Median | Mean | Max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Rust port | 4 | 1.14s | 1.43s | 1.63s | 2.55s |
+| Original Python app | 4 | 3.77s | 4.61s | 5.01s | 7.03s |
+
+Treat this as a sanity check, not a universal guarantee. Facebook response time depends heavily on
+region, account health, link type, cookies, and whether a link needs share-resolution redirects.
+
+Practical differences from the Python app:
+
+| Area | Original Python app | Rust port |
+| --- | --- | --- |
+| Runtime | Python 3.12+ with Bottle, BeautifulSoup, requests, and helper packages. | Single Rust binary with async `axum` and `reqwest`. |
+| Docker image | Python runtime plus site packages. | Static release binary copied into `scratch`. |
+| Updates | Included a remote `/update` hook. | No remote self-update endpoint; redeploy normally. |
+| Parser layout | One large `facebed.py`. | Parser modules by URL type. |
+| Cookies | One `cookies.json`; stale timestamps disable cookies. | Multiple accounts, live startup checks, cooldowns, retries, and affinity. |
+| URL coverage | Posts, photos, reels, watch, share links, and photo comments. | Keeps those and adds stories, Page-video routing, group multi-permalink cleanup, and more mobile-share handling. |
+
+## Local development
+
+Requires Rust 1.75 or newer.
+
+Run with defaults:
+
+```bash
+cargo run
+```
+
+Run with config and cookies:
+
+```bash
+cargo run -- -c config.yaml --cookies cookies.json
+```
+
+Release build:
+
+```bash
+cargo build --release
+./target/release/facebed -c config.yaml --cookies cookies.json
+```
+
+Verbose logs:
+
+```bash
+RUST_LOG=debug cargo run -- -c config.yaml --cookies cookies.json
+```
+
+Tests and formatting:
 
 ```bash
 cargo test
-```
-
-Check formatting:
-
-```bash
 cargo fmt -- --check
 ```
 
-Run locally and request an embed as Discord:
+## Maintainer notes
 
-```bash
-cargo run -- -c config.yaml
-curl -A 'Discordbot/2.0' 'http://localhost:9812/<facebook-path>'
-```
-
-Inspect the returned HTML for `og:title`, `og:description`, `og:image`, `og:video`, and
-`og:site_name` tags.
-
-## Production notes
-
-- Keep the crawler-user-agent gate. Humans should redirect to Facebook instead of seeing the embed page.
-- Keep parser failures noisy. `P` errors with raw HTML attachments are how Facebook schema changes get fixed.
-- Keep the Rust image small and boring. The current Dockerfile builds a static release binary and copies only the binary plus assets into `scratch`.
-- Prefer targeted parser changes over large rewrites; Facebook URL families use different JSON shapes.
-- If a video is larger than Discord's media proxy limit, facebed serves the thumbnail and a click-through hint instead of an empty video card.
-
-## License
-
-MIT
+- Keep the crawler user-agent gate. Humans should redirect to Facebook.
+- Keep parser failures noisy. `P` errors with HTML attachments are how Facebook schema changes get
+  fixed.
+- Keep user-facing error code letters stable: `C`, `P`, `U`, `X`, and `T`.
