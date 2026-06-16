@@ -68,7 +68,7 @@ impl Parser for VideoWatchParser {
 
         let thumbnail = thumbnail_in_node(&content_node)
             .or_else(|| thumbnail_in_target_blocks(&blocks, &video_id))
-            .or_else(|| blocks.iter().find_map(|b| thumbnail_in_node(b)));
+            .or_else(|| blocks.iter().find_map(thumbnail_in_node));
 
         Ok(ParsedPost {
             author_name: op_name,
@@ -100,8 +100,7 @@ fn target_video_id(post_path: &str) -> Option<String> {
     }
     parsed
         .path_segments()?
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-        .last()
+        .rfind(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
         .map(str::to_owned)
 }
 

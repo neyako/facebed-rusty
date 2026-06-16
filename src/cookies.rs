@@ -11,8 +11,6 @@ use tracing::{info, warn};
 pub struct CookieEntry {
     pub name: String,
     pub value: String,
-    #[serde(default)]
-    pub domain: Option<String>,
     #[serde(default, rename = "expirationDate")]
     pub expiration_date: Option<f64>,
 }

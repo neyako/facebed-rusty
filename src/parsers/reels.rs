@@ -67,8 +67,8 @@ impl Parser for ReelsParser {
             return Ok(banned_post(&post_url));
         }
 
-        let thumbnail = thumbnail_in_node(&content_node)
-            .or_else(|| blocks.iter().find_map(|b| thumbnail_in_node(b)));
+        let thumbnail =
+            thumbnail_in_node(&content_node).or_else(|| blocks.iter().find_map(thumbnail_in_node));
 
         Ok(ParsedPost {
             author_name: op_name,
@@ -251,9 +251,8 @@ fn get_reaction_counts(
     }
     let bloc = matched[0];
 
-    let feedbacks = jq::all(bloc, "feedback");
-    let first_fb = feedbacks.first().copied()?;
-    let last_fb = feedbacks.last().copied()?;
+    let first_fb = jq::first(bloc, "feedback")?;
+    let last_fb = jq::last(bloc, "feedback")?;
     let (first_fb, last_fb) = if first_fb
         .to_string()
         .contains("cross_universe_feedback_info")

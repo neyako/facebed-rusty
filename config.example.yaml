@@ -9,6 +9,6 @@ timezone: 7
 # Facebook author IDs whose posts return a "banned" placeholder instead of being embedded.
 banned_users: []
 
-# Discord webhook URL. If set, the server posts parser-bug reports and expired-cookie alerts here.
+# Discord webhook URL. If set, the server posts parser-bug reports and cookie-account health alerts here.
 # Leave empty to disable.
 notifier_webhook: ""

@@ -43,14 +43,6 @@ pub fn val_str(v: &Value) -> String {
     }
 }
 
-pub fn val_i64(v: &Value) -> Option<i64> {
-    match v {
-        Value::Number(n) => n.as_i64(),
-        Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
 pub fn val_str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }

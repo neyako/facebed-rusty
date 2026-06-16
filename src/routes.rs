@@ -195,18 +195,44 @@ async fn catch_all(
 
     // share link resolve
     let mut working = path.clone();
+    if let Some(wrapped) = url_clean::extract_share_url(&working) {
+        working = wrapped;
+    }
     if RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working) {
-        match resolve_share_link(&state.fetcher, &working).await {
-            Ok(resolved) if !resolved.path.is_empty() => {
+        let remaining = match DISCORD_RESPONSE_BUDGET.checked_sub(started.elapsed()) {
+            Some(remaining) => remaining,
+            None => {
+                warn!(
+                    path = %working,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "share resolve skipped after Discord response budget"
+                );
+                return no_store_html_response(format_timeout_embed(&url_clean::ensure_absolute(
+                    &working,
+                )));
+            }
+        };
+        match tokio::time::timeout(remaining, resolve_share_link(&state.fetcher, &working)).await {
+            Err(_) => {
+                warn!(
+                    path = %working,
+                    budget_ms = DISCORD_RESPONSE_BUDGET.as_millis(),
+                    "share resolve exceeded Discord response budget"
+                );
+                return no_store_html_response(format_timeout_embed(&url_clean::ensure_absolute(
+                    &working,
+                )));
+            }
+            Ok(Ok(resolved)) if !resolved.path.is_empty() => {
                 working = resolved.path;
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 return html_response(format_error_embed(
                     &url_clean::ensure_absolute(&working),
                     "C",
                 ));
             }
-            Err(e) => return error_response(&state, &working, e),
+            Ok(Err(e)) => return error_response(&state, &working, e),
         }
     }
 
@@ -234,9 +260,8 @@ async fn catch_all(
     } else if path_only(&working)
         .map(|p| RE_WATCH.is_match(&p))
         .unwrap_or(false)
+        || RE_PAGE_VIDEO.is_match(&working)
     {
-        ParserKind::Watch
-    } else if RE_PAGE_VIDEO.is_match(&working) {
         ParserKind::Watch
     } else if is_facebook_url(&working) {
         ParserKind::JsonPost
