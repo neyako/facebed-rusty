@@ -340,6 +340,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     let attempts = n.max(1);
     let mut last_err: Option<FacebedError> = None;
     let key = scope_key(path);
+    let process_started = Instant::now();
 
     // Build ordering: healthy accounts first (priority order), then
     // cooldowned ones as fallback. With n=0 (anonymous) we still loop once.
@@ -371,6 +372,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     };
 
     for (loop_idx, &account_index) in order.iter().enumerate() {
+        let attempt_started = Instant::now();
         let result = if n > 0 {
             ACCOUNT_OVERRIDE
                 .scope(account_index, run_parser(state, path, kind))
@@ -381,13 +383,25 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
 
         match result {
             Ok(post) => {
+                let scrape_ms = attempt_started.elapsed().as_millis();
                 if n > 0 {
                     state.ctx.cookies.mark_ok(account_index);
                     if let Some(k) = key.as_deref() {
                         state.ctx.cookies.set_affinity(k.to_string(), account_index);
                     }
                 }
+                let render_started = Instant::now();
                 let body = render_with_size_check(state, &post, kind).await;
+                info!(
+                    path = %path,
+                    kind = ?kind,
+                    account = %state.ctx.cookies.label_at(account_index).unwrap_or(""),
+                    attempt = loop_idx,
+                    scrape_ms,
+                    render_ms = render_started.elapsed().as_millis(),
+                    total_ms = process_started.elapsed().as_millis(),
+                    "embed rendered"
+                );
                 return html_response(body);
             }
             Err(e) if is_retryable(&e) && loop_idx + 1 < order.len() => {
@@ -401,7 +415,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                     }
                 }
                 let label = state.ctx.cookies.label_at(account_index).unwrap_or("?");
-                warn!(path = %path, attempt = loop_idx, account = %label, error = %e, "retrying with fallback account");
+                warn!(path = %path, attempt = loop_idx, account = %label, error = %e, elapsed_ms = attempt_started.elapsed().as_millis(), "retrying with fallback account");
                 last_err = Some(e);
                 continue;
             }
@@ -410,6 +424,16 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                     let count = state.ctx.cookies.mark_failed(account_index);
                     maybe_notify_bad_account(state, account_index, count, &e);
                 }
+                warn!(
+                    path = %path,
+                    kind = ?kind,
+                    account = %state.ctx.cookies.label_at(account_index).unwrap_or(""),
+                    attempt = loop_idx,
+                    error = %e,
+                    attempt_ms = attempt_started.elapsed().as_millis(),
+                    total_ms = process_started.elapsed().as_millis(),
+                    "embed render failed"
+                );
                 return error_response(state, path, e);
             }
         }
@@ -509,6 +533,10 @@ async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: Parse
         // Server didn't advertise Content-Length — assume it's fine and let
         // Discord try. Better to attempt the inline than silently downgrade
         // every video where FB omits the header.
+        info!(
+            url = %post.url,
+            "video size unavailable; rendering inline video embed"
+        );
         return render(post, tz, kind);
     };
     if size <= DISCORD_VIDEO_BYTE_LIMIT {

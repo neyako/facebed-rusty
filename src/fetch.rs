@@ -7,8 +7,9 @@ use regex::Regex;
 use reqwest::{Client, RequestBuilder};
 use scraper::{Html, Selector};
 use serde_json::Value;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use url::Url;
 
 tokio::task_local! {
@@ -21,6 +22,7 @@ tokio::task_local! {
 pub struct Fetcher {
     client: Client,
     cookies: Arc<CookieJar>,
+    media_size_cache: Mutex<MediaSizeCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,52 @@ const HEADERS: &[(&str, &str)] = &[
 ];
 const SHARE_HEAD_USER_AGENT: &str = "python-requests/2.32.3";
 const VIDEO_HEAD_TIMEOUT: Duration = Duration::from_millis(750);
+const VIDEO_HEAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const VIDEO_HEAD_CACHE_MAX: usize = 256;
+
+#[derive(Default)]
+struct MediaSizeCache {
+    entries: HashMap<String, CachedContentLength>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedContentLength {
+    value: Option<u64>,
+    checked_at: Instant,
+}
+
+impl MediaSizeCache {
+    fn get(&mut self, url: &str, now: Instant) -> Option<Option<u64>> {
+        let Some(entry) = self.entries.get(url).copied() else {
+            return None;
+        };
+        if now.duration_since(entry.checked_at) <= VIDEO_HEAD_CACHE_TTL {
+            return Some(entry.value);
+        }
+        self.entries.remove(url);
+        None
+    }
+
+    fn insert(&mut self, url: &str, value: Option<u64>, now: Instant) {
+        if self.entries.len() >= VIDEO_HEAD_CACHE_MAX && !self.entries.contains_key(url) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.checked_at)
+                .map(|(url, _)| url.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            url.to_owned(),
+            CachedContentLength {
+                value,
+                checked_at: now,
+            },
+        );
+    }
+}
 
 impl Fetcher {
     pub fn new(cookies: Arc<CookieJar>) -> anyhow::Result<Self> {
@@ -86,7 +134,11 @@ impl Fetcher {
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(8))
             .build()?;
-        Ok(Self { client, cookies })
+        Ok(Self {
+            client,
+            cookies,
+            media_size_cache: Mutex::default(),
+        })
     }
 
     pub fn client(&self) -> &Client {
@@ -201,33 +253,81 @@ impl Fetcher {
     /// hand the URL off as an `og:video`. Returns `None` on transport error,
     /// non-2xx response, or missing/unparseable header.
     pub async fn head_content_length(&self, url: &str) -> Option<u64> {
-        let resp = self
+        let started = Instant::now();
+        let now = Instant::now();
+        if let Ok(mut cache) = self.media_size_cache.lock() {
+            if let Some(value) = cache.get(url, now) {
+                tracing::info!(
+                    size = ?value,
+                    cached = true,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "video size probe done"
+                );
+                return value;
+            }
+        }
+
+        let resp = match self
             .client
             .head(url)
             .timeout(VIDEO_HEAD_TIMEOUT)
             .send()
             .await
-            .ok()?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let e = e.without_url();
+                tracing::debug!(
+                    error = %e,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "video size probe failed"
+                );
+                return None;
+            }
+        };
+        let status = resp.status();
         if !resp.status().is_success() {
+            if let Ok(mut cache) = self.media_size_cache.lock() {
+                cache.insert(url, None, Instant::now());
+            }
+            tracing::debug!(
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                "video size probe rejected status"
+            );
             return None;
         }
-        resp.headers()
-            .get(reqwest::header::CONTENT_LENGTH)?
-            .to_str()
-            .ok()?
-            .parse()
-            .ok()
+        let value = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        if let Ok(mut cache) = self.media_size_cache.lock() {
+            cache.insert(url, value, Instant::now());
+        }
+        tracing::info!(
+            status = %status,
+            size = ?value,
+            cached = false,
+            elapsed_ms = started.elapsed().as_millis(),
+            "video size probe done"
+        );
+        value
     }
 
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
+        let started = Instant::now();
         let url = ensure_absolute(post_path);
         let (req, account_label) = self.request_for(&url, use_cookies);
         let resp = req.send().await?;
+        let response_ms = started.elapsed().as_millis();
         let status = resp.status();
         let final_url = resp.url().to_string();
+        let read_started = Instant::now();
         let html = resp.text().await?;
-        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, "fetch done");
+        let read_ms = read_started.elapsed().as_millis();
+        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
         self.page_from_html(url, html, post_path, false)
     }
 
@@ -244,13 +344,16 @@ impl Fetcher {
         F: FnMut(&str) -> bool,
     {
         let mut should_stop = should_stop;
+        let started = Instant::now();
         let url = ensure_absolute(post_path);
         let (req, account_label) = self.request_for(&url, use_cookies);
         let mut resp = req.send().await?;
+        let response_ms = started.elapsed().as_millis();
         let status = resp.status();
         let final_url = resp.url().to_string();
         let mut body = Vec::new();
         let mut stopped_early = false;
+        let read_started = Instant::now();
         while let Some(chunk) = resp.chunk().await? {
             body.extend_from_slice(&chunk);
             let html = String::from_utf8_lossy(&body);
@@ -259,8 +362,9 @@ impl Fetcher {
                 break;
             }
         }
+        let read_ms = read_started.elapsed().as_millis();
         let html = String::from_utf8_lossy(&body).into_owned();
-        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early, "fetch done");
+        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
         self.page_from_html(url, html, post_path, stopped_early)
     }
 
@@ -295,14 +399,24 @@ impl Fetcher {
         post_path: &str,
         partial: bool,
     ) -> FacebedResult<FetchedPage> {
+        let parse_started = Instant::now();
         let document = Html::parse_document(&html);
+        let parse_ms = parse_started.elapsed().as_millis();
         let page = FetchedPage {
             url,
             html,
             document,
             partial,
         };
+        let probe_started = Instant::now();
         check_or_raise(&page, post_path)?;
+        tracing::debug!(
+            path = %post_path,
+            partial,
+            parse_ms,
+            probe_ms = probe_started.elapsed().as_millis(),
+            "facebook html parsed"
+        );
         Ok(page)
     }
 }
@@ -441,6 +555,7 @@ async fn resolve_share_link_body(
     path: &str,
     account_index: Option<usize>,
 ) -> FacebedResult<ResolvedShare> {
+    let started = Instant::now();
     let url = ensure_absolute(path);
     let mut req = fetcher.client().get(&url);
     for (k, v) in HEADERS {
@@ -453,8 +568,12 @@ async fn resolve_share_link_body(
         "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
     );
     let resp = req.send().await?;
+    let response_ms = started.elapsed().as_millis();
+    let status = resp.status();
     let final_url = resp.url().to_string();
+    let read_started = Instant::now();
     let body = resp.text().await?;
+    let read_ms = read_started.elapsed().as_millis();
 
     // Prefer og:url / link[rel=canonical] from the response body — that
     // value is the page's own declared canonical path, not just wherever
@@ -472,7 +591,7 @@ async fn resolve_share_link_body(
                     path: String::new(),
                 });
             }
-            final_url
+            final_url.clone()
         }
     };
 
@@ -482,6 +601,18 @@ async fn resolve_share_link_body(
             .trim_start_matches("http://www.facebook.com/")
             .to_owned()
     });
+    tracing::info!(
+        path = %path,
+        account = %share_account_label(fetcher, account_index),
+        status = %status,
+        final_url = %final_url,
+        resolved = %stripped,
+        len = body.len(),
+        response_ms,
+        read_ms,
+        total_ms = started.elapsed().as_millis(),
+        "share body resolve done"
+    );
     Ok(ResolvedShare { path: stripped })
 }
 
@@ -490,18 +621,58 @@ async fn resolve_share_link_head(
     path: &str,
     account_index: Option<usize>,
 ) -> Option<String> {
+    let started = Instant::now();
     let url = ensure_absolute(path);
     let mut req = fetcher.client().head(&url);
     for (k, v) in HEADERS {
         req = req.header(*k, *v);
     }
     req = attach_share_identity(fetcher, req, account_index, SHARE_HEAD_USER_AGENT);
-    let resp = req.send().await.ok()?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::debug!(
+                path = %path,
+                account = %share_account_label(fetcher, account_index),
+                error = %e,
+                elapsed_ms = started.elapsed().as_millis(),
+                "share head resolve failed"
+            );
+            return None;
+        }
+    };
+    let status = resp.status();
     let final_url = resp.url().to_string();
     if final_url == url {
+        tracing::info!(
+            path = %path,
+            account = %share_account_label(fetcher, account_index),
+            status = %status,
+            final_url = %final_url,
+            resolved = ?Option::<String>::None,
+            elapsed_ms = started.elapsed().as_millis(),
+            "share head resolve done"
+        );
         return None;
     }
-    facebook_path_from_url(&final_url)
+    let resolved = facebook_path_from_url(&final_url);
+    tracing::info!(
+        path = %path,
+        account = %share_account_label(fetcher, account_index),
+        status = %status,
+        final_url = %final_url,
+        resolved = ?resolved,
+        elapsed_ms = started.elapsed().as_millis(),
+        "share head resolve done"
+    );
+    resolved
+}
+
+fn share_account_label(fetcher: &Fetcher, account_index: Option<usize>) -> String {
+    account_index
+        .and_then(|i| fetcher.cookies.label_at(i))
+        .unwrap_or("")
+        .to_owned()
 }
 
 fn attach_share_identity(
@@ -775,9 +946,11 @@ mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
         head_target_usable, is_group_landing_target, is_post_like_share_target, probe_page_type,
-        share_resolution_usable, PageType, ResolvedShare,
+        share_resolution_usable, MediaSizeCache, PageType, ResolvedShare, VIDEO_HEAD_CACHE_MAX,
+        VIDEO_HEAD_CACHE_TTL,
     };
     use scraper::Html;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn facebook_path_from_url_keeps_query_for_real_targets() {
@@ -870,6 +1043,30 @@ mod tests {
         let body = r#"<script>{"queryName":"useCometLogInFormQuery","login_data":{}}</script>"#;
         let doc = Html::parse_document(body);
         assert_eq!(probe_page_type(&doc, body), PageType::LoginWall);
+    }
+
+    #[test]
+    fn media_size_cache_expires_and_bounds_entries() {
+        let mut cache = MediaSizeCache::default();
+        let now = Instant::now();
+
+        cache.insert("https://video.test/1", Some(123), now);
+        assert_eq!(
+            cache.get("https://video.test/1", now + Duration::from_secs(1)),
+            Some(Some(123))
+        );
+        assert_eq!(
+            cache.get(
+                "https://video.test/1",
+                now + VIDEO_HEAD_CACHE_TTL + Duration::from_secs(1)
+            ),
+            None
+        );
+
+        for i in 0..=VIDEO_HEAD_CACHE_MAX {
+            cache.insert(&format!("https://video.test/{i}"), None, now);
+        }
+        assert!(cache.entries.len() <= VIDEO_HEAD_CACHE_MAX);
     }
 
     #[test]
