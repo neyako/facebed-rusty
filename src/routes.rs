@@ -173,13 +173,19 @@ async fn catch_all(
             .map(|(_, v)| v.into_owned())
             .collect();
         if types.iter().any(|t| t.contains('3')) {
-            return process(&state, &path, ParserKind::Photocom).await;
+            let cleaned = url_clean::clean_path(&path);
+            return process(&state, &cleaned, ParserKind::Photocom).await;
         }
     }
 
     // crawler gate
     if !is_bot {
         let target = url_clean::ensure_absolute(&path);
+        let target = if url_clean::is_facebook_page_url(&target) {
+            target
+        } else {
+            String::from("https://www.facebook.com/")
+        };
         let body = format_redirect_page(&target);
         let mut hdrs = HeaderMap::new();
         hdrs.insert(

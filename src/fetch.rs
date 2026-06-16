@@ -1,7 +1,7 @@
 use crate::cookies::CookieJar;
 use crate::error::{FacebedError, FacebedResult};
 use crate::jq;
-use crate::url_clean::ensure_absolute;
+use crate::url_clean::{ensure_absolute, is_facebook_media_host, is_facebook_page_host};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{Client, RequestBuilder};
@@ -253,6 +253,13 @@ impl Fetcher {
     /// hand the URL off as an `og:video`. Returns `None` on transport error,
     /// non-2xx response, or missing/unparseable header.
     pub async fn head_content_length(&self, url: &str) -> Option<u64> {
+        let host_ok = Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(is_facebook_media_host))
+            .unwrap_or(false);
+        if !host_ok {
+            return None;
+        }
         let started = Instant::now();
         let now = Instant::now();
         if let Ok(mut cache) = self.media_size_cache.lock() {
@@ -318,7 +325,7 @@ impl Fetcher {
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
         let started = Instant::now();
-        let url = ensure_absolute(post_path);
+        let url = facebook_fetch_url(post_path)?;
         let (req, account_label) = self.request_for(&url, use_cookies);
         let resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
@@ -345,7 +352,7 @@ impl Fetcher {
     {
         let mut should_stop = should_stop;
         let started = Instant::now();
-        let url = ensure_absolute(post_path);
+        let url = facebook_fetch_url(post_path)?;
         let (req, account_label) = self.request_for(&url, use_cookies);
         let mut resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
@@ -418,6 +425,24 @@ impl Fetcher {
             "facebook html parsed"
         );
         Ok(page)
+    }
+}
+
+/// Resolve `post_path` to an absolute URL, refusing anything that is not a
+/// Facebook page host. Content fetches can attach the account cookie, so only
+/// Facebook page hosts may receive these requests.
+fn facebook_fetch_url(post_path: &str) -> FacebedResult<String> {
+    let url = ensure_absolute(post_path);
+    let allowed = Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(is_facebook_page_host))
+        .unwrap_or(false);
+    if allowed {
+        Ok(url)
+    } else {
+        Err(FacebedError::no_data(format!(
+            "refusing to fetch non-Facebook host for {post_path}"
+        )))
     }
 }
 
@@ -958,6 +983,21 @@ mod tests {
             facebook_path_from_url("https://www.facebook.com/watch/?v=123&rdid=x"),
             Some("watch/?v=123&rdid=x".into())
         );
+    }
+
+    #[test]
+    fn fetch_url_guard_allows_facebook_refuses_other_hosts() {
+        use crate::error::FacebedError;
+
+        assert_eq!(
+            super::facebook_fetch_url("groups/1/posts/2").unwrap(),
+            "https://www.facebook.com/groups/1/posts/2"
+        );
+        assert!(super::facebook_fetch_url("https://m.facebook.com/x").is_ok());
+        assert!(matches!(
+            super::facebook_fetch_url("https://example.com/x?type=3"),
+            Err(FacebedError::NoData(_))
+        ));
     }
 
     #[test]

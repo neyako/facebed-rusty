@@ -155,3 +155,32 @@ fn find_bucket_containing<'a>(root: &'a Value, needle: &Value) -> Option<&'a Val
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::find_story_bucket_and_node;
+    use serde_json::json;
+
+    #[test]
+    fn finds_bucket_and_story_node() {
+        let blocks = vec![json!({
+            "owner": {"id": "9", "name": "Story Owner"},
+            "unified_stories_with_notes": {
+                "edges": [{"node": {
+                    "creation_time": 123,
+                    "attachments": [{"media": {"image": {"uri": "https://img.example/s.jpg"}}}]
+                }}]
+            }
+        })];
+
+        let (bucket, node) = find_story_bucket_and_node(&blocks).unwrap();
+        assert_eq!(
+            bucket.pointer("/owner/name").and_then(|v| v.as_str()),
+            Some("Story Owner")
+        );
+        assert_eq!(
+            node.get("creation_time").and_then(|v| v.as_i64()),
+            Some(123)
+        );
+    }
+}

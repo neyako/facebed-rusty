@@ -94,3 +94,25 @@ fn get_single_image(blocks: &[Value]) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{get_content_node, get_single_image};
+    use serde_json::json;
+
+    #[test]
+    fn finds_content_node_and_single_image() {
+        let blocks = vec![json!({
+            "message_preferred_body": {},
+            "container_story": {},
+            "data": {"owner": {"name": "Photog"}},
+            "prefetch_uris_v2": [{"uri": "https://img.example/single.jpg"}]
+        })];
+
+        assert!(get_content_node(&blocks).is_some());
+        assert_eq!(
+            get_single_image(&blocks).as_deref(),
+            Some("https://img.example/single.jpg")
+        );
+    }
+}

@@ -388,7 +388,24 @@ pub fn credit() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::format_description_text;
+    use super::{format_description_text, format_full_post_embed, format_reel_post_embed};
+    use crate::parsers::ParsedPost;
+
+    fn sample_post() -> ParsedPost {
+        ParsedPost {
+            author_name: r#"Title "quote""#.into(),
+            text: "body text".into(),
+            allow_discord_markdown: false,
+            image_links: vec!["https://img.example/p.jpg".into()],
+            url: "https://www.facebook.com/x".into(),
+            date: -1,
+            likes: "null".into(),
+            comments: "null".into(),
+            shares: "null".into(),
+            video_links: Vec::new(),
+            thumbnail: None,
+        }
+    }
 
     #[test]
     fn preserves_intentional_discord_markdown() {
@@ -427,5 +444,28 @@ mod tests {
             format_description_text("Sale ** ends", true),
             r"Sale \*\* ends"
         );
+    }
+
+    #[test]
+    fn full_embed_emits_image_and_escapes_attribute() {
+        let html = format_full_post_embed(&sample_post(), 0);
+
+        assert!(html.contains(r#"<meta property="og:image" content="https://img.example/p.jpg"/>"#));
+        assert!(html.contains("Title &quot;quote&quot;"));
+        assert!(!html.contains(r#"content="Title "quote""#));
+    }
+
+    #[test]
+    fn reel_embed_emits_video_player_card() {
+        let mut post = sample_post();
+        post.image_links.clear();
+        post.video_links = vec!["https://video.fbcdn.net/v.mp4".into()];
+
+        let html = format_reel_post_embed(&post, 0);
+
+        assert!(
+            html.contains(r#"<meta property="og:video" content="https://video.fbcdn.net/v.mp4"/>"#)
+        );
+        assert!(html.contains(r#"<meta name="twitter:card" content="player"/>"#));
     }
 }
