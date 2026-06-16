@@ -345,12 +345,11 @@ impl Fetcher {
         &self,
         post_path: &str,
         use_cookies: bool,
-        should_stop: F,
+        mut should_stop: F,
     ) -> FacebedResult<FetchedPage>
     where
-        F: FnMut(&str) -> bool,
+        F: FnMut(&[u8]) -> bool,
     {
-        let mut should_stop = should_stop;
         let started = Instant::now();
         let url = facebook_fetch_url(post_path)?;
         let (req, account_label) = self.request_for(&url, use_cookies);
@@ -363,8 +362,7 @@ impl Fetcher {
         let read_started = Instant::now();
         while let Some(chunk) = resp.chunk().await? {
             body.extend_from_slice(&chunk);
-            let html = String::from_utf8_lossy(&body);
-            if should_stop(&html) {
+            if should_stop(&body) {
                 stopped_early = true;
                 break;
             }
