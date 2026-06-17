@@ -1,7 +1,7 @@
 use crate::cookies::CookieJar;
 use crate::error::{FacebedError, FacebedResult};
 use crate::jq;
-use crate::url_clean::ensure_absolute;
+use crate::url_clean::{ensure_absolute, is_facebook_media_host, is_facebook_page_host};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{Client, RequestBuilder};
@@ -253,6 +253,13 @@ impl Fetcher {
     /// hand the URL off as an `og:video`. Returns `None` on transport error,
     /// non-2xx response, or missing/unparseable header.
     pub async fn head_content_length(&self, url: &str) -> Option<u64> {
+        let host_ok = Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(is_facebook_media_host))
+            .unwrap_or(false);
+        if !host_ok {
+            return None;
+        }
         let started = Instant::now();
         let now = Instant::now();
         if let Ok(mut cache) = self.media_size_cache.lock() {
@@ -318,12 +325,17 @@ impl Fetcher {
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
         let started = Instant::now();
-        let url = ensure_absolute(post_path);
+        let url = facebook_fetch_url(post_path)?;
         let (req, account_label) = self.request_for(&url, use_cookies);
         let resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
         let final_url = resp.url().to_string();
+        let retry_after = retry_after_secs(&resp);
+        if let Some(err) = classify_block(status, &final_url, retry_after) {
+            tracing::warn!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, response_ms, "fetch blocked");
+            return Err(err);
+        }
         let read_started = Instant::now();
         let html = resp.text().await?;
         let read_ms = read_started.elapsed().as_millis();
@@ -338,26 +350,29 @@ impl Fetcher {
         &self,
         post_path: &str,
         use_cookies: bool,
-        should_stop: F,
+        mut should_stop: F,
     ) -> FacebedResult<FetchedPage>
     where
-        F: FnMut(&str) -> bool,
+        F: FnMut(&[u8]) -> bool,
     {
-        let mut should_stop = should_stop;
         let started = Instant::now();
-        let url = ensure_absolute(post_path);
+        let url = facebook_fetch_url(post_path)?;
         let (req, account_label) = self.request_for(&url, use_cookies);
         let mut resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
         let final_url = resp.url().to_string();
+        let retry_after = retry_after_secs(&resp);
+        if let Some(err) = classify_block(status, &final_url, retry_after) {
+            tracing::warn!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, response_ms, "fetch blocked");
+            return Err(err);
+        }
         let mut body = Vec::new();
         let mut stopped_early = false;
         let read_started = Instant::now();
         while let Some(chunk) = resp.chunk().await? {
             body.extend_from_slice(&chunk);
-            let html = String::from_utf8_lossy(&body);
-            if should_stop(&html) {
+            if should_stop(&body) {
                 stopped_early = true;
                 break;
             }
@@ -418,6 +433,24 @@ impl Fetcher {
             "facebook html parsed"
         );
         Ok(page)
+    }
+}
+
+/// Resolve `post_path` to an absolute URL, refusing anything that is not a
+/// Facebook page host. Content fetches can attach the account cookie, so only
+/// Facebook page hosts may receive these requests.
+fn facebook_fetch_url(post_path: &str) -> FacebedResult<String> {
+    let url = ensure_absolute(post_path);
+    let allowed = Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(is_facebook_page_host))
+        .unwrap_or(false);
+    if allowed {
+        Ok(url)
+    } else {
+        Err(FacebedError::no_data(format!(
+            "refusing to fetch non-Facebook host for {post_path}"
+        )))
     }
 }
 
@@ -871,6 +904,35 @@ static OG_URL_SEL: Lazy<Selector> =
     Lazy::new(|| Selector::parse(r#"meta[property="og:url"]"#).unwrap());
 static TITLE_SEL: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
 
+/// Classify a Facebook response that indicates the request was blocked rather
+/// than served. Rate limits are transient; checkpoint/recovery redirects need a
+/// human to re-export cookies. Login walls are detected later by `check_or_raise`.
+fn classify_block(
+    status: reqwest::StatusCode,
+    final_url: &str,
+    retry_after: Option<u64>,
+) -> Option<FacebedError> {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return Some(FacebedError::rate_limited(retry_after));
+    }
+    let lower = final_url.to_ascii_lowercase();
+    if lower.contains("/checkpoint") || lower.contains("/recover") {
+        return Some(FacebedError::checkpointed());
+    }
+    None
+}
+
+/// Parse a `Retry-After` header expressed in whole seconds. HTTP-date form is
+/// ignored; caller falls back to a default cooldown.
+fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 pub fn probe_page_type(html: &Html, body: &str) -> PageType {
     if let Some(el) = html.select(&CANONICAL_LINK_SEL).next() {
         if let Some(href) = el.value().attr("href") {
@@ -958,6 +1020,60 @@ mod tests {
             facebook_path_from_url("https://www.facebook.com/watch/?v=123&rdid=x"),
             Some("watch/?v=123&rdid=x".into())
         );
+    }
+
+    #[test]
+    fn fetch_url_guard_allows_facebook_refuses_other_hosts() {
+        use crate::error::FacebedError;
+
+        assert_eq!(
+            super::facebook_fetch_url("groups/1/posts/2").unwrap(),
+            "https://www.facebook.com/groups/1/posts/2"
+        );
+        assert!(super::facebook_fetch_url("https://m.facebook.com/x").is_ok());
+        assert!(matches!(
+            super::facebook_fetch_url("https://example.com/x?type=3"),
+            Err(FacebedError::NoData(_))
+        ));
+    }
+
+    #[test]
+    fn classify_block_flags_rate_limit_and_checkpoint() {
+        use crate::error::FacebedError;
+        use reqwest::StatusCode;
+
+        assert!(matches!(
+            super::classify_block(
+                StatusCode::TOO_MANY_REQUESTS,
+                "https://www.facebook.com/x",
+                Some(30)
+            ),
+            Some(FacebedError::RateLimited {
+                retry_after: Some(30)
+            })
+        ));
+        assert!(matches!(
+            super::classify_block(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "https://www.facebook.com/x",
+                None
+            ),
+            Some(FacebedError::RateLimited { retry_after: None })
+        ));
+        assert!(matches!(
+            super::classify_block(
+                StatusCode::OK,
+                "https://www.facebook.com/checkpoint/?next=y",
+                None
+            ),
+            Some(FacebedError::Checkpointed)
+        ));
+        assert!(super::classify_block(
+            StatusCode::OK,
+            "https://www.facebook.com/groups/1/posts/2",
+            None
+        )
+        .is_none());
     }
 
     #[test]

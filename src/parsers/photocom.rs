@@ -102,3 +102,30 @@ fn get_attached_image_and_url(blocks: &[Value]) -> Option<(String, String)> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{get_attached_image_and_url, get_reaction_count};
+    use serde_json::json;
+
+    #[test]
+    fn finds_reaction_count_and_attached_image() {
+        let blocks = vec![json!({
+            "attached_comment": {},
+            "unified_reactors": {"count": 5},
+            "currMedia": {
+                "image": {"uri": "https://img.example/comment.jpg"},
+                "attached_comment": {"feedback": {"url": "https://www.facebook.com/c"}}
+            }
+        })];
+
+        assert_eq!(get_reaction_count(&blocks), Some(5));
+        assert_eq!(
+            get_attached_image_and_url(&blocks),
+            Some((
+                "https://img.example/comment.jpg".to_string(),
+                "https://www.facebook.com/c".to_string()
+            ))
+        );
+    }
+}

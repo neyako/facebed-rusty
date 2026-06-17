@@ -177,8 +177,10 @@ pub fn images_from_post(post_json: &Value) -> Vec<String> {
     // single-set: attachment with "media" but not a Sticker
     for attachment_set in &all_attachments {
         if attachment_set.get("media").is_some() {
-            let dumped = attachment_set.to_string();
-            if dumped.contains("'__typename': 'Sticker'") {
+            let is_sticker = jq::all(attachment_set, "__typename")
+                .into_iter()
+                .any(|v| v.as_str() == Some("Sticker"));
+            if is_sticker {
                 continue;
             }
             let imgs: Vec<String> = jq::all(attachment_set, "photo_image")
@@ -356,4 +358,106 @@ pub fn interaction_counts(post_json: &Value) -> Result<(String, String, String),
         .map(val_str)
         .unwrap_or_else(|| "0".into());
     Ok((reactions, comments, shares))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{images_from_post, Story};
+    use serde_json::json;
+
+    #[test]
+    fn skips_sticker_attachment() {
+        let post = json!({
+            "attachment": {
+                "media": { "__typename": "Sticker" },
+                "photo_image": { "uri": "https://sticker.example/sticker.png" }
+            }
+        });
+
+        assert!(images_from_post(&post).is_empty());
+    }
+
+    #[test]
+    fn returns_photo_image_for_non_sticker_media() {
+        let post = json!({
+            "attachment": {
+                "media": { "__typename": "Photo" },
+                "photo_image": { "uri": "https://img.example/photo.jpg" }
+            }
+        });
+
+        assert_eq!(
+            images_from_post(&post),
+            vec!["https://img.example/photo.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn story_extracts_author_text_and_photo() {
+        let story = Story::from_json(&json!({
+            "actors": [{"name": "Test Author", "id": "100"}],
+            "message": {"text": "hello world"},
+            "wwwURL": "https://www.facebook.com/groups/1/posts/2",
+            "attachment": {
+                "media": {"__typename": "Photo"},
+                "photo_image": {"uri": "https://img.example/p.jpg"}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(story.author_name, "Test Author");
+        assert_eq!(story.author_id, "100");
+        assert_eq!(story.text, "hello world");
+        assert_eq!(story.url, "https://www.facebook.com/groups/1/posts/2");
+        assert_eq!(
+            story.image_links,
+            vec!["https://img.example/p.jpg".to_string()]
+        );
+        assert!(story.video_links.is_empty());
+    }
+
+    #[test]
+    fn story_extracts_progressive_video() {
+        let story = Story::from_json(&json!({
+            "actors": [{"name": "V", "id": "7"}],
+            "message": {"text": "vid"},
+            "wwwURL": "https://www.facebook.com/x",
+            "attachment": {
+                "media": {
+                    "videoDeliveryResponseFragment": {
+                        "videoDeliveryResponseResult": {
+                            "progressive_urls": [
+                                {"progressive_url": "https://video.fbcdn.net/v.mp4"}
+                            ]
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            story.video_links,
+            vec!["https://video.fbcdn.net/v.mp4".to_string()]
+        );
+    }
+
+    #[test]
+    fn story_appends_shared_attached_story_text() {
+        let story = Story::from_json(&json!({
+            "actors": [{"name": "Outer", "id": "1"}],
+            "message": {"text": "outer text"},
+            "wwwURL": "https://www.facebook.com/o",
+            "attached_story": {
+                "actors": [{"name": "Inner", "id": "2"}],
+                "message": {"text": "inner text"}
+            }
+        }))
+        .unwrap();
+
+        let combined = story.get_text();
+        assert!(combined.contains("outer text"));
+        assert!(combined.contains("╰┈➤ Inner"));
+        assert!(combined.contains("inner text"));
+    }
 }

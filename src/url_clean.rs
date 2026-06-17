@@ -76,6 +76,27 @@ pub fn ensure_absolute(input: &str) -> String {
     }
 }
 
+/// True for Facebook page hosts. Matches `facebook.com` and any subdomain,
+/// but not lookalikes such as `evilfacebook.com`.
+pub fn is_facebook_page_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "facebook.com" || host.ends_with(".facebook.com")
+}
+
+/// True for hosts that may serve Facebook media.
+pub fn is_facebook_media_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    is_facebook_page_host(&host) || host == "fbcdn.net" || host.ends_with(".fbcdn.net")
+}
+
+/// True iff `url` parses, is absolute, and its host is a Facebook page host.
+pub fn is_facebook_page_url(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(is_facebook_page_host))
+        .unwrap_or(false)
+}
+
 fn strip_prefix(s: &str) -> &str {
     s.trim_start_matches("https://www.facebook.com/")
         .trim_start_matches("http://www.facebook.com/")
@@ -122,5 +143,24 @@ mod tests {
             "reel/123/?share_url=https%3A%2F%2Fwww.facebook.com%2Fshare%2Fr%2Fabc%2F",
         );
         assert_eq!(s, Some("share/r/abc/".to_string()));
+    }
+
+    #[test]
+    fn host_allowlist_accepts_facebook_rejects_lookalikes() {
+        assert!(is_facebook_page_host("www.facebook.com"));
+        assert!(is_facebook_page_host("m.facebook.com"));
+        assert!(is_facebook_page_host("facebook.com"));
+        assert!(!is_facebook_page_host("evilfacebook.com"));
+        assert!(!is_facebook_page_host("facebook.com.evil.com"));
+        assert!(!is_facebook_page_host("example.com"));
+
+        assert!(is_facebook_media_host("scontent.xx.fbcdn.net"));
+        assert!(!is_facebook_media_host("example.com"));
+
+        assert!(is_facebook_page_url(
+            "https://www.facebook.com/groups/1/posts/2"
+        ));
+        assert!(!is_facebook_page_url("https://example.com/x"));
+        assert!(!is_facebook_page_url("not a url"));
     }
 }

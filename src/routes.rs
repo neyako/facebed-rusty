@@ -173,13 +173,19 @@ async fn catch_all(
             .map(|(_, v)| v.into_owned())
             .collect();
         if types.iter().any(|t| t.contains('3')) {
-            return process(&state, &path, ParserKind::Photocom).await;
+            let cleaned = url_clean::clean_path(&path);
+            return process(&state, &cleaned, ParserKind::Photocom).await;
         }
     }
 
     // crawler gate
     if !is_bot {
         let target = url_clean::ensure_absolute(&path);
+        let target = if url_clean::is_facebook_page_url(&target) {
+            target
+        } else {
+            String::from("https://www.facebook.com/")
+        };
         let body = format_redirect_page(&target);
         let mut hdrs = HeaderMap::new();
         hdrs.insert(
@@ -431,13 +437,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
             }
             Err(e) if is_retryable(&e) && loop_idx + 1 < order.len() => {
                 if n > 0 {
-                    let count = state.ctx.cookies.mark_failed(account_index);
-                    maybe_notify_bad_account(state, account_index, count, &e);
-                    if let Some(k) = key.as_deref() {
-                        if state.ctx.cookies.affinity_for(k) == Some(account_index) {
-                            state.ctx.cookies.forget_affinity(k);
-                        }
-                    }
+                    record_account_failure(state, account_index, &e, key.as_deref());
                 }
                 let label = state.ctx.cookies.label_at(account_index).unwrap_or("?");
                 warn!(path = %path, attempt = loop_idx, account = %label, error = %e, elapsed_ms = attempt_started.elapsed().as_millis(), "retrying with fallback account");
@@ -446,8 +446,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
             }
             Err(e) => {
                 if n > 0 {
-                    let count = state.ctx.cookies.mark_failed(account_index);
-                    maybe_notify_bad_account(state, account_index, count, &e);
+                    record_account_failure(state, account_index, &e, key.as_deref());
                 }
                 warn!(
                     path = %path,
@@ -523,7 +522,10 @@ async fn run_parser(
 
 fn is_retryable(e: &FacebedError) -> bool {
     match e {
-        FacebedError::NoData(_) | FacebedError::Parse { .. } => true,
+        FacebedError::NoData(_)
+        | FacebedError::Parse { .. }
+        | FacebedError::RateLimited { .. }
+        | FacebedError::Checkpointed => true,
         FacebedError::Http(err) => err.is_timeout() || err.is_connect(),
         _ => false,
     }
@@ -574,6 +576,37 @@ async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: Parse
         "video oversized for Discord media proxy — falling back to thumbnail embed"
     );
     format_oversized_video_embed(post, tz)
+}
+
+/// Apply cooldown and alerting appropriate to a failed attempt's cause.
+fn record_account_failure(
+    state: &AppState,
+    account_index: usize,
+    e: &FacebedError,
+    key: Option<&str>,
+) {
+    match e {
+        FacebedError::RateLimited { retry_after } => {
+            state
+                .ctx
+                .cookies
+                .mark_rate_limited(account_index, *retry_after);
+            return;
+        }
+        FacebedError::Checkpointed => {
+            let count = state.ctx.cookies.mark_checkpointed(account_index);
+            maybe_notify_bad_account(state, account_index, count, e);
+        }
+        _ => {
+            let count = state.ctx.cookies.mark_failed(account_index);
+            maybe_notify_bad_account(state, account_index, count, e);
+        }
+    }
+    if let Some(k) = key {
+        if state.ctx.cookies.affinity_for(k) == Some(account_index) {
+            state.ctx.cookies.forget_affinity(k);
+        }
+    }
 }
 
 /// Fire a Discord webhook when an account has failed [`NOTIFY_FAILURE_THRESHOLD`]
@@ -669,6 +702,14 @@ mod tests {
     fn video_routes_share_kind_affinity() {
         assert_eq!(scope_key("reel/12345"), Some("kind/reels".into()));
         assert_eq!(scope_key("watch?v=12345"), Some("kind/watch".into()));
+    }
+
+    #[test]
+    fn rate_limit_and_checkpoint_are_retryable() {
+        use crate::error::FacebedError;
+
+        assert!(super::is_retryable(&FacebedError::rate_limited(Some(30))));
+        assert!(super::is_retryable(&FacebedError::checkpointed()));
     }
 
     #[test]

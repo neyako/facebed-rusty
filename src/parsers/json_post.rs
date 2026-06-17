@@ -16,11 +16,10 @@ impl Parser for JsonPostParser {
         let post_id = extract_post_id(post_path);
         if should_try_partial_fetch(post_id.as_deref()) {
             let pid = post_id.clone().unwrap_or_default();
+            let mut scanner = PostBlockScanner::default();
             let page = ctx
                 .fetcher
-                .fetch_until(post_path, true, |html| {
-                    has_completed_matching_post_block(html, &pid)
-                })
+                .fetch_until(post_path, true, |bytes| scanner.found_match(bytes, &pid))
                 .await?;
             match parse_page(ctx, post_path, post_id.as_deref(), &page) {
                 Ok(post) => return Ok(post),
@@ -153,31 +152,95 @@ fn should_try_partial_fetch(post_id: Option<&str>) -> bool {
     pid.chars().all(|c| c.is_ascii_digit())
 }
 
-fn has_completed_matching_post_block(html: &str, post_id: &str) -> bool {
-    let mut offset = 0;
-    while let Some(script_rel) = html[offset..].find("<script") {
-        let start = offset + script_rel;
-        let Some(open_end_rel) = html[start..].find('>') else {
-            return false;
-        };
-        let open_end = start + open_end_rel + 1;
-        let open_tag = &html[start..open_end];
-        let Some(close_rel) = html[open_end..].find("</script>") else {
-            return false;
-        };
-        let close_start = open_end + close_rel;
-        if open_tag.contains(r#"type="application/json""#)
-            && open_tag.contains("data-content-len")
-            && open_tag.contains("data-sjs")
-        {
-            let body = &html[open_end..close_start];
-            if body.contains("i18n_reaction_count") && body.contains(post_id) {
-                return true;
+/// Incremental, forward-only scanner for the partial-fetch stop condition.
+/// Returns `true` once a completed JSON script block has been seen whose body
+/// contains both `i18n_reaction_count` and the requested `post_id`.
+#[derive(Default)]
+struct PostBlockScanner {
+    /// Byte offset to resume the search for the next `<script` open tag.
+    search_from: usize,
+    /// Set while inside a script whose `</script>` has not arrived yet.
+    open: Option<OpenScript>,
+}
+
+struct OpenScript {
+    /// Index just past the `>` of the open tag.
+    body_start: usize,
+    /// Whether the open tag matched the Facebook JSON-block attributes.
+    is_json_block: bool,
+    /// Byte offset to resume the search for `</script>`.
+    close_search_from: usize,
+}
+
+impl PostBlockScanner {
+    fn found_match(&mut self, html: &[u8], post_id: &str) -> bool {
+        const OPEN: &[u8] = b"<script";
+        const CLOSE: &[u8] = b"</script>";
+
+        loop {
+            if let Some(open) = self.open.as_mut() {
+                match find_bytes(&html[open.close_search_from..], CLOSE) {
+                    Some(rel) => {
+                        let close_start = open.close_search_from + rel;
+                        if open.is_json_block {
+                            let block = &html[open.body_start..close_start];
+                            if contains_bytes(block, b"i18n_reaction_count")
+                                && contains_bytes(block, post_id.as_bytes())
+                            {
+                                return true;
+                            }
+                        }
+                        self.search_from = close_start + CLOSE.len();
+                        self.open = None;
+                    }
+                    None => {
+                        self.close_search_from_near_tail(html.len(), CLOSE.len());
+                        return false;
+                    }
+                }
+            } else {
+                let Some(rel) = find_bytes(&html[self.search_from..], OPEN) else {
+                    self.search_from = html.len().saturating_sub(OPEN.len() - 1);
+                    return false;
+                };
+                let tag_start = self.search_from + rel;
+                let Some(gt_rel) = find_bytes(&html[tag_start..], b">") else {
+                    self.search_from = tag_start;
+                    return false;
+                };
+                let body_start = tag_start + gt_rel + 1;
+                let open_tag = &html[tag_start..body_start];
+                let is_json_block = contains_bytes(open_tag, br#"type="application/json""#)
+                    && contains_bytes(open_tag, b"data-content-len")
+                    && contains_bytes(open_tag, b"data-sjs");
+                self.open = Some(OpenScript {
+                    body_start,
+                    is_json_block,
+                    close_search_from: body_start,
+                });
             }
         }
-        offset = close_start + "</script>".len();
     }
-    false
+
+    fn close_search_from_near_tail(&mut self, html_len: usize, close_len: usize) {
+        if let Some(open) = self.open.as_mut() {
+            open.close_search_from = html_len.saturating_sub(close_len - 1).max(open.body_start);
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    find_bytes(haystack, needle).is_some()
 }
 
 static POST_ID_RE: Lazy<Regex> = Lazy::new(|| {
@@ -252,10 +315,7 @@ fn get_group_name(blocks: &[JsonBlockText]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        extract_post_id, has_completed_matching_post_block, is_group_post_path,
-        should_try_partial_fetch,
-    };
+    use super::{extract_post_id, is_group_post_path, should_try_partial_fetch, PostBlockScanner};
 
     #[test]
     fn extracts_numeric_post_id() {
@@ -315,17 +375,36 @@ mod tests {
     fn matching_post_block_requires_completed_script() {
         let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
         let body = r#"{"i18n_reaction_count":"1K","id":"123"}"#;
-        assert!(!has_completed_matching_post_block(
-            &format!("{open}{body}"),
+
+        let mut scanner = PostBlockScanner::default();
+        assert!(!scanner.found_match(format!("{open}{body}").as_bytes(), "123"));
+
+        let mut scanner = PostBlockScanner::default();
+        assert!(scanner.found_match(
+            format!("{open}{body}</script><div>later</div>").as_bytes(),
             "123"
         ));
-        assert!(has_completed_matching_post_block(
-            &format!("{open}{body}</script><div>later</div>"),
-            "123"
-        ));
-        assert!(!has_completed_matching_post_block(
-            &format!("{open}{body}</script>"),
-            "456"
-        ));
+
+        let mut scanner = PostBlockScanner::default();
+        assert!(!scanner.found_match(format!("{open}{body}</script>").as_bytes(), "456"));
+    }
+
+    #[test]
+    fn scanner_matches_across_chunk_boundaries() {
+        let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
+        let body = r#"{"i18n_reaction_count":"1K","id":"123"}"#;
+        let full = format!("{open}{body}</script>");
+        let bytes = full.as_bytes();
+
+        let mut scanner = PostBlockScanner::default();
+        let mut fired_at = None;
+        for end in 1..=bytes.len() {
+            if scanner.found_match(&bytes[..end], "123") {
+                fired_at = Some(end);
+                break;
+            }
+        }
+
+        assert_eq!(fired_at, Some(bytes.len()));
     }
 }
