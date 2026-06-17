@@ -26,6 +26,12 @@ pub enum FacebedError {
 
     #[error("other: {0}")]
     Other(#[from] anyhow::Error),
+
+    #[error("rate limited")]
+    RateLimited { retry_after: Option<u64> },
+
+    #[error("checkpoint")]
+    Checkpointed,
 }
 
 impl FacebedError {
@@ -49,9 +55,17 @@ impl FacebedError {
         Self::NoData(msg.into())
     }
 
+    pub fn rate_limited(retry_after: Option<u64>) -> Self {
+        Self::RateLimited { retry_after }
+    }
+
+    pub fn checkpointed() -> Self {
+        Self::Checkpointed
+    }
+
     pub fn error_code(&self) -> &'static str {
         match self {
-            Self::NoData(_) => "C",
+            Self::NoData(_) | Self::RateLimited { .. } | Self::Checkpointed => "C",
             Self::Parse { .. } => "P",
             Self::Http(_) | Self::Io(_) | Self::Json(_) | Self::Yaml(_) => "U",
             Self::Other(_) => "X",
@@ -60,3 +74,14 @@ impl FacebedError {
 }
 
 pub type FacebedResult<T> = Result<T, FacebedError>;
+
+#[cfg(test)]
+mod tests {
+    use super::FacebedError;
+
+    #[test]
+    fn rate_limit_and_checkpoint_render_as_c() {
+        assert_eq!(FacebedError::rate_limited(Some(30)).error_code(), "C");
+        assert_eq!(FacebedError::checkpointed().error_code(), "C");
+    }
+}

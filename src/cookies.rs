@@ -64,6 +64,16 @@ impl CookieAccount {
 /// also in cooldown, so a transient blip doesn't lock everyone out.
 pub const ACCOUNT_COOLDOWN_SECS: u64 = 300;
 
+/// Cooldown after a soft rate limit (HTTP 429/503). Short: FB rate limits are
+/// usually per-minute and the cookie itself is healthy. A `Retry-After` value
+/// overrides this, capped at the max below.
+pub const RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
+pub const RATE_LIMIT_COOLDOWN_MAX_SECS: u64 = 600;
+
+/// Cooldown after a checkpoint / account-recovery redirect. Long: a checkpoint
+/// will not clear within minutes; it needs a human to re-export the cookie.
+pub const CHECKPOINT_COOLDOWN_SECS: u64 = 1800;
+
 /// Max distinct scope keys retained in the affinity map. Past this, we drop
 /// an arbitrary entry on insert to bound memory. Affinity is a hint, not a
 /// correctness invariant, so eviction is cheap.
@@ -79,9 +89,9 @@ pub const NOTIFY_FAILURE_THRESHOLD: u64 = 3;
 #[derive(Debug)]
 pub struct CookieJar {
     accounts: Vec<CookieAccount>,
-    /// Per-account "last failure" unix seconds. Parallel to `accounts`.
-    /// Zero means "never failed".
-    last_failures: Vec<AtomicU64>,
+    /// Per-account unix seconds when cooldown ends. Parallel to `accounts`.
+    /// Zero means "not in cooldown".
+    cooldown_until: Vec<AtomicU64>,
     /// Per-account count of consecutive failures since last success. Used
     /// to fire an admin notification when an account looks persistently
     /// broken (vs. a one-off transient blip).
@@ -98,7 +108,7 @@ impl CookieJar {
     pub fn empty() -> Self {
         Self {
             accounts: Vec::new(),
-            last_failures: Vec::new(),
+            cooldown_until: Vec::new(),
             consecutive_failures: Vec::new(),
             affinity: Mutex::new(HashMap::new()),
         }
@@ -201,11 +211,11 @@ impl CookieJar {
             warn!("no cookies loaded, non incognito-viewable posts will NOT work");
         }
 
-        let last_failures = (0..accounts.len()).map(|_| AtomicU64::new(0)).collect();
+        let cooldown_until = (0..accounts.len()).map(|_| AtomicU64::new(0)).collect();
         let consecutive_failures = (0..accounts.len()).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             accounts,
-            last_failures,
+            cooldown_until,
             consecutive_failures,
             affinity: Mutex::new(HashMap::new()),
         })
@@ -303,6 +313,14 @@ impl CookieJar {
         Some(&self.accounts[i % self.accounts.len()])
     }
 
+    fn set_cooldown(&self, idx: usize, secs: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.cooldown_until[idx].store(now.saturating_add(secs), Ordering::Relaxed);
+    }
+
     /// Mark the account at `i` (mod len) as having just failed. Future
     /// requests skip it on first attempt for [`ACCOUNT_COOLDOWN_SECS`].
     ///
@@ -314,11 +332,31 @@ impl CookieJar {
             return 0;
         }
         let idx = i % self.accounts.len();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.last_failures[idx].store(now, Ordering::Relaxed);
+        self.set_cooldown(idx, ACCOUNT_COOLDOWN_SECS);
+        self.consecutive_failures[idx].fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Soft rate limit: cool down briefly and do NOT touch the consecutive
+    /// failure counter. A rate limit is not a bad cookie.
+    pub fn mark_rate_limited(&self, i: usize, retry_after: Option<u64>) {
+        if self.accounts.is_empty() {
+            return;
+        }
+        let idx = i % self.accounts.len();
+        let secs = retry_after
+            .map(|s| s.min(RATE_LIMIT_COOLDOWN_MAX_SECS))
+            .unwrap_or(RATE_LIMIT_COOLDOWN_SECS);
+        self.set_cooldown(idx, secs);
+    }
+
+    /// Checkpoint / recovery block: long cooldown, and count it as a failure so
+    /// the admin alert fires when the bad-account threshold is reached.
+    pub fn mark_checkpointed(&self, i: usize) -> u64 {
+        if self.accounts.is_empty() {
+            return 0;
+        }
+        let idx = i % self.accounts.len();
+        self.set_cooldown(idx, CHECKPOINT_COOLDOWN_SECS);
         self.consecutive_failures[idx].fetch_add(1, Ordering::Relaxed) + 1
     }
 
@@ -329,7 +367,7 @@ impl CookieJar {
             return;
         }
         let idx = i % self.accounts.len();
-        self.last_failures[idx].store(0, Ordering::Relaxed);
+        self.cooldown_until[idx].store(0, Ordering::Relaxed);
         self.consecutive_failures[idx].store(0, Ordering::Relaxed);
     }
 
@@ -348,15 +386,15 @@ impl CookieJar {
         if self.accounts.is_empty() {
             return false;
         }
-        let last = self.last_failures[i % self.accounts.len()].load(Ordering::Relaxed);
-        if last == 0 {
+        let until = self.cooldown_until[i % self.accounts.len()].load(Ordering::Relaxed);
+        if until == 0 {
             return false;
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        now.saturating_sub(last) < ACCOUNT_COOLDOWN_SECS
+        now < until
     }
 
     /// Label of the account at `i` (for logging).
@@ -571,6 +609,30 @@ mod tests {
         assert_eq!(jar.mark_failed(0), 3);
         jar.mark_ok(0);
         assert_eq!(jar.mark_failed(0), 1);
+    }
+
+    #[test]
+    fn rate_limit_cools_down_without_marking_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+
+        jar.mark_rate_limited(0, None);
+        assert!(jar.in_cooldown(0));
+        assert_eq!(jar.mark_failed(0), 1);
+    }
+
+    #[test]
+    fn checkpoint_cools_down_and_counts_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = CookieJar::load(&main).unwrap();
+
+        assert_eq!(jar.mark_checkpointed(0), 1);
+        assert!(jar.in_cooldown(0));
+        assert_eq!(jar.mark_checkpointed(0), 2);
     }
 
     #[test]

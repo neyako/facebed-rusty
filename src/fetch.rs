@@ -331,6 +331,11 @@ impl Fetcher {
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
         let final_url = resp.url().to_string();
+        let retry_after = retry_after_secs(&resp);
+        if let Some(err) = classify_block(status, &final_url, retry_after) {
+            tracing::warn!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, response_ms, "fetch blocked");
+            return Err(err);
+        }
         let read_started = Instant::now();
         let html = resp.text().await?;
         let read_ms = read_started.elapsed().as_millis();
@@ -357,6 +362,11 @@ impl Fetcher {
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
         let final_url = resp.url().to_string();
+        let retry_after = retry_after_secs(&resp);
+        if let Some(err) = classify_block(status, &final_url, retry_after) {
+            tracing::warn!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, response_ms, "fetch blocked");
+            return Err(err);
+        }
         let mut body = Vec::new();
         let mut stopped_early = false;
         let read_started = Instant::now();
@@ -894,6 +904,35 @@ static OG_URL_SEL: Lazy<Selector> =
     Lazy::new(|| Selector::parse(r#"meta[property="og:url"]"#).unwrap());
 static TITLE_SEL: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
 
+/// Classify a Facebook response that indicates the request was blocked rather
+/// than served. Rate limits are transient; checkpoint/recovery redirects need a
+/// human to re-export cookies. Login walls are detected later by `check_or_raise`.
+fn classify_block(
+    status: reqwest::StatusCode,
+    final_url: &str,
+    retry_after: Option<u64>,
+) -> Option<FacebedError> {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return Some(FacebedError::rate_limited(retry_after));
+    }
+    let lower = final_url.to_ascii_lowercase();
+    if lower.contains("/checkpoint") || lower.contains("/recover") {
+        return Some(FacebedError::checkpointed());
+    }
+    None
+}
+
+/// Parse a `Retry-After` header expressed in whole seconds. HTTP-date form is
+/// ignored; caller falls back to a default cooldown.
+fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 pub fn probe_page_type(html: &Html, body: &str) -> PageType {
     if let Some(el) = html.select(&CANONICAL_LINK_SEL).next() {
         if let Some(href) = el.value().attr("href") {
@@ -996,6 +1035,45 @@ mod tests {
             super::facebook_fetch_url("https://example.com/x?type=3"),
             Err(FacebedError::NoData(_))
         ));
+    }
+
+    #[test]
+    fn classify_block_flags_rate_limit_and_checkpoint() {
+        use crate::error::FacebedError;
+        use reqwest::StatusCode;
+
+        assert!(matches!(
+            super::classify_block(
+                StatusCode::TOO_MANY_REQUESTS,
+                "https://www.facebook.com/x",
+                Some(30)
+            ),
+            Some(FacebedError::RateLimited {
+                retry_after: Some(30)
+            })
+        ));
+        assert!(matches!(
+            super::classify_block(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "https://www.facebook.com/x",
+                None
+            ),
+            Some(FacebedError::RateLimited { retry_after: None })
+        ));
+        assert!(matches!(
+            super::classify_block(
+                StatusCode::OK,
+                "https://www.facebook.com/checkpoint/?next=y",
+                None
+            ),
+            Some(FacebedError::Checkpointed)
+        ));
+        assert!(super::classify_block(
+            StatusCode::OK,
+            "https://www.facebook.com/groups/1/posts/2",
+            None
+        )
+        .is_none());
     }
 
     #[test]
