@@ -26,13 +26,22 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use url::Url;
 
+#[derive(Default)]
+pub struct Metrics {
+    pub requests: std::sync::atomic::AtomicU64,
+    pub errors: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: Arc<arc_swap::ArcSwap<Config>>,
     pub ctx: Arc<ParserCtx>,
     pub notifier: Notifier,
     pub fetcher: Arc<Fetcher>,
     pub embed_cache: Arc<std::sync::Mutex<crate::embed_cache::EmbedCache>>,
+    pub fetch_limit: Arc<tokio::sync::Semaphore>,
+    pub metrics: Arc<Metrics>,
+    pub started_at: Instant,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -41,6 +50,8 @@ pub fn router(state: AppState) -> Router {
         .route("/oembed.json", get(oembed))
         .route("/favicon.ico", get(favicon))
         .route("/banner.png", get(banner))
+        .route("/healthz", get(healthz))
+        .route("/media", get(media))
         .route("/*path", get(catch_all))
         .with_state(state)
 }
@@ -95,6 +106,15 @@ fn json_response(body: String) -> Response {
     (StatusCode::OK, headers, body).into_response()
 }
 
+fn busy_response() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("2"),
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, headers, "busy").into_response()
+}
+
 #[derive(serde::Deserialize)]
 struct OEmbedParams {
     #[serde(default)]
@@ -107,6 +127,91 @@ struct OEmbedParams {
 
 async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> Response {
     json_response(build_oembed_json(&p.author, &p.url, &p.kind))
+}
+
+#[derive(serde::Deserialize)]
+struct MediaParams {
+    #[serde(default)]
+    u: String,
+}
+
+const MAX_MEDIA_BYTES: u64 = 30 * 1024 * 1024;
+
+async fn media(
+    State(state): State<AppState>,
+    axum::extract::Query(p): axum::extract::Query<MediaParams>,
+) -> Response {
+    let Ok(parsed) = Url::parse(&p.u) else {
+        return (StatusCode::BAD_REQUEST, "bad url").into_response();
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return (StatusCode::BAD_REQUEST, "bad scheme").into_response();
+    }
+    if !media_target_allowed(&p.u) {
+        return (StatusCode::FORBIDDEN, "host not allowed").into_response();
+    }
+
+    let upstream = match state.fetcher.client().get(parsed).send().await {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
+    };
+    if !upstream.status().is_success() {
+        return (StatusCode::BAD_GATEWAY, "upstream status").into_response();
+    }
+    if let Some(len) = upstream.content_length() {
+        if len > MAX_MEDIA_BYTES {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "too large").into_response();
+        }
+    }
+
+    let ct = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, ct);
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    let body = axum::body::Body::from_stream(upstream.bytes_stream());
+    (StatusCode::OK, headers, body).into_response()
+}
+
+/// Returns true iff `u` is a fetchable Facebook media URL.
+fn media_target_allowed(u: &str) -> bool {
+    match Url::parse(u) {
+        Ok(parsed) => {
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed
+                    .host_str()
+                    .map(crate::url_clean::is_facebook_media_host)
+                    .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+async fn healthz(State(state): State<AppState>) -> Response {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let jar = state.ctx.cookies.load();
+    let accounts: Vec<(String, bool)> = (0..jar.len())
+        .map(|i| {
+            (
+                jar.label_at(i).unwrap_or("?").to_string(),
+                jar.in_cooldown(i),
+            )
+        })
+        .collect();
+    let body = build_healthz_json(
+        state.started_at.elapsed().as_secs(),
+        state.metrics.requests.load(Relaxed),
+        state.metrics.errors.load(Relaxed),
+        &accounts,
+    );
+    json_response(body)
 }
 
 /// Build the oEmbed 1.0 document Discord reads to render the author/provider
@@ -124,6 +229,27 @@ fn build_oembed_json(author: &str, url: &str, kind: &str) -> String {
         "author_name": author,
         "author_url": url,
         "title": author,
+    })
+    .to_string()
+}
+
+fn build_healthz_json(
+    uptime_secs: u64,
+    requests: u64,
+    errors: u64,
+    accounts: &[(String, bool)],
+) -> String {
+    let accounts: Vec<serde_json::Value> = accounts
+        .iter()
+        .map(|(label, in_cooldown)| serde_json::json!({"label": label, "in_cooldown": in_cooldown}))
+        .collect();
+    serde_json::json!({
+        "status": "ok",
+        "uptime_secs": uptime_secs,
+        "requests": requests,
+        "errors": errors,
+        "cookie_accounts": accounts.len(),
+        "accounts": accounts,
     })
     .to_string()
 }
@@ -403,6 +529,11 @@ enum ParserKind {
 }
 
 async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
+    state
+        .metrics
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     {
         let now = Instant::now();
         if let Ok(mut cache) = state.embed_cache.lock() {
@@ -412,6 +543,11 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
             }
         }
     }
+
+    let _permit = match state.fetch_limit.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => return busy_response(),
+    };
 
     // Retry across every cookie account in configured priority order. Primary
     // account gets first chance; extra accounts are fallback/load-balancing
@@ -614,7 +750,7 @@ fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
 }
 
 async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: ParserKind) -> String {
-    let tz = state.config.timezone;
+    let tz = state.config.load().timezone;
     let Some(video_url) = post.video_links.first() else {
         return render(post, tz, kind);
     };
@@ -696,6 +832,11 @@ fn maybe_notify_bad_account(state: &AppState, account_index: usize, count: u64, 
 }
 
 fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
+    state
+        .metrics
+        .errors
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let url = url_clean::ensure_absolute(path);
     let code = e.error_code();
     match &e {
@@ -733,7 +874,10 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_oembed_json, group_multi_permalink_path, is_facebook_url, scope_key};
+    use super::{
+        build_healthz_json, build_oembed_json, group_multi_permalink_path, is_facebook_url,
+        media_target_allowed, scope_key,
+    };
 
     #[test]
     fn group_path_extracts_group_id() {
@@ -774,6 +918,49 @@ mod tests {
 
         assert!(super::is_retryable(&FacebedError::rate_limited(Some(30))));
         assert!(super::is_retryable(&FacebedError::checkpointed()));
+    }
+
+    #[test]
+    fn fetch_cap_rejects_when_exhausted() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let _a = sem.clone().try_acquire_owned().expect("first permit");
+        let _b = sem.clone().try_acquire_owned().expect("second permit");
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "third acquire must fail when the 2-permit cap is exhausted"
+        );
+        drop(_a);
+        assert!(
+            sem.clone().try_acquire_owned().is_ok(),
+            "a permit frees up after one is dropped"
+        );
+    }
+
+    #[test]
+    fn healthz_json_reports_counters_and_accounts() {
+        let json = build_healthz_json(42, 7, 1, &[("primary".into(), true), ("alt".into(), false)]);
+        assert!(json.contains(r#""status":"ok""#));
+        assert!(json.contains(r#""uptime_secs":42"#));
+        assert!(json.contains(r#""requests":7"#));
+        assert!(json.contains(r#""errors":1"#));
+        assert!(json.contains(r#""cookie_accounts":2"#));
+        assert!(json.contains(r#""label":"primary""#));
+        assert!(json.contains(r#""in_cooldown":true"#));
+    }
+
+    #[test]
+    fn media_guard_blocks_non_facebook_hosts() {
+        assert!(media_target_allowed(
+            "https://scontent.xx.fbcdn.net/v/x.jpg"
+        ));
+        assert!(media_target_allowed("https://video.fbcdn.net/v.mp4"));
+        assert!(!media_target_allowed("https://evil.example.com/x.jpg"));
+        assert!(!media_target_allowed("https://evilfbcdn.net/x.jpg"));
+        assert!(!media_target_allowed("file:///etc/passwd"));
+        assert!(!media_target_allowed(
+            "http://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!media_target_allowed("not a url"));
     }
 
     #[test]
