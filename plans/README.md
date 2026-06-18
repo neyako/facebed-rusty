@@ -38,6 +38,20 @@ REJECTED (one-line rationale).
 
 ## Reconcile log
 
+**2026-06-18 — reconciled: plan 010 verified DONE at `ebd64bc`.** The group-post
+markdown fix landed in one commit (`ebd64bc`, branch
+`advisor/010-group-post-markdown`), touching only `src/embed.rs` plus the
+`plans/` files — scope clean. Re-ran every machine-checkable done criterion on
+current HEAD, all hold: `cargo fmt -- --check` exit 0, `cargo build` exit 0,
+`cargo test` **88 passed / 0 failed** (was 84; +4 new tests:
+`strips_leading_heading_markers`, `honors_fb_backslash_escape`,
+`normalizes_padded_bold`, `escaped_bold_stays_literal`). The escape/unescape
+helpers are gone (`grep unescape_paired_marker|unescape_line_start_blockquotes`
+empty), the single-pass renderer is in (`render_group_markdown` /
+`render_inline` / `MD_ESCAPE` / `is_md_special`), and `escape_markdown` survives
+as the `allow=false` path. All three leaks (literal `#`, doubled `\`, dead
+padded `**`) are pinned by the new tests. **Plans 001–010 are all DONE.**
+
 **2026-06-18 — focused pass: group-post markdown handling → plan 010 (TODO).**
 A real group-post embed (screenshot) showed three leaks in the
 `allow_discord_markdown == true` render path (`src/embed.rs:49-126`): leading
