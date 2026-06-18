@@ -32,11 +32,34 @@ Scope.
 | 008  | Short-TTL in-memory cache for rendered embeds (direction) | P2 | M | LOW-MED | — | DONE |
 | 009  | Reload cookies on SIGHUP without redeploy — spike (direction) | P3 | M | MED | — | DONE |
 | 010  | Fix group-post markdown leaks in embed descriptions (#, \, padded **) | P2 | M | LOW | — | DONE |
+| 011  | Cap concurrent Facebook fetches to protect the cookie pool (direction) | P2 | S-M | MED | — | TODO |
+| 012  | Reload `timezone` + `banned_users` on SIGHUP without redeploy (direction) | P3 | S-M | MED | — | TODO |
+| 013  | Add a `/healthz` endpoint: liveness, counters, cookie state (direction) | P3 | M | LOW | — | TODO |
+| 014  | SPIKE: stream Facebook CDN media through a `/media` route (direction) | P3 | M-L | MED | — | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) |
 REJECTED (one-line rationale).
 
 ## Reconcile log
+
+**2026-06-18 — direction pass (`/improve next`) against `2e6610f`.** Plans
+001–010 confirmed all DONE. Audited only "where to take this next"; surfaced 5
+grounded direction options and the maintainer chose 4 → plans **011–014** (all
+TODO, independent of each other and of the bug cluster). New grounding this pass:
+no inbound concurrency cap exists (`grep -rn "Semaphore" src/` empty) so a public
+caller can drive unbounded cookied FB fetches (011); config is load-once while
+cookies hot-reload via 009 (`banned_users` baked into `ParserCtx` at
+`main.rs:124`, `notifier_webhook` into `Notifier` at `:58`, only `timezone` read
+live at `routes.rs:617`) (012); no health/metrics route exists — only `/`,
+`/oembed.json`, `/favicon`, `/banner`, catch-all (013); and `og:image`/`og:video`
+emit raw expiring `fbcdn` URLs (`embed.rs:252`/`:311`) so videos die after the
+signed URL expires (014, a spike). **Declined this pass:** finding E, the `/text`
+variant (`assets/index.html:28` promises it, no handler — already recorded below
+under "considered and not turned into plans"; still open). **Recommended order:**
+011 → 012 → 013 → 014 (cheap+safe first; 014 is a security-sensitive spike, last).
+Soft note: 011/013/014 all add routes/fields to `routes.rs`+`main.rs` and 012
+also touches `parsers/mod.rs` — land them one at a time and reconcile each one's
+"Current state" excerpts against the prior, same as the 004/001/003 cluster.
 
 **2026-06-18 — reconciled: plan 010 verified DONE at `ebd64bc`.** The group-post
 markdown fix landed in one commit (`ebd64bc`, branch
