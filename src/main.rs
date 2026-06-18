@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -52,11 +53,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let cookies = Arc::new(CookieJar::load(&args.cookies)?);
+    let cookies = Arc::new(ArcSwap::from_pointee(CookieJar::load(&args.cookies)?));
     let fetcher = Arc::new(Fetcher::new(cookies.clone())?);
     let notifier = Notifier::new(config.notifier_webhook.clone(), fetcher.client().clone());
 
-    if !cookies.is_empty() {
+    if !cookies.load().is_empty() {
         let check_fetcher = fetcher.clone();
         let check_notifier = notifier.clone();
         tokio::spawn(async move {
@@ -92,6 +93,34 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    #[cfg(unix)]
+    {
+        let jar = cookies.clone();
+        let cookies_path = args.cookies.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("cannot install SIGHUP handler: {e}");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                match validate_cookie_json_files(&cookies_path)
+                    .and_then(|_| CookieJar::load(&cookies_path))
+                {
+                    Ok(new_jar) => {
+                        let n = new_jar.len();
+                        jar.store(Arc::new(new_jar));
+                        info!("reloaded {n} cookie account(s) on SIGHUP");
+                    }
+                    Err(e) => warn!("cookie reload failed: {e}"),
+                }
+            }
+        });
+    }
+
     let ctx = Arc::new(ParserCtx {
         fetcher: fetcher.clone(),
         cookies: cookies.clone(),
@@ -117,5 +146,45 @@ async fn main() -> anyhow::Result<()> {
     info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_cookie_json_files(path: &std::path::Path) -> anyhow::Result<()> {
+    let mut files = Vec::new();
+    if path.exists() {
+        files.push(path.to_path_buf());
+    }
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    for entry in std::fs::read_dir(&parent)
+        .map_err(|e| anyhow::anyhow!("scan {}: {}", parent.display(), e))?
+        .flatten()
+    {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with("cookies") && name.ends_with(".json") && name != "cookies.example.json"
+        {
+            files.push(p);
+        }
+    }
+    files.sort();
+    files.dedup();
+
+    for p in files {
+        let raw = std::fs::read_to_string(&p)
+            .map_err(|e| anyhow::anyhow!("read {}: {}", p.display(), e))?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|e| anyhow::anyhow!("parse {}: {}", p.display(), e))?;
+    }
     Ok(())
 }

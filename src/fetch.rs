@@ -21,7 +21,7 @@ tokio::task_local! {
 
 pub struct Fetcher {
     client: Client,
-    cookies: Arc<CookieJar>,
+    cookies: Arc<arc_swap::ArcSwap<CookieJar>>,
     media_size_cache: Mutex<MediaSizeCache>,
 }
 
@@ -127,7 +127,7 @@ impl MediaSizeCache {
 }
 
 impl Fetcher {
-    pub fn new(cookies: Arc<CookieJar>) -> anyhow::Result<Self> {
+    pub fn new(cookies: Arc<arc_swap::ArcSwap<CookieJar>>) -> anyhow::Result<Self> {
         let client = Client::builder()
             .gzip(true)
             .brotli(true)
@@ -146,15 +146,17 @@ impl Fetcher {
     }
 
     pub async fn check_cookie_accounts(&self) -> Vec<CookieAccountCheck> {
-        let mut checks = Vec::with_capacity(self.cookies.len());
-        for i in 0..self.cookies.len() {
+        let n = self.cookies.load().len();
+        let mut checks = Vec::with_capacity(n);
+        for i in 0..n {
             checks.push(self.check_cookie_account(i).await);
         }
         checks
     }
 
     pub async fn check_cookie_account(&self, account_index: usize) -> CookieAccountCheck {
-        let Some(acc) = self.cookies.account_at(account_index) else {
+        let guard = self.cookies.load();
+        let Some(acc) = guard.account_at(account_index) else {
             return CookieAccountCheck {
                 index: account_index,
                 label: format!("#{account_index}"),
@@ -390,12 +392,13 @@ impl Fetcher {
         }
         let mut account_label = String::new();
         let mut user_agent: &str = DEFAULT_USER_AGENT;
+        let guard = self.cookies.load();
         if use_cookies {
             let acc = ACCOUNT_OVERRIDE
-                .try_with(|i| self.cookies.account_at(*i))
+                .try_with(|i| guard.account_at(*i))
                 .ok()
                 .flatten()
-                .or_else(|| self.cookies.account_at(0));
+                .or_else(|| guard.account_at(0));
             if let Some(acc) = acc {
                 account_label = acc.label.clone();
                 req = req.header("cookie", acc.header_value());
@@ -462,7 +465,7 @@ fn facebook_fetch_url(post_path: &str) -> FacebedResult<String> {
 /// cookie path for share resolution and content fetches.
 pub async fn resolve_share_link(fetcher: &Fetcher, path: &str) -> FacebedResult<ResolvedShare> {
     let is_share_v = is_share_v_path(path);
-    if !fetcher.cookies.is_empty() {
+    if !fetcher.cookies.load().is_empty() {
         if let Some(resolved) = resolve_share_link_with_accounts(fetcher, path, is_share_v).await {
             return Ok(resolved);
         }
@@ -538,6 +541,7 @@ async fn resolve_share_link_with_accounts(
     for account_index in share_account_order(fetcher) {
         let label = fetcher
             .cookies
+            .load()
             .label_at(account_index)
             .unwrap_or("?")
             .to_owned();
@@ -570,11 +574,12 @@ async fn resolve_share_link_with_accounts(
 }
 
 fn share_account_order(fetcher: &Fetcher) -> Vec<usize> {
-    let n = fetcher.cookies.len();
+    let guard = fetcher.cookies.load();
+    let n = guard.len();
     let mut healthy = Vec::new();
     let mut cooled = Vec::new();
     for i in 0..n {
-        if fetcher.cookies.in_cooldown(i) {
+        if guard.in_cooldown(i) {
             cooled.push(i);
         } else {
             healthy.push(i);
@@ -702,8 +707,9 @@ async fn resolve_share_link_head(
 }
 
 fn share_account_label(fetcher: &Fetcher, account_index: Option<usize>) -> String {
+    let guard = fetcher.cookies.load();
     account_index
-        .and_then(|i| fetcher.cookies.label_at(i))
+        .and_then(|i| guard.label_at(i))
         .unwrap_or("")
         .to_owned()
 }
@@ -717,7 +723,8 @@ fn attach_share_identity(
     let Some(account_index) = account_index else {
         return req.header("user-agent", fallback_ua);
     };
-    let Some(acc) = fetcher.cookies.account_at(account_index) else {
+    let guard = fetcher.cookies.load();
+    let Some(acc) = guard.account_at(account_index) else {
         return req.header("user-agent", fallback_ua);
     };
     let ua = acc.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);

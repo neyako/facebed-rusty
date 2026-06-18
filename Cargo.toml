@@ -17,6 +17,7 @@ strip = true
 opt-level = 3
 
 [dependencies]
+arc-swap = "1"
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "matched-path", "query"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time", "fs"] }
 tower = "0.5"

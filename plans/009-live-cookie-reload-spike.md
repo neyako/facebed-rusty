@@ -407,6 +407,6 @@ Stop and report (do not improvise) if:
 ## Spike outcome (fill this in when done)
 
 - Mechanism shipped: SIGHUP + `arc-swap` whole-jar swap.
-- Call sites touched: <count>.
-- Anything that resisted / was deferred: <notes>.
-- Recommendation on the deferred follow-ups: <keep / drop / promote to a plan>.
+- Call sites touched: 20 `.load()` read/write sites plus the `Fetcher`/`ParserCtx` jar type declarations.
+- Anything that resisted / was deferred: `request_for` needed the jar guard to outlive the borrowed per-account UA until the request header is built. Manual smoke also showed `CookieJar::load` treats bad per-file JSON as a warning and returns `Ok`, so the SIGHUP path now pre-validates cookie JSON syntax before swapping. Post-reload cookie health checks, HTTP reload endpoint, and file watching remain deferred.
+- Recommendation on the deferred follow-ups: keep post-reload health checks as the next small ops improvement; keep HTTP reload endpoint only for deployments where Unix signals are awkward; keep file watching optional.

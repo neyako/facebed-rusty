@@ -421,7 +421,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     // we don't pay a slow FB round-trip on a checkpointed/expired account
     // every other request. They're still tried as a last resort if no healthy
     // account succeeded.
-    let n = state.ctx.cookies.len();
+    let n = state.ctx.cookies.load().len();
     let attempts = n.max(1);
     let mut last_err: Option<FacebedError> = None;
     let key = scope_key(path);
@@ -437,14 +437,14 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
         let mut cooled = Vec::new();
         for attempt in 0..attempts {
             let i = attempt % n;
-            if state.ctx.cookies.in_cooldown(i) {
+            if state.ctx.cookies.load().in_cooldown(i) {
                 cooled.push(i);
             } else {
                 healthy.push(i);
             }
         }
         if let Some(k) = key.as_deref() {
-            if let Some(pref) = state.ctx.cookies.affinity_for(k) {
+            if let Some(pref) = state.ctx.cookies.load().affinity_for(k) {
                 if let Some(pos) = healthy.iter().position(|&i| i == pref) {
                     let e = healthy.remove(pos);
                     healthy.insert(0, e);
@@ -470,9 +470,13 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
             Ok(post) => {
                 let scrape_ms = attempt_started.elapsed().as_millis();
                 if n > 0 {
-                    state.ctx.cookies.mark_ok(account_index);
+                    state.ctx.cookies.load().mark_ok(account_index);
                     if let Some(k) = key.as_deref() {
-                        state.ctx.cookies.set_affinity(k.to_string(), account_index);
+                        state
+                            .ctx
+                            .cookies
+                            .load()
+                            .set_affinity(k.to_string(), account_index);
                     }
                 }
                 let render_started = Instant::now();
@@ -483,7 +487,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 info!(
                     path = %path,
                     kind = ?kind,
-                    account = %state.ctx.cookies.label_at(account_index).unwrap_or(""),
+                    account = %state.ctx.cookies.load().label_at(account_index).unwrap_or(""),
                     attempt = loop_idx,
                     scrape_ms,
                     render_ms = render_started.elapsed().as_millis(),
@@ -496,7 +500,8 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 if n > 0 {
                     record_account_failure(state, account_index, &e, key.as_deref());
                 }
-                let label = state.ctx.cookies.label_at(account_index).unwrap_or("?");
+                let guard = state.ctx.cookies.load();
+                let label = guard.label_at(account_index).unwrap_or("?");
                 warn!(path = %path, attempt = loop_idx, account = %label, error = %e, elapsed_ms = attempt_started.elapsed().as_millis(), "retrying with fallback account");
                 last_err = Some(e);
                 continue;
@@ -508,7 +513,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 warn!(
                     path = %path,
                     kind = ?kind,
-                    account = %state.ctx.cookies.label_at(account_index).unwrap_or(""),
+                    account = %state.ctx.cookies.load().label_at(account_index).unwrap_or(""),
                     attempt = loop_idx,
                     error = %e,
                     attempt_ms = attempt_started.elapsed().as_millis(),
@@ -647,21 +652,22 @@ fn record_account_failure(
             state
                 .ctx
                 .cookies
+                .load()
                 .mark_rate_limited(account_index, *retry_after);
             return;
         }
         FacebedError::Checkpointed => {
-            let count = state.ctx.cookies.mark_checkpointed(account_index);
+            let count = state.ctx.cookies.load().mark_checkpointed(account_index);
             maybe_notify_bad_account(state, account_index, count, e);
         }
         _ => {
-            let count = state.ctx.cookies.mark_failed(account_index);
+            let count = state.ctx.cookies.load().mark_failed(account_index);
             maybe_notify_bad_account(state, account_index, count, e);
         }
     }
     if let Some(k) = key {
-        if state.ctx.cookies.affinity_for(k) == Some(account_index) {
-            state.ctx.cookies.forget_affinity(k);
+        if state.ctx.cookies.load().affinity_for(k) == Some(account_index) {
+            state.ctx.cookies.load().forget_affinity(k);
         }
     }
 }
@@ -676,6 +682,7 @@ fn maybe_notify_bad_account(state: &AppState, account_index: usize, count: u64, 
     let label = state
         .ctx
         .cookies
+        .load()
         .label_at(account_index)
         .unwrap_or("?")
         .to_owned();
@@ -685,7 +692,7 @@ fn maybe_notify_bad_account(state: &AppState, account_index: usize, count: u64, 
     );
     warn!(account = %label, count, "notifying admin about bad account");
     state.notifier.warn(msg, None);
-    state.ctx.cookies.reset_failure_count(account_index);
+    state.ctx.cookies.load().reset_failure_count(account_index);
 }
 
 fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {

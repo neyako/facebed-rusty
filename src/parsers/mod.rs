@@ -31,7 +31,7 @@ pub struct ParsedPost {
 
 pub struct ParserCtx {
     pub fetcher: Arc<Fetcher>,
-    pub cookies: Arc<CookieJar>,
+    pub cookies: Arc<arc_swap::ArcSwap<CookieJar>>,
     pub banned_users: Vec<String>,
 }
 

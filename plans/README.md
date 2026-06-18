@@ -30,12 +30,17 @@ Scope.
 | 003  | Detect checkpoints & rate limits, cool down by cause (cookies) | P1 | M-L | MED | 001 | DONE |
 | 007  | Serve an oEmbed endpoint for a real Discord author line (direction) | P2 | M | LOW-MED | — | DONE |
 | 008  | Short-TTL in-memory cache for rendered embeds (direction) | P2 | M | LOW-MED | — | DONE |
-| 009  | Reload cookies on SIGHUP without redeploy — spike (direction) | P3 | M | MED | — | TODO |
+| 009  | Reload cookies on SIGHUP without redeploy — spike (direction) | P3 | M | MED | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) |
 REJECTED (one-line rationale).
 
 ## Reconcile log
+
+**2026-06-18 - implemented 009.** Added Unix SIGHUP cookie reload with
+`ArcSwap<CookieJar>` whole-jar swaps. Machine checks passed (`cargo build`,
+`cargo test`, `cargo fmt --check`, `cargo test --locked`); manual smoke logged
+one successful reload and one failed reload while the server kept running.
 
 **2026-06-18 — implemented 007.** Added `/oembed.json` plus the
 `application/json+oembed` alternate link on full/reel embeds. Machine checks
