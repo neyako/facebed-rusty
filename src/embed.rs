@@ -31,6 +31,21 @@ fn escape_attr(s: &str) -> String {
     encode_quoted_attribute(s).to_string()
 }
 
+fn enc_query(s: &str) -> String {
+    utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// Relative oEmbed link the embed advertises to Discord. Discord resolves this
+/// href against the page URL and reads `author_name`/`provider_name`.
+fn oembed_link_tag(author: &str, url: &str, kind: &str) -> String {
+    format!(
+        r#"<link rel="alternate" type="application/json+oembed" href="/oembed.json?author={a}&amp;url={u}&amp;type={kind}"/>"#,
+        a = enc_query(author),
+        u = enc_query(url),
+        kind = kind,
+    )
+}
+
 /// Escape markdown control chars that Discord renders inside `og:description`.
 /// Intentional FB group-post markdown should survive, but punctuation in normal
 /// prose should not accidentally bold/quote/code-format the embed body.
@@ -176,6 +191,12 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     let post_date = format_timestamp(post.date, tz_offset);
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
+    let kind = if post.video_links.is_empty() {
+        "link"
+    } else {
+        "video"
+    };
+    let oembed = oembed_link_tag(&post.author_name, &post.url, kind);
 
     format!(
         r##"<!DOCTYPE html>
@@ -191,6 +212,7 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     <meta property="og:url" content="{url_q}"/>
     {image_meta}
     <link rel="canonical" href="{url_q}"/>
+    {oembed}
     <meta http-equiv="refresh" content="0;url={url_q}"/>
     <meta name="twitter:card" content="summary_large_image"/>
     <meta name="theme-color" content="#0866ff"/>
@@ -207,6 +229,7 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
         extra = extra,
         url_q = url_q,
         image_meta = image_meta,
+        oembed = oembed,
     )
 }
 
@@ -228,6 +251,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     let post_date = format_timestamp(post.date, tz_offset);
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
+    let oembed = oembed_link_tag(&post.author_name, &post.url, "video");
 
     format!(
         r##"<!DOCTYPE html>
@@ -247,6 +271,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     {video_meta}
 
     <link rel="canonical" href="{url_q}"/>
+    {oembed}
     <meta http-equiv="refresh" content="0;url={url_q}"/>
     <meta name="twitter:card" content="player"/>
     <meta name="theme-color" content="#0866ff"/>
@@ -262,6 +287,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
         reactions = reactions,
         url_q = url_q,
         video_meta = video_meta,
+        oembed = oembed,
     )
 }
 
@@ -453,6 +479,14 @@ mod tests {
         assert!(html.contains(r#"<meta property="og:image" content="https://img.example/p.jpg"/>"#));
         assert!(html.contains("Title &quot;quote&quot;"));
         assert!(!html.contains(r#"content="Title "quote""#));
+    }
+
+    #[test]
+    fn full_embed_advertises_oembed_link() {
+        let html = format_full_post_embed(&sample_post(), 0);
+        let mime = ["application/json", "oembed"].join("+");
+        assert!(html.contains(&format!(r#"type="{mime}""#)));
+        assert!(html.contains("/oembed.json?author="));
     }
 
     #[test]

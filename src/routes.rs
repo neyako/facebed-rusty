@@ -37,6 +37,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
+        .route("/oembed.json", get(oembed))
         .route("/favicon.ico", get(favicon))
         .route("/banner.png", get(banner))
         .route("/*path", get(catch_all))
@@ -82,6 +83,48 @@ fn html_response(body: String) -> Response {
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     (StatusCode::OK, headers, body).into_response()
+}
+
+fn json_response(body: String) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, body).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct OEmbedParams {
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, rename = "type")]
+    kind: String,
+}
+
+async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> Response {
+    json_response(build_oembed_json(&p.author, &p.url, &p.kind))
+}
+
+/// Build the oEmbed 1.0 document Discord reads to render the author/provider
+/// line. Kept pure (no extractors) so it is unit-testable.
+fn build_oembed_json(author: &str, url: &str, kind: &str) -> String {
+    let kind = match kind {
+        "video" | "photo" | "rich" => kind,
+        _ => "link",
+    };
+    serde_json::json!({
+        "version": "1.0",
+        "type": kind,
+        "provider_name": crate::embed::credit(),
+        "provider_url": url,
+        "author_name": author,
+        "author_url": url,
+        "title": author,
+    })
+    .to_string()
 }
 
 fn no_store_html_response(body: String) -> Response {
@@ -669,7 +712,7 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_multi_permalink_path, is_facebook_url, scope_key};
+    use super::{build_oembed_json, group_multi_permalink_path, is_facebook_url, scope_key};
 
     #[test]
     fn group_path_extracts_group_id() {
@@ -748,5 +791,19 @@ mod tests {
         assert!(is_facebook_url("story.php?story_fbid=1&id=2"));
         assert!(is_facebook_url("photo.php?fbid=1&id=2"));
         assert!(!is_facebook_url("share/p/abc"));
+    }
+
+    #[test]
+    fn oembed_json_has_author_and_provider() {
+        let json = build_oembed_json("Jane Doe", "https://www.facebook.com/x", "video");
+        assert!(json.contains(r#""author_name":"Jane Doe""#));
+        assert!(json.contains(r#""provider_name":"facebed on Rust""#));
+        assert!(json.contains(r#""type":"video""#));
+    }
+
+    #[test]
+    fn oembed_json_defaults_unknown_type_to_link() {
+        let json = build_oembed_json("A", "https://x", "garbage");
+        assert!(json.contains(r#""type":"link""#));
     }
 }
