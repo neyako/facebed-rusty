@@ -31,11 +31,23 @@ Scope.
 | 007  | Serve an oEmbed endpoint for a real Discord author line (direction) | P2 | M | LOW-MED | — | DONE |
 | 008  | Short-TTL in-memory cache for rendered embeds (direction) | P2 | M | LOW-MED | — | DONE |
 | 009  | Reload cookies on SIGHUP without redeploy — spike (direction) | P3 | M | MED | — | DONE |
+| 010  | Fix group-post markdown leaks in embed descriptions (#, \, padded **) | P2 | M | LOW | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) |
 REJECTED (one-line rationale).
 
 ## Reconcile log
+
+**2026-06-18 — focused pass: group-post markdown handling → plan 010 (TODO).**
+A real group-post embed (screenshot) showed three leaks in the
+`allow_discord_markdown == true` render path (`src/embed.rs:49-126`): leading
+`#` headings shown literally (Discord embed descriptions don't render ATX
+headings), FB `\`-escapes double-escaped into a visible `\*`, and padded bold
+`**word **` rendered literally (CommonMark flanking rejects it). Maintainer
+chose: fix all three, keep the enhancement. Plan 010 replaces the
+escape-then-unescape helpers with a single-pass renderer. Independent of
+001–009; touches only `src/embed.rs`.
+
 
 **2026-06-18 — reconciled: 007, 008, 009 all verified DONE at `436bae1`.** All
 three direction plans landed since the last session, one commit each on branch

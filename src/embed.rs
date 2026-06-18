@@ -63,66 +63,133 @@ fn escape_markdown(s: &str) -> String {
     out
 }
 
-fn unescape_paired_marker(s: &str, escaped_marker: &str, raw_marker: &str) -> String {
-    let positions: Vec<usize> = s.match_indices(escaped_marker).map(|(i, _)| i).collect();
-    if positions.len() < 2 {
-        return s.to_owned();
-    }
+/// Markdown specials that get a literal backslash-escape so Discord renders
+/// them as plain text instead of formatting.
+const MD_ESCAPE: &[char] = &['*', '_', '~', '|', '`', '>'];
 
-    let paired_count = positions.len() - (positions.len() % 2);
-    let mut out = String::with_capacity(s.len());
-    let mut cursor = 0;
-    for (idx, pos) in positions.into_iter().enumerate() {
-        out.push_str(&s[cursor..pos]);
-        if idx < paired_count {
-            out.push_str(raw_marker);
-        } else {
-            out.push_str(escaped_marker);
-        }
-        cursor = pos + escaped_marker.len();
-    }
-    out.push_str(&s[cursor..]);
-    out
+/// Chars a Facebook-authored `\X` escape may protect. Includes `#` and `\`
+/// themselves, which `MD_ESCAPE` deliberately omits.
+fn is_md_special(c: char) -> bool {
+    MD_ESCAPE.contains(&c) || c == '#' || c == '\\'
 }
 
-fn unescape_line_start_blockquotes(escaped: &str, raw: &str) -> String {
-    let escaped_lines: Vec<&str> = escaped.split_inclusive('\n').collect();
-    let raw_lines: Vec<&str> = raw.split_inclusive('\n').collect();
-    if escaped_lines.len() != raw_lines.len() {
-        return escaped.to_owned();
-    }
-
-    let mut out = String::with_capacity(escaped.len());
-    for (escaped_line, raw_line) in escaped_lines.iter().zip(raw_lines.iter()) {
-        let leading = raw_line
-            .char_indices()
-            .find(|(_, c)| !c.is_whitespace() || *c == '\n')
-            .map(|(i, _)| i)
-            .unwrap_or(raw_line.len());
-        let marker = &raw_line[leading..];
-        if !(marker.starts_with("> ") || marker == ">" || marker == ">\n") {
-            out.push_str(escaped_line);
-            continue;
-        }
-
-        if escaped_line.len() >= leading + 2 && &escaped_line[leading..leading + 2] == r"\>" {
-            out.push_str(&escaped_line[..leading]);
-            out.push('>');
-            out.push_str(&escaped_line[leading + 2..]);
-        } else {
-            out.push_str(escaped_line);
-        }
-    }
-    out
+fn push_escaped(out: &mut String, c: char) {
+    out.push('\\');
+    out.push(c);
 }
 
 fn format_description_text(s: &str, allow_discord_markdown: bool) -> String {
-    let escaped = escape_markdown(s);
     if !allow_discord_markdown {
-        return escaped;
+        return escape_markdown(s);
     }
-    let with_bold = unescape_paired_marker(&escaped, r"\*\*", "**");
-    unescape_line_start_blockquotes(&with_bold, s)
+    render_group_markdown(s)
+}
+
+/// Render trusted FB-group-post text for a Discord embed description.
+/// FB stores plain text, but group posters often write Markdown intending
+/// formatting. Render a safe subset (bold, blockquote) and neutralize the rest.
+fn render_group_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        render_group_markdown_line(&mut out, line);
+    }
+    out
+}
+
+fn render_group_markdown_line(out: &mut String, line: &str) {
+    let ws_end = line
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    out.push_str(&line[..ws_end]);
+    let mut rest = &line[ws_end..];
+
+    let hashes = rest.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && rest[hashes..].starts_with(' ') {
+        rest = rest[hashes..].trim_start_matches(' ');
+    }
+
+    if rest == ">" || rest.starts_with("> ") {
+        out.push('>');
+        render_inline(out, &rest[1..]);
+        return;
+    }
+
+    render_inline(out, rest);
+}
+
+fn render_inline(out: &mut String, s: &str) {
+    let chars: Vec<char> = s.chars().collect();
+
+    let mut markers: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            markers.push(i);
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+
+    let paired = markers.len() - (markers.len() % 2);
+    let mut opens = std::collections::HashSet::new();
+    let mut closes = std::collections::HashSet::new();
+    for (n, &pos) in markers.iter().take(paired).enumerate() {
+        if n % 2 == 0 {
+            opens.insert(pos);
+        } else {
+            closes.insert(pos);
+        }
+    }
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            if let Some(&next) = chars.get(i + 1) {
+                if is_md_special(next) {
+                    push_escaped(out, next);
+                    i += 2;
+                    continue;
+                }
+            }
+            push_escaped(out, '\\');
+            i += 1;
+            continue;
+        }
+        if c == '*' && opens.contains(&i) {
+            out.push_str("**");
+            i += 2;
+            while chars.get(i) == Some(&' ') {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '*' && closes.contains(&i) {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+            out.push_str("**");
+            i += 2;
+            continue;
+        }
+        if MD_ESCAPE.contains(&c) {
+            push_escaped(out, c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> &str {
@@ -439,8 +506,38 @@ mod tests {
 
         assert_eq!(
             format_description_text(text, true),
-            "> Dmm GenG oi\n# **FIFA WORLD CUP 2026**\n\n**Germany vs Curacao**"
+            "> Dmm GenG oi\n**FIFA WORLD CUP 2026**\n\n**Germany vs Curacao**"
         );
+    }
+
+    #[test]
+    fn strips_leading_heading_markers() {
+        assert_eq!(
+            format_description_text("# ⚠️ Cảnh báo\n### Sub", true),
+            "⚠️ Cảnh báo\nSub"
+        );
+        assert_eq!(format_description_text("a #b c", true), "a #b c");
+        assert_eq!(format_description_text("####### x", true), "####### x");
+    }
+
+    #[test]
+    fn honors_fb_backslash_escape() {
+        assert_eq!(
+            format_description_text(r"từ: \*4 OCPU", true),
+            r"từ: \*4 OCPU"
+        );
+        assert_eq!(format_description_text(r"a\b", true), r"a\\b");
+    }
+
+    #[test]
+    fn normalizes_padded_bold() {
+        assert_eq!(format_description_text("**Oracle **", true), "**Oracle**");
+        assert_eq!(format_description_text("** spaced **", true), "**spaced**");
+    }
+
+    #[test]
+    fn escaped_bold_stays_literal() {
+        assert_eq!(format_description_text(r"\*\*x\*\*", true), r"\*\*x\*\*");
     }
 
     #[test]
