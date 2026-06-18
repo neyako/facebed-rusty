@@ -21,8 +21,22 @@ tokio::task_local! {
 
 pub struct Fetcher {
     client: Client,
+    media_client: Client,
     cookies: Arc<arc_swap::ArcSwap<CookieJar>>,
     media_size_cache: Mutex<MediaSizeCache>,
+}
+
+/// Max redirect hops the media proxy will follow.
+const MEDIA_MAX_REDIRECTS: usize = 4;
+
+/// Decide whether the media proxy may follow a redirect to `next_host` after
+/// `hops_so_far` hops. Every hop must stay on the Facebook media allowlist, and
+/// the chain is capped. `next_host` is `None` when the URL has no host.
+pub fn media_redirect_ok(next_host: Option<&str>, hops_so_far: usize) -> bool {
+    hops_so_far < MEDIA_MAX_REDIRECTS
+        && next_host
+            .map(crate::url_clean::is_facebook_media_host)
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +148,23 @@ impl Fetcher {
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(8))
             .build()?;
+        let media_client = Client::builder()
+            .gzip(true)
+            .brotli(true)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(8))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let host = attempt.url().host_str().map(|h| h.to_owned());
+                if media_redirect_ok(host.as_deref(), attempt.previous().len()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()?;
         Ok(Self {
             client,
+            media_client,
             cookies,
             media_size_cache: Mutex::default(),
         })
@@ -143,6 +172,10 @@ impl Fetcher {
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub fn media_client(&self) -> &Client {
+        &self.media_client
     }
 
     pub async fn check_cookie_accounts(&self) -> Vec<CookieAccountCheck> {
@@ -1042,6 +1075,19 @@ mod tests {
             super::facebook_fetch_url("https://example.com/x?type=3"),
             Err(FacebedError::NoData(_))
         ));
+    }
+
+    #[test]
+    fn media_redirect_blocks_offsite_and_caps_hops() {
+        use super::media_redirect_ok;
+
+        assert!(media_redirect_ok(Some("scontent.xx.fbcdn.net"), 0));
+        assert!(media_redirect_ok(Some("video.fbcdn.net"), 2));
+        assert!(!media_redirect_ok(Some("169.254.169.254"), 0));
+        assert!(!media_redirect_ok(Some("evil.example.com"), 0));
+        assert!(!media_redirect_ok(Some("evilfbcdn.net"), 0));
+        assert!(!media_redirect_ok(None, 0));
+        assert!(!media_redirect_ok(Some("scontent.xx.fbcdn.net"), 4));
     }
 
     #[test]

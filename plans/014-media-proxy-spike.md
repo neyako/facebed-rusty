@@ -324,12 +324,23 @@ For whoever owns this next:
 
 ## Spike outcome
 
-> _Executor: fill this in after Step 5 before marking the plan DONE._
-
-- Did `/media` successfully proxy a live `og:video` URL? (yes/no, status, CT)
-- Typical video size / first-byte latency observed:
+- Did `/media` successfully proxy a live `og:video` URL? No live `og:video` URL
+  was available in this checkout: there were no cookies, public reel probes
+  returned login-wall error embeds, and Facebook's crawler HTML exposed only
+  `og:image`. The route did proxy that live signed `og:image` successfully:
+  `200 OK`, `Content-Type: image/jpeg`.
+- Typical video size / first-byte latency observed: video not measured. The live
+  signed image was 85,980 bytes with 0.479 s first-byte latency; a current
+  `static.xx.fbcdn.net` icon also returned `200 image/x-icon`.
 - Does the `Content-Length` cap fire on oversized media, and do chunked upstreams
-  slip past it?
-- **Recommendation**: should a follow-up rewrite `og:video` (and/or `og:image`)
-  through `/media`? Trade-off in 2-3 sentences (durable embeds vs. egress cost).
-- Any follow-up plan worth filing (caching, Range support, per-`/media` rate cap)?
+  slip past it? The handler returns `413` when a declared length exceeds 30 MiB,
+  but no live oversized allowed asset was available to exercise that branch.
+  Chunked or otherwise unknown-length upstreams bypass the cap by design.
+- **Recommendation**: do not rewrite embed media through `/media` yet. A
+  follow-up should proxy `og:video` only after adding Range/206 support, a hard
+  streaming byte cap, redirect-hop host validation, and media-specific
+  concurrency/rate controls; keep `og:image` direct because Discord already
+  caches stills and proxying them adds egress with little durability benefit.
+- Follow-up plan: add Range forwarding, a counted streaming cap, per-hop
+  redirect allowlist enforcement, a small cache, and a tighter per-`/media`
+  concurrency/rate budget before measuring video playback egress.

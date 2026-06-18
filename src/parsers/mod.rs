@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::cookies::CookieJar;
 use crate::error::FacebedResult;
 use crate::fetch::Fetcher;
@@ -32,12 +33,16 @@ pub struct ParsedPost {
 pub struct ParserCtx {
     pub fetcher: Arc<Fetcher>,
     pub cookies: Arc<arc_swap::ArcSwap<CookieJar>>,
-    pub banned_users: Vec<String>,
+    pub config: Arc<arc_swap::ArcSwap<Config>>,
 }
 
 impl ParserCtx {
     pub fn is_banned(&self, author_id: &str) -> bool {
-        self.banned_users.iter().any(|b| b == author_id)
+        self.config
+            .load()
+            .banned_users
+            .iter()
+            .any(|b| b == author_id)
     }
 }
 
@@ -60,4 +65,25 @@ pub fn banned_post(url: &str) -> ParsedPost {
 #[async_trait::async_trait]
 pub trait Parser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn banned_reload_takes_effect_after_swap() {
+        let swap = Arc::new(arc_swap::ArcSwap::from_pointee(Config::default()));
+
+        assert!(!swap.load().banned_users.iter().any(|b| b == "100012345"));
+
+        let mut cfg = Config::default();
+        cfg.banned_users = vec!["100012345".to_string()];
+        swap.store(Arc::new(cfg));
+
+        assert!(
+            swap.load().banned_users.iter().any(|b| b == "100012345"),
+            "swapping config must make the new banned id visible"
+        );
+    }
 }
