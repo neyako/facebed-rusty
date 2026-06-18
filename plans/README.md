@@ -31,11 +31,37 @@ Scope.
 | 007  | Serve an oEmbed endpoint for a real Discord author line (direction) | P2 | M | LOW-MED | — | DONE |
 | 008  | Short-TTL in-memory cache for rendered embeds (direction) | P2 | M | LOW-MED | — | DONE |
 | 009  | Reload cookies on SIGHUP without redeploy — spike (direction) | P3 | M | MED | — | DONE |
+| 010  | Fix group-post markdown leaks in embed descriptions (#, \, padded **) | P2 | M | LOW | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) |
 REJECTED (one-line rationale).
 
 ## Reconcile log
+
+**2026-06-18 — reconciled: plan 010 verified DONE at `ebd64bc`.** The group-post
+markdown fix landed in one commit (`ebd64bc`, branch
+`advisor/010-group-post-markdown`), touching only `src/embed.rs` plus the
+`plans/` files — scope clean. Re-ran every machine-checkable done criterion on
+current HEAD, all hold: `cargo fmt -- --check` exit 0, `cargo build` exit 0,
+`cargo test` **88 passed / 0 failed** (was 84; +4 new tests:
+`strips_leading_heading_markers`, `honors_fb_backslash_escape`,
+`normalizes_padded_bold`, `escaped_bold_stays_literal`). The escape/unescape
+helpers are gone (`grep unescape_paired_marker|unescape_line_start_blockquotes`
+empty), the single-pass renderer is in (`render_group_markdown` /
+`render_inline` / `MD_ESCAPE` / `is_md_special`), and `escape_markdown` survives
+as the `allow=false` path. All three leaks (literal `#`, doubled `\`, dead
+padded `**`) are pinned by the new tests. **Plans 001–010 are all DONE.**
+
+**2026-06-18 — focused pass: group-post markdown handling → plan 010 (TODO).**
+A real group-post embed (screenshot) showed three leaks in the
+`allow_discord_markdown == true` render path (`src/embed.rs:49-126`): leading
+`#` headings shown literally (Discord embed descriptions don't render ATX
+headings), FB `\`-escapes double-escaped into a visible `\*`, and padded bold
+`**word **` rendered literally (CommonMark flanking rejects it). Maintainer
+chose: fix all three, keep the enhancement. Plan 010 replaces the
+escape-then-unescape helpers with a single-pass renderer. Independent of
+001–009; touches only `src/embed.rs`.
+
 
 **2026-06-18 — reconciled: 007, 008, 009 all verified DONE at `436bae1`.** All
 three direction plans landed since the last session, one commit each on branch
