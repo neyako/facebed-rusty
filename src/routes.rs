@@ -32,6 +32,7 @@ pub struct AppState {
     pub ctx: Arc<ParserCtx>,
     pub notifier: Notifier,
     pub fetcher: Arc<Fetcher>,
+    pub embed_cache: Arc<std::sync::Mutex<crate::embed_cache::EmbedCache>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -402,6 +403,16 @@ enum ParserKind {
 }
 
 async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
+    {
+        let now = Instant::now();
+        if let Ok(mut cache) = state.embed_cache.lock() {
+            if let Some(body) = cache.get(path, now) {
+                info!(path = %path, cached = true, "embed cache hit");
+                return html_response(body);
+            }
+        }
+    }
+
     // Retry across every cookie account in configured priority order. Primary
     // account gets first chance; extra accounts are fallback/load-balancing
     // hints via affinity, not blind per-request rotation.
@@ -466,6 +477,9 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 }
                 let render_started = Instant::now();
                 let body = render_with_size_check(state, &post, kind).await;
+                if let Ok(mut cache) = state.embed_cache.lock() {
+                    cache.insert(path, body.clone(), Instant::now());
+                }
                 info!(
                     path = %path,
                     kind = ?kind,

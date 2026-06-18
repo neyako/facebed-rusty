@@ -9,6 +9,7 @@ mod config;
 mod cookies;
 mod crawler;
 mod embed;
+mod embed_cache;
 mod error;
 mod fetch;
 mod jq;
@@ -103,6 +104,9 @@ async fn main() -> anyhow::Result<()> {
         ctx,
         notifier,
         fetcher,
+        embed_cache: Arc::new(std::sync::Mutex::new(
+            crate::embed_cache::EmbedCache::default(),
+        )),
     };
     let app = router(state).layer(
         tower_http::trace::TraceLayer::new_for_http()
