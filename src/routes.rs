@@ -151,7 +151,7 @@ async fn media(
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
 
-    let upstream = match state.fetcher.client().get(parsed).send().await {
+    let upstream = match state.fetcher.media_client().get(parsed).send().await {
         Ok(r) => r,
         Err(_) => return (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
     };

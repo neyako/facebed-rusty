@@ -36,12 +36,35 @@ Scope.
 | 012  | Reload `timezone` + `banned_users` on SIGHUP without redeploy (direction) | P3 | S-M | MED | — | DONE |
 | 013  | Add a `/healthz` endpoint: liveness, counters, cookie state (direction) | P3 | M | LOW | — | DONE |
 | 014  | SPIKE: stream Facebook CDN media through a `/media` route (direction) | P3 | M-L | MED | — | DONE |
-| 015  | Close the redirect-hop SSRF on `/media` (security) | P1 | S | LOW | 014 | TODO |
+| 015  | Close the redirect-hop SSRF on `/media` (security) | P1 | S | LOW | 014 | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) |
 REJECTED (one-line rationale).
 
 ## Reconcile log
+
+**2026-06-18 — reconciled: plan 015 verified, but UNCOMMITTED.** Independently
+re-ran every 015 done criterion on the working tree (HEAD still `2519954`):
+`cargo build` exit 0, `cargo fmt -- --check` exit 0, `cargo test` **93 passed /
+0 failed** (+1 vs 92 = `media_redirect_blocks_offsite_and_caps_hops`, which
+passes — it pins the `169.254.169.254`, `evilfbcdn.net` lookalike, hostless, and
+hop-cap=4 cases). Scope is exactly the plan's: `git status` shows only
+`src/fetch.rs` + `src/routes.rs` modified. The shared `client` builder
+(`fetch.rs:131-150`) carries **no** `.redirect(...)` — untouched, as required;
+the new policy lives only on `media_client` (`fetch.rs:151-168`,
+`Policy::custom` → `media_redirect_ok`), and `/media` fetches via
+`media_client()` (`routes.rs:154`). The redirect-hop SSRF is closed (fail-closed:
+a disallowed hop stops the chain → handler returns 502). **The 015 code is not
+committed** — committing is the maintainer's call (the advisor never commits).
+Once committed, `/media` is safe to expose. **All plans 001–015 are DONE**
+(015 pending commit).
+
+**2026-06-18 — plan 015 implemented.** `/media` now uses a dedicated reqwest
+client that re-validates every redirect host against the Facebook-media
+allowlist and stops after four hops. The shared fetch client remains unchanged.
+Security regression coverage blocks metadata IPs, offsite/lookalike hosts,
+hostless targets, and over-budget chains. Verified: `cargo build`,
+`cargo fmt -- --check`, and `cargo test` (**93 passed / 0 failed**).
 
 **2026-06-18 — reconciled 011–014: implemented + green, but UNCOMMITTED, and a
 new SSRF finding in 014.** All four direction plans are implemented in the
