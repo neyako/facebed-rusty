@@ -37,6 +37,40 @@ REJECTED (one-line rationale).
 
 ## Reconcile log
 
+**2026-06-18 — reconciled: 007, 008, 009 all verified DONE at `436bae1`.** All
+three direction plans landed since the last session, one commit each on branch
+`advisor/009-live-cookie-reload`: `c941f09` (007 oEmbed), `cbfb255` (008 embed
+cache), `436bae1` (009 SIGHUP reload). Re-ran every machine-checkable done
+criterion on current HEAD — all hold: `cargo fmt --check` exit 0, `cargo build`
+exit 0, `cargo test` **84 passed / 0 failed** (was 80; +3 from 007, +1 from 008,
+009 adds none by design). Per-commit scope is clean and the critical boundaries
+held: **008 did not touch `src/fetch.rs`**, **009 did not touch `src/cookies.rs`**
+(`git diff --stat cbed1e3..436bae1 -- src/cookies.rs` empty), and
+`grep -rn "Arc<CookieJar>" src/` returns no matches.
+
+- **007** — `/oembed.json` route + `build_oembed_json` in `routes.rs`; `enc_query`
+  + `oembed_link_tag` in `embed.rs`; the `application/json+oembed` alternate link
+  emitted on full **and** reel embeds; `og:site_name` stuffing left in place (4
+  lines still present — additive, no regression to non-oEmbed crawlers). Tests
+  assert real content. **Still pending: maintainer Discord test** of the relative
+  href (Step 4 — not machine-verifiable; if the author line doesn't appear, the
+  absolute-Host-header fallback is the documented next step).
+- **008** — new `src/embed_cache.rs` (`EmbedCache`, 90 s TTL / 512 max); cache
+  read at top of `process()`, write on the success branch only; `AppState` gains
+  the `Arc<Mutex<EmbedCache>>` field. Unit test asserts fresh hit, TTL expiry, and
+  the size bound.
+- **009** — `Arc<ArcSwap<CookieJar>>` swap on SIGHUP; all ~20 read/write sites
+  gained `.load()`, the four bound-guard sites match the plan, `cookies.rs` is
+  byte-unchanged, `Cargo.lock` carries `arc-swap`. **Approved deviation** (in
+  scope, documented in the Spike outcome): a `#[cfg(unix)] validate_cookie_json_files`
+  pre-check was added in `main.rs` because `CookieJar::load` returns `Ok` on
+  malformed per-file JSON — without it the plan's "survived bad-file reload"
+  criterion would silently swap in a degraded jar instead of logging
+  `cookie reload failed`. Review note for the maintainer: that validator
+  reconstructs `CookieJar::load`'s multi-file discovery (parent-dir `cookies*.json`,
+  excluding `cookies.example.json`); if the load discovery ever changes, keep the
+  pre-check in sync.
+
 **2026-06-18 - implemented 009.** Added Unix SIGHUP cookie reload with
 `ArcSwap<CookieJar>` whole-jar swaps. Machine checks passed (`cargo build`,
 `cargo test`, `cargo fmt --check`, `cargo test --locked`); manual smoke logged
@@ -66,14 +100,15 @@ machine-checkable done criteria and the full suite (`cargo test --locked` →
 The earlier "execute 004 → 001 → 003 sequentially, drift will trip" caveat is now
 historical — that cluster is merged into `cbed1e3`.
 
-**Executable now:** plans **007, 008, 009** — all TODO, planned at `cbed1e3`
-(= current HEAD), **no drift**. Confirmed unimplemented: no `/oembed.json` route,
-no `EmbedCache`, no SIGHUP/`arc-swap` in the tree. Independent of one another;
-recommended order 007 → 008 → 009.
+**All planned work is DONE.** Plans 001–009 have landed (HEAD `436bae1`). Nothing
+in `plans/` is TODO. The 009 commits sit on branch `advisor/009-live-cookie-reload`;
+merging to `rust` is the maintainer's call.
 
 **Still open, not planned:** the `/text` text-only embed finding (declined this
-cycle) and the two direction options below (`/healthz`+metrics, per-account rate
-budget).
+cycle); a **maintainer Discord test of 007's relative oEmbed href** (the one
+done-criterion that isn't machine-checkable); and the two direction options below
+(`/healthz`+metrics, per-account rate budget). Run `/improve next` for the next
+direction pass when ready.
 
 **Recommended order: 004 → 006 → 002 → 005 → 001 → 003**, then the direction
 plans **007 → 008 → 009** (independent of the bug cluster and of each other;
