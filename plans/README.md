@@ -32,15 +32,88 @@ Scope.
 | 008  | Short-TTL in-memory cache for rendered embeds (direction) | P2 | M | LOW-MED | — | DONE |
 | 009  | Reload cookies on SIGHUP without redeploy — spike (direction) | P3 | M | MED | — | DONE |
 | 010  | Fix group-post markdown leaks in embed descriptions (#, \, padded **) | P2 | M | LOW | — | DONE |
-| 011  | Cap concurrent Facebook fetches to protect the cookie pool (direction) | P2 | S-M | MED | — | TODO |
-| 012  | Reload `timezone` + `banned_users` on SIGHUP without redeploy (direction) | P3 | S-M | MED | — | TODO |
-| 013  | Add a `/healthz` endpoint: liveness, counters, cookie state (direction) | P3 | M | LOW | — | TODO |
-| 014  | SPIKE: stream Facebook CDN media through a `/media` route (direction) | P3 | M-L | MED | — | TODO |
+| 011  | Cap concurrent Facebook fetches to protect the cookie pool (direction) | P2 | S-M | MED | — | DONE |
+| 012  | Reload `timezone` + `banned_users` on SIGHUP without redeploy (direction) | P3 | S-M | MED | — | DONE |
+| 013  | Add a `/healthz` endpoint: liveness, counters, cookie state (direction) | P3 | M | LOW | — | DONE |
+| 014  | SPIKE: stream Facebook CDN media through a `/media` route (direction) | P3 | M-L | MED | — | DONE |
+| 015  | Close the redirect-hop SSRF on `/media` (security) | P1 | S | LOW | 014 | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) |
 REJECTED (one-line rationale).
 
 ## Reconcile log
+
+**2026-06-18 — reconciled: plan 015 verified, but UNCOMMITTED.** Independently
+re-ran every 015 done criterion on the working tree (HEAD still `2519954`):
+`cargo build` exit 0, `cargo fmt -- --check` exit 0, `cargo test` **93 passed /
+0 failed** (+1 vs 92 = `media_redirect_blocks_offsite_and_caps_hops`, which
+passes — it pins the `169.254.169.254`, `evilfbcdn.net` lookalike, hostless, and
+hop-cap=4 cases). Scope is exactly the plan's: `git status` shows only
+`src/fetch.rs` + `src/routes.rs` modified. The shared `client` builder
+(`fetch.rs:131-150`) carries **no** `.redirect(...)` — untouched, as required;
+the new policy lives only on `media_client` (`fetch.rs:151-168`,
+`Policy::custom` → `media_redirect_ok`), and `/media` fetches via
+`media_client()` (`routes.rs:154`). The redirect-hop SSRF is closed (fail-closed:
+a disallowed hop stops the chain → handler returns 502). **The 015 code is not
+committed** — committing is the maintainer's call (the advisor never commits).
+Once committed, `/media` is safe to expose. **All plans 001–015 are DONE**
+(015 pending commit).
+
+**2026-06-18 — plan 015 implemented.** `/media` now uses a dedicated reqwest
+client that re-validates every redirect host against the Facebook-media
+allowlist and stops after four hops. The shared fetch client remains unchanged.
+Security regression coverage blocks metadata IPs, offsite/lookalike hosts,
+hostless targets, and over-budget chains. Verified: `cargo build`,
+`cargo fmt -- --check`, and `cargo test` (**93 passed / 0 failed**).
+
+**2026-06-18 — reconciled 011–014: implemented + green, but UNCOMMITTED, and a
+new SSRF finding in 014.** All four direction plans are implemented in the
+working tree on branch `advisor/014-media-proxy` — `git status` shows
+`src/main.rs`, `src/parsers/mod.rs`, `src/routes.rs`, `Cargo.toml`, `Cargo.lock`
+modified but **not committed** (HEAD still `515c7d8`). Re-ran every
+machine-checkable done criterion on the working tree, all hold: `cargo build`
+exit 0, `cargo fmt -- --check` exit 0, `cargo test` **92 passed / 0 failed** (was
+88; +4 = one new test per plan: `fetch_cap_rejects_when_exhausted` 011,
+`banned_reload_takes_effect_after_swap` 012, `healthz_json_reports_counters_and_accounts`
+013, `media_guard_blocks_non_facebook_hosts` 014). Scope is clean per plan:
+- **011** — `fetch_limit: Arc<Semaphore>` on `AppState`, `MAX_INFLIGHT_FETCHES=16`,
+  `try_acquire_owned` permit in `process` (`routes.rs:547`), `busy_response`.
+- **012** — `ParserCtx.config`/`AppState.config` now `Arc<ArcSwap<Config>>`,
+  `is_banned` reads live, `tz` read live (`routes.rs:753`), SIGHUP reloads config
+  (`main.rs:106-133`). `banned_users: Vec<String>` field gone.
+- **013** — `/healthz` route + `build_healthz_json`; `Metrics{requests,errors}`;
+  no cookie values in the JSON (label + `in_cooldown` only).
+- **014** — `/media` route + `media_target_allowed`; `Cargo.toml` adds exactly the
+  `reqwest` `stream` feature; **`src/embed.rs` untouched** (`git diff --stat HEAD
+  -- src/embed.rs` empty) — the spike correctly did not rewire embed media. Spike
+  outcome filled: `/media` proxied a live `og:image` (200, `image/jpeg`, 85,980 B,
+  0.479 s); recommends NOT routing embeds through `/media` yet.
+
+The status rows above are marked DONE in the working tree, but the work is **not
+committed** — committing/merging to `rust` is the maintainer's call (the advisor
+never commits). Nothing else in `plans/` is TODO.
+
+**NEW security finding (introduced by the uncommitted 014, HIGH) — redirect-hop
+SSRF on `/media`.** The handler validates only the *initial* host
+(`media_target_allowed`, `routes.rs:150`) and then fetches with the shared
+`reqwest` client (`routes.rs:154`), which sets **no redirect policy**
+(`fetch.rs:131-136` → reqwest default follows up to 10 redirects). The
+`is_facebook_media_host` allowlist accepts any `*.facebook.com`, including
+open-redirect endpoints such as `l.facebook.com/l.php?u=…`. So
+`GET /media?u=https://l.facebook.com/l.php?u=http://169.254.169.254/latest/meta-data`
+passes the allowlist, reqwest follows the redirect to the internal target, and
+the body is streamed back to the caller — a full read-SSRF. The route is **live
+and directly reachable** (`routes.rs:54`) even though embeds don't link it. The
+014 executor flagged exactly this in its spike outcome ("redirect-hop host
+validation", "per-hop redirect allowlist enforcement"). **Recommended fix → a new
+plan 015** (P0/P1, S): give `/media` its own client built with
+`redirect::Policy::none()` (or a custom policy that re-runs `is_facebook_media_host`
+on every hop and caps hop count). Do not reuse the shared client, which must keep
+following redirects for the normal fetch path. **Drafted as plan 015** (P1/S/LOW,
+depends on 014) — it takes the custom-policy route (re-validate every hop, cap at
+4) so legit `fbcdn→fbcdn` redirects still work. The 011–014 implementation was
+committed at `e68aa0a` with the SSRF flagged in the commit body and a "do not
+deploy /media until 015 lands" warning. Plan 015 is TODO and executable now.
 
 **2026-06-18 — direction pass (`/improve next`) against `2e6610f`.** Plans
 001–010 confirmed all DONE. Audited only "where to take this next"; surfaced 5

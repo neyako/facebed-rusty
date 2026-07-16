@@ -26,6 +26,10 @@ use crate::notifier::Notifier;
 use crate::parsers::ParserCtx;
 use crate::routes::{router, AppState};
 
+/// Max Facebook post-renders in flight at once. Excess requests get a fast 503
+/// instead of piling concurrent load onto the cookie pool. Tune for your host.
+const MAX_INFLIGHT_FETCHES: usize = 16;
+
 #[derive(Parser, Debug)]
 #[command(name = "facebed", about = "Facebook embed proxy server")]
 struct Args {
@@ -53,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let config = match args.config {
+    let config = match &args.config {
         Some(p) => Config::load(&p)?,
         None => {
             warn!("no config provided; using defaults");
@@ -88,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let notifier = Notifier::new(config.notifier_webhook.clone(), fetcher.client().clone());
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    let config = Arc::new(ArcSwap::from_pointee(config));
 
     if !cookies.load().is_empty() {
         let check_fetcher = fetcher.clone();
@@ -129,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
     {
         let jar = cookies.clone();
         let cookies_path = args.cookies.clone();
+        let cfg_swap = config.clone();
+        let cfg_path = args.config.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let mut hup = match signal(SignalKind::hangup()) {
@@ -149,6 +157,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(e) => warn!("cookie reload failed: {e}"),
                 }
+                if let Some(p) = &cfg_path {
+                    match Config::load(p) {
+                        Ok(new_cfg) => {
+                            cfg_swap.store(Arc::new(new_cfg));
+                            info!(
+                                "reloaded config on SIGHUP (timezone + banned_users live; host/port/webhook need restart)"
+                            );
+                        }
+                        Err(e) => warn!("config reload failed: {e}"),
+                    }
+                }
             }
         });
     }
@@ -156,18 +175,20 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(ParserCtx {
         fetcher: fetcher.clone(),
         cookies: cookies.clone(),
-        banned_users: config.banned_users.clone(),
+        config: config.clone(),
     });
 
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let state = AppState {
-        config: Arc::new(config),
+        config: config.clone(),
         ctx,
         notifier,
         fetcher,
         embed_cache: Arc::new(std::sync::Mutex::new(
             crate::embed_cache::EmbedCache::default(),
         )),
+        fetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FETCHES)),
+        metrics: Arc::new(crate::routes::Metrics::default()),
+        started_at: std::time::Instant::now(),
     };
     let app = router(state).layer(
         tower_http::trace::TraceLayer::new_for_http()
