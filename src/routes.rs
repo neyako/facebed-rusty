@@ -9,9 +9,9 @@ use crate::error::FacebedError;
 use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
 use crate::notifier::Notifier;
 use crate::parsers::{
-    comment::CommentParser, json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
-    single_photo::SinglePhotoParser, stories::StoriesParser, video_watch::VideoWatchParser,
-    ParsedPost, Parser, ParserCtx,
+    comment::CommentParser, json_post::JsonPostParser, photocom::PhotocomParser,
+    reels::ReelsParser, single_photo::SinglePhotoParser, stories::StoriesParser,
+    video_watch::VideoWatchParser, ParsedPost, Parser, ParserCtx,
 };
 use crate::url_clean;
 use axum::extract::State;
@@ -986,14 +986,8 @@ mod tests {
 
     #[test]
     fn select_kind_routes_paths() {
-        assert!(matches!(
-            select_kind("reel/123"),
-            Some(ParserKind::Reels)
-        ));
-        assert!(matches!(
-            select_kind("watch?v=1"),
-            Some(ParserKind::Watch)
-        ));
+        assert!(matches!(select_kind("reel/123"), Some(ParserKind::Reels)));
+        assert!(matches!(select_kind("watch?v=1"), Some(ParserKind::Watch)));
         assert!(matches!(
             select_kind("groups/1/posts/2"),
             Some(ParserKind::JsonPost)

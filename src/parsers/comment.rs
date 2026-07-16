@@ -51,7 +51,9 @@ pub(crate) fn comment_id_in(path: &str) -> Option<String> {
 fn candidate_comment_nodes(bloc: &Value) -> Vec<&Value> {
     let mut out = Vec::new();
     for edges in jq::all(bloc, "edges") {
-        let Some(arr) = edges.as_array() else { continue };
+        let Some(arr) = edges.as_array() else {
+            continue;
+        };
         for edge in arr {
             if let Some(node) = edge.get("node") {
                 if node.get("preferred_body").is_some() && node.get("author").is_some() {
@@ -304,10 +306,7 @@ mod tests {
             Some("https://img.fbcdn.net/t.jpg")
         );
         assert!(post.image_links.is_empty());
-        assert_eq!(
-            post.url,
-            "https://www.facebook.com/reel/999?comment_id=222"
-        );
+        assert_eq!(post.url, "https://www.facebook.com/reel/999?comment_id=222");
     }
 
     #[test]
