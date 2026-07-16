@@ -40,6 +40,14 @@ struct Args {
     /// Path to cookies.json (default: ./cookies.json).
     #[arg(long, default_value = "cookies.json")]
     cookies: PathBuf,
+
+    /// Recon: fetch one Facebook path, dump raw HTML + JSON blocks, exit.
+    #[arg(long, value_name = "FB_PATH")]
+    dump: Option<String>,
+
+    /// Output directory for --dump.
+    #[arg(long, default_value = "/tmp/recon_out")]
+    dump_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -59,6 +67,30 @@ async fn main() -> anyhow::Result<()> {
 
     let cookies = Arc::new(ArcSwap::from_pointee(CookieJar::load(&args.cookies)?));
     let fetcher = Arc::new(Fetcher::new(cookies.clone())?);
+
+    if let Some(fb_path) = args.dump.as_deref() {
+        let page = fetcher
+            .fetch(fb_path, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("dump fetch failed: {e}"))?;
+        std::fs::create_dir_all(&args.dump_dir)?;
+        std::fs::write(args.dump_dir.join("page.html"), &page.html)?;
+        let blocks = crate::fetch::get_json_blocks(page.document(), true);
+        for (i, block) in blocks.iter().enumerate() {
+            std::fs::write(
+                args.dump_dir.join(format!("block_{i:03}.json")),
+                serde_json::to_string_pretty(block)?,
+            )?;
+        }
+        println!(
+            "dumped {} json blocks from {} into {}",
+            blocks.len(),
+            page.url,
+            args.dump_dir.display()
+        );
+        return Ok(());
+    }
+
     let notifier = Notifier::new(config.notifier_webhook.clone(), fetcher.client().clone());
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let config = Arc::new(ArcSwap::from_pointee(config));

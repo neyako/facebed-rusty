@@ -9,7 +9,7 @@ use crate::error::FacebedError;
 use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
 use crate::notifier::Notifier;
 use crate::parsers::{
-    json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
+    comment::CommentParser, json_post::JsonPostParser, photocom::PhotocomParser, reels::ReelsParser,
     single_photo::SinglePhotoParser, stories::StoriesParser, video_watch::VideoWatchParser,
     ParsedPost, Parser, ParserCtx,
 };
@@ -419,30 +419,18 @@ async fn catch_all(
     }
 
     // /videos/<id> → reel/<id>
-    if let Some(caps) = RE_VIDEOS.captures(&working) {
-        working = format!("reel/{}", &caps[1]);
+    if let Some(rewritten) = rewrite_videos_path(&working) {
+        working = rewritten;
     }
 
-    // dispatch
-    let kind = if RE_STORIES.is_match(&working) {
-        ParserKind::Stories
-    } else if RE_REEL.is_match(&working) {
-        ParserKind::Reels
-    } else if path_only(&working)
-        .map(|p| RE_PHOTO.is_match(&p))
-        .unwrap_or(false)
-    {
-        ParserKind::SinglePhoto
-    } else if path_only(&working)
-        .map(|p| RE_WATCH.is_match(&p))
-        .unwrap_or(false)
-        || RE_PAGE_VIDEO.is_match(&working)
-    {
-        ParserKind::Watch
-    } else if is_facebook_url(&working) {
-        ParserKind::JsonPost
+    // dispatch — comment permalinks first, then path-shape routing
+    let kind = if crate::parsers::comment::comment_id_in(&working).is_some() {
+        ParserKind::Comment
     } else {
-        return html_response(format_error_embed("https://git.facebed.com", "C"));
+        match select_kind(&working) {
+            Some(kind) => kind,
+            None => return html_response(format_error_embed("https://git.facebed.com", "C")),
+        }
     };
 
     info!(working = %working, kind = ?kind, "dispatch");
@@ -456,6 +444,71 @@ fn path_only(s: &str) -> Option<String> {
     ))
     .ok()
     .map(|u| u.path().to_owned())
+}
+
+/// `videos/<slug?>/<id>[?query]` → `reel/<id>[?query]`. Query survives so
+/// `comment_id` dispatch (ParserKind::Comment) still sees it.
+fn rewrite_videos_path(working: &str) -> Option<String> {
+    let caps = RE_VIDEOS.captures(working)?;
+    let mut out = format!("reel/{}", &caps[1]);
+    if let Some((_, query)) = working.split_once('?') {
+        if !query.is_empty() {
+            out.push('?');
+            out.push_str(query);
+        }
+    }
+    Some(out)
+}
+
+fn select_kind(working: &str) -> Option<ParserKind> {
+    if RE_STORIES.is_match(working) {
+        Some(ParserKind::Stories)
+    } else if RE_REEL.is_match(working) {
+        Some(ParserKind::Reels)
+    } else if path_only(working)
+        .map(|p| RE_PHOTO.is_match(&p))
+        .unwrap_or(false)
+    {
+        Some(ParserKind::SinglePhoto)
+    } else if path_only(working)
+        .map(|p| RE_WATCH.is_match(&p))
+        .unwrap_or(false)
+        || RE_PAGE_VIDEO.is_match(working)
+    {
+        Some(ParserKind::Watch)
+    } else if is_facebook_url(working) {
+        Some(ParserKind::JsonPost)
+    } else {
+        None
+    }
+}
+
+/// Drop comment_id/reply_comment_id so a failed comment lookup can re-dispatch
+/// as the plain post/video it hangs off.
+fn strip_comment_id(path: &str) -> String {
+    let Ok(url) = Url::parse(&url_clean::ensure_absolute(path)) else {
+        return path.to_owned();
+    };
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "comment_id" && k != "reply_comment_id")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let mut out = url.path().trim_start_matches('/').to_owned();
+    if !kept.is_empty() {
+        let mut tmp = Url::parse("https://www.facebook.com").unwrap();
+        {
+            let mut qp = tmp.query_pairs_mut();
+            for (k, v) in &kept {
+                qp.append_pair(k, v);
+            }
+        }
+        if let Some(q) = tmp.query() {
+            out.push('?');
+            out.push_str(q);
+        }
+    }
+    out
 }
 
 fn group_multi_permalink_path(s: &str) -> Option<String> {
@@ -526,6 +579,7 @@ enum ParserKind {
     Reels,
     Watch,
     Stories,
+    Comment,
 }
 
 async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
@@ -719,6 +773,26 @@ async fn run_parser(
         ParserKind::Reels => ReelsParser.process(&state.ctx, path).await,
         ParserKind::Watch => VideoWatchParser.process(&state.ctx, path).await,
         ParserKind::Stories => StoriesParser.process(&state.ctx, path).await,
+        ParserKind::Comment => {
+            match CommentParser.process(&state.ctx, path).await {
+                Err(FacebedError::NoData(reason)) => {
+                    // Comment absent from SSR HTML — embed the underlying post
+                    // instead of erroring with C.
+                    let stripped = strip_comment_id(path);
+                    let Some(fallback) = select_kind(&stripped) else {
+                        return Err(FacebedError::no_data(reason));
+                    };
+                    info!(
+                        path = %stripped,
+                        kind = ?fallback,
+                        %reason,
+                        "comment not found; falling back to post embed"
+                    );
+                    Box::pin(run_parser(state, &stripped, fallback)).await
+                }
+                other => other,
+            }
+        }
     }
 }
 
@@ -880,8 +954,52 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 mod tests {
     use super::{
         build_healthz_json, build_oembed_json, group_multi_permalink_path, is_facebook_url,
-        media_target_allowed, scope_key,
+        media_target_allowed, rewrite_videos_path, scope_key, select_kind, strip_comment_id,
+        ParserKind,
     };
+
+    #[test]
+    fn videos_rewrite_preserves_query() {
+        assert_eq!(
+            rewrite_videos_path("videos/123/?comment_id=456"),
+            Some("reel/123?comment_id=456".to_string())
+        );
+        assert_eq!(
+            rewrite_videos_path("videos/123/"),
+            Some("reel/123".to_string())
+        );
+        assert_eq!(rewrite_videos_path("reel/123"), None);
+    }
+
+    #[test]
+    fn strip_comment_id_removes_only_comment_params() {
+        assert_eq!(strip_comment_id("reel/999?comment_id=111"), "reel/999");
+        assert_eq!(
+            strip_comment_id("story.php?story_fbid=1&comment_id=2&id=3"),
+            "story.php?story_fbid=1&id=3"
+        );
+        assert_eq!(
+            strip_comment_id("reel/999?comment_id=1&reply_comment_id=2"),
+            "reel/999"
+        );
+    }
+
+    #[test]
+    fn select_kind_routes_paths() {
+        assert!(matches!(
+            select_kind("reel/123"),
+            Some(ParserKind::Reels)
+        ));
+        assert!(matches!(
+            select_kind("watch?v=1"),
+            Some(ParserKind::Watch)
+        ));
+        assert!(matches!(
+            select_kind("groups/1/posts/2"),
+            Some(ParserKind::JsonPost)
+        ));
+        assert!(select_kind("definitely-not-facebook").is_none());
+    }
 
     #[test]
     fn group_path_extracts_group_id() {

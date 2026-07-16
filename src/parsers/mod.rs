@@ -4,6 +4,7 @@ use crate::error::FacebedResult;
 use crate::fetch::Fetcher;
 use std::sync::Arc;
 
+pub mod comment;
 pub mod json_post;
 pub mod photocom;
 pub mod reels;

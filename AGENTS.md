@@ -39,6 +39,7 @@ src/
     reels.rs              /reel/<id>  ← BUG 1 FIX lives here (relaxed get_content_node)
     video_watch.rs        /watch
     stories.rs            24-hour stories /stories/<author_id>/<media_id>  ← BUG 3 NEW
+    comment.rs            comment permalink (?comment_id=) — comment text/image/video embed
 assets/                   favicon, banner, index.html landing page
 Dockerfile                multi-stage musl build → scratch image
 docker-compose.yml        compose example with volume mounts
@@ -76,15 +77,17 @@ Expired cookies trigger `Notifier::warn` to the Discord webhook on startup.
 3. Crawler UA gate (`crawler::is_crawler`) — non-crawler returns 301 + `format_redirect_page`.
 4. `/share/{v,r,p}/...` → `fetch::resolve_share_link` (follow redirects via reqwest, then re-dispatch on resolved path).
 5. `url_clean::clean_path` strips tracking params (`fs`, `mibextid`, `rdid`, `share_url`, etc).
-6. `/videos/<id>` rewritten to `reel/<id>`.
-7. Path matched by regex → one of the parsers:
+6. `/videos/<id>` rewritten to `reel/<id>` (query string preserved).
+7. Query has `comment_id` → `CommentParser`; on NoData `(ccn)` the comment params
+   are stripped and the path re-dispatched below (post embed instead of error C).
+8. Path matched by regex → one of the parsers:
    - `^/?stories/\d+/[A-Za-z0-9=_-]+` → `StoriesParser`
    - `^/?reel/[0-9]+` → `ReelsParser`
    - `^/*photo(\.php)*/*$` → `SinglePhotoParser`
    - `^/*watch` → `VideoWatchParser`
    - `is_facebook_url()` (groups/permalink/story/posts/photo) → `JsonPostParser`
    - else → error embed code `C`
-8. Parser returns `ParsedPost`. `routes::render` picks `format_full_post_embed` (image card)
+9. Parser returns `ParsedPost`. `routes::render` picks `format_full_post_embed` (image card)
    or `format_reel_post_embed` (video card). If `video_links` non-empty, reel format wins.
 
 ### Parsers
@@ -99,6 +102,7 @@ They call `ctx.fetcher.fetch(post_path, use_cookies)` to get a `FetchedPage`, th
 - **`ReelsParser`** (`reels.rs`) — short-form video. **Bug 1 fix:** `find_content_node` matches `creation_story` with `short_form_video_context` OR `videoDeliveryResponseFragment` (modern field) OR `videoDeliveryLegacyFields` OR `playable_url`. Owner-with-name found by scanning every block (the rich owner lives in a different block from `creation_story`).
 - **`VideoWatchParser`** (`video_watch.rs`) — `/watch` URLs. Generic-watch-feed canonical link → `NoData`.
 - **`StoriesParser`** (`stories.rs`) — NEW. Searches blocks for `unified_stories_with_notes.edges[0].node`, pulls `playable_url` (video) or `image.uri` (photo) from `attachments[0].media`. Owner from `bucket.owner.name`. Expired or login-walled story → `NoData` (24h auto-expiry).
+- **`CommentParser`** (`comment.rs`) — `?comment_id=` permalinks. Finds the comment node by `legacy_fbid`, `comment_id=` inside url fields, or base64-decoding node `id` (`comment:<post>_<id>`). Author rendered as `Name (💬)`; media via the shared `images_from_post`/`video_link_in_node` probes. Comment not server-rendered → `NoData` `(ccn)` and routes re-dispatches the stripped path.
 
 ### Video URL extraction (parsers/util.rs::video_link_in_node)
 
