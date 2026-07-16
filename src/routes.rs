@@ -532,7 +532,11 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     )
 }
 
-const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(5000);
+// Discord's embed crawler aborts ~10.0s after fetch start (measured 2026-07-16
+// by bisecting delayed-OG responses in a live channel: <=9.4s rendered every
+// time, 9.5-9.6s was flaky, >=9.7s never rendered). 8500ms keeps the whole
+// response inside the reliable zone with margin for edge/origin latency.
+const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(8500);
 
 async fn process_with_deadline(
     state: &AppState,
