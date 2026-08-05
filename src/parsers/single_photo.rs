@@ -28,11 +28,7 @@ impl Parser for SinglePhotoParser {
                 page.url.clone(),
             )
         })?;
-        let text = content_node
-            .pointer("/message/text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let text = longest_post_text(&content_node);
         let author = content_node
             .pointer("/owner/name")
             .and_then(|v| v.as_str())
@@ -76,6 +72,20 @@ fn get_content_node(blocks: &[Value]) -> Option<Value> {
     None
 }
 
+fn longest_post_text(content_node: &Value) -> &str {
+    [
+        content_node.pointer("/message_preferred_body/text"),
+        content_node.pointer("/container_story/message/text"),
+        content_node.pointer("/message/text"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .filter(|text| !text.trim().is_empty())
+    .max_by_key(|text| text.chars().count())
+    .unwrap_or("")
+}
+
 fn get_interactions_node(blocks: &[Value]) -> Option<Value> {
     for bloc in blocks {
         if jq::has(bloc, &["comet_ufi_summary_and_actions_renderer"]) {
@@ -97,7 +107,7 @@ fn get_single_image(blocks: &[Value]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_content_node, get_single_image};
+    use super::{get_content_node, get_single_image, longest_post_text};
     use serde_json::json;
 
     #[test]
@@ -113,6 +123,29 @@ mod tests {
         assert_eq!(
             get_single_image(&blocks).as_deref(),
             Some("https://img.example/single.jpg")
+        );
+    }
+
+    #[test]
+    fn prefers_full_caption_over_short_photo_preview() {
+        let blocks = vec![json!({
+            "message_preferred_body": {},
+            "container_story": {},
+            "data": {
+                "message": {"text": "Short preview..."},
+                "message_preferred_body": {
+                    "text": "Full caption with every paragraph preserved for Discord."
+                },
+                "container_story": {
+                    "message": {"text": "Medium caption"}
+                }
+            }
+        })];
+        let content = get_content_node(&blocks).expect("fixture must contain photo content");
+
+        assert_eq!(
+            longest_post_text(&content),
+            "Full caption with every paragraph preserved for Discord."
         );
     }
 }

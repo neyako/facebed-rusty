@@ -52,6 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/banner.png", get(banner))
         .route("/healthz", get(healthz))
         .route("/media", get(media))
+        .route("/api/v1/statuses/:id", get(activity_status))
         .route("/*path", get(catch_all))
         .with_state(state)
 }
@@ -98,12 +99,33 @@ fn html_response(body: String) -> Response {
 }
 
 fn json_response(body: String) -> Response {
+    json_status_response(StatusCode::OK, body)
+}
+
+fn json_status_response(status: StatusCode, body: String) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json; charset=utf-8"),
     );
-    (StatusCode::OK, headers, body).into_response()
+    (status, headers, body).into_response()
+}
+
+fn activity_error_response(status: StatusCode) -> Response {
+    let mut response = json_status_response(
+        status,
+        serde_json::json!({
+            "error": status.canonical_reason().unwrap_or("error"),
+        })
+        .to_string(),
+    );
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("2"),
+        );
+    }
+    response
 }
 
 fn busy_response() -> Response {
@@ -127,6 +149,43 @@ struct OEmbedParams {
 
 async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> Response {
     json_response(build_oembed_json(&p.author, &p.url, &p.kind))
+}
+
+async fn activity_status(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let (path, kind) = match activity_path(&id) {
+        Ok(activity) => activity,
+        Err(status) => return activity_error_response(status),
+    };
+
+    if let Ok(mut cache) = state.embed_cache.lock() {
+        if let Some(post) = cache.get_activity(&id, Instant::now()) {
+            return if post.video_links.is_empty() {
+                json_response(crate::activity::status_json(&id, &post))
+            } else {
+                activity_error_response(StatusCode::NOT_FOUND)
+            };
+        }
+    }
+
+    let _permit = match state.fetch_limit.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return activity_error_response(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let post = match tokio::time::timeout(DISCORD_RESPONSE_BUDGET, run_parser(&state, &path, kind))
+        .await
+    {
+        Ok(Ok(post)) if post.video_links.is_empty() => post,
+        Ok(Ok(_)) | Ok(Err(_)) => return activity_error_response(StatusCode::NOT_FOUND),
+        Err(_) => return activity_error_response(StatusCode::SERVICE_UNAVAILABLE),
+    };
+
+    if let Ok(mut cache) = state.embed_cache.lock() {
+        cache.insert_activity(&id, post.clone(), Instant::now());
+    }
+    json_response(crate::activity::status_json(&id, &post))
 }
 
 #[derive(serde::Deserialize)]
@@ -483,6 +542,39 @@ fn select_kind(working: &str) -> Option<ParserKind> {
     }
 }
 
+fn activity_path(id: &str) -> Result<(String, ParserKind), StatusCode> {
+    let mut path = crate::activity::decode_status_path(id).ok_or(StatusCode::BAD_REQUEST)?;
+    if let Some(group_post) = group_multi_permalink_path(&path) {
+        path = group_post;
+    }
+    if let Some(rewritten) = rewrite_videos_path(&path) {
+        path = rewritten;
+    }
+
+    let is_photocom = Url::parse(&url_clean::ensure_absolute(&path))
+        .ok()
+        .map(|url| {
+            url.query_pairs()
+                .any(|(key, value)| key == "type" && value.contains('3'))
+        })
+        .unwrap_or(false);
+    if crate::parsers::comment::comment_id_in(&path).is_some() || is_photocom {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    match select_kind(&path) {
+        Some(kind @ ParserKind::JsonPost) | Some(kind @ ParserKind::SinglePhoto) => {
+            Ok((path, kind))
+        }
+        Some(ParserKind::Photocom)
+        | Some(ParserKind::Reels)
+        | Some(ParserKind::Watch)
+        | Some(ParserKind::Stories)
+        | Some(ParserKind::Comment)
+        | None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 /// Drop comment_id/reply_comment_id so a failed comment lookup can re-dispatch
 /// as the plain post/video it hangs off.
 fn strip_comment_id(path: &str) -> String {
@@ -672,6 +764,11 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                 let render_started = Instant::now();
                 let body = render_with_size_check(state, &post, kind).await;
                 if let Ok(mut cache) = state.embed_cache.lock() {
+                    if activity_eligible(&post, kind) {
+                        if let Some(id) = crate::activity::status_id(&post.url) {
+                            cache.insert_activity(&id, post.clone(), Instant::now());
+                        }
+                    }
                     cache.insert(path, body.clone(), Instant::now());
                 }
                 info!(
@@ -813,6 +910,10 @@ fn is_retryable(e: &FacebedError) -> bool {
 /// caption + link embed instead of an `og:video`.
 const DISCORD_VIDEO_BYTE_LIMIT: u64 = 25 * 1024 * 1024;
 
+fn activity_eligible(post: &ParsedPost, kind: ParserKind) -> bool {
+    matches!(kind, ParserKind::JsonPost | ParserKind::SinglePhoto) && post.video_links.is_empty()
+}
+
 fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
     // Reels/Watch always render as a video card. For mixed-media JsonPosts (video
     // + images), prefer the image-grid embed so Discord can show the photos and
@@ -823,7 +924,7 @@ fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
     if force_reel || video_only {
         format_reel_post_embed(post, tz)
     } else {
-        format_full_post_embed(post, tz)
+        format_full_post_embed(post, tz, activity_eligible(post, kind))
     }
 }
 
@@ -953,10 +1054,115 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_healthz_json, build_oembed_json, group_multi_permalink_path, is_facebook_url,
-        media_target_allowed, rewrite_videos_path, scope_key, select_kind, strip_comment_id,
-        ParserKind,
+        activity_eligible, activity_error_response, activity_path, build_healthz_json,
+        build_oembed_json, group_multi_permalink_path, is_facebook_url, media_target_allowed,
+        rewrite_videos_path, scope_key, select_kind, strip_comment_id, ParserKind,
     };
+
+    fn activity_post() -> crate::parsers::ParsedPost {
+        crate::parsers::ParsedPost {
+            author_name: "Author".into(),
+            text: "Post".into(),
+            allow_discord_markdown: false,
+            image_links: vec!["https://img.example/post.jpg".into()],
+            url: "https://www.facebook.com/groups/example/posts/123".into(),
+            date: 0,
+            likes: "null".into(),
+            comments: "null".into(),
+            shares: "null".into(),
+            video_links: Vec::new(),
+            thumbnail: None,
+        }
+    }
+
+    #[test]
+    fn activity_eligibility_requires_video_free_json_or_single_photo() {
+        let post = activity_post();
+
+        assert!(activity_eligible(&post, ParserKind::JsonPost));
+        assert!(activity_eligible(&post, ParserKind::SinglePhoto));
+        for kind in [
+            ParserKind::Photocom,
+            ParserKind::Reels,
+            ParserKind::Watch,
+            ParserKind::Stories,
+            ParserKind::Comment,
+        ] {
+            assert!(!activity_eligible(&post, kind));
+        }
+
+        let mut mixed = post;
+        mixed
+            .video_links
+            .push("https://video.example/post.mp4".into());
+        assert!(!activity_eligible(&mixed, ParserKind::JsonPost));
+        assert!(!activity_eligible(&mixed, ParserKind::SinglePhoto));
+    }
+
+    #[test]
+    fn activity_service_unavailable_retries_after_two_seconds() {
+        let response = activity_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("2"))
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static(
+                "application/json; charset=utf-8"
+            ))
+        );
+    }
+
+    #[test]
+    fn activity_path_rejects_malformed_and_unsupported_ids() {
+        assert!(matches!(
+            activity_path("12x"),
+            Err(axum::http::StatusCode::BAD_REQUEST)
+        ));
+
+        let marketplace =
+            crate::activity::status_id("https://www.facebook.com/marketplace/item/123").unwrap();
+        assert!(matches!(
+            activity_path(&marketplace),
+            Err(axum::http::StatusCode::NOT_FOUND)
+        ));
+    }
+
+    #[test]
+    fn activity_path_accepts_video_free_parser_kinds() {
+        let group = crate::activity::status_id("https://www.facebook.com/groups/example/posts/123")
+            .unwrap();
+        let photo =
+            crate::activity::status_id("https://www.facebook.com/photo.php?fbid=123&id=456")
+                .unwrap();
+
+        assert!(matches!(
+            activity_path(&group),
+            Ok((path, ParserKind::JsonPost)) if path == "groups/example/posts/123"
+        ));
+        assert!(matches!(
+            activity_path(&photo),
+            Ok((path, ParserKind::SinglePhoto)) if path == "photo.php?fbid=123&id=456"
+        ));
+    }
+
+    #[test]
+    fn activity_path_rejects_video_story_and_comment_kinds() {
+        for url in [
+            "https://www.facebook.com/stories/123/abc",
+            "https://www.facebook.com/reel/123",
+            "https://www.facebook.com/watch?v=123",
+            "https://www.facebook.com/groups/example/posts/123?comment_id=456",
+        ] {
+            let id = crate::activity::status_id(url).unwrap();
+            assert!(matches!(
+                activity_path(&id),
+                Err(axum::http::StatusCode::NOT_FOUND)
+            ));
+        }
+    }
 
     #[test]
     fn videos_rewrite_preserves_query() {

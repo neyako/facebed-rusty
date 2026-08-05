@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod activity;
 mod config;
 mod cookies;
 mod crawler;

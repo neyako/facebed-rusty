@@ -10,10 +10,16 @@ pub const EMBED_CACHE_MAX: usize = 512;
 #[derive(Default)]
 pub struct EmbedCache {
     entries: HashMap<String, CachedEmbed>,
+    activity_entries: HashMap<String, CachedActivity>,
 }
 
 struct CachedEmbed {
     body: String,
+    stored_at: Instant,
+}
+
+struct CachedActivity {
+    post: crate::parsers::ParsedPost,
     stored_at: Instant,
 }
 
@@ -50,11 +56,58 @@ impl EmbedCache {
             },
         );
     }
+
+    pub fn get_activity(&mut self, id: &str, now: Instant) -> Option<crate::parsers::ParsedPost> {
+        let entry = self.activity_entries.get(id)?;
+        if now.duration_since(entry.stored_at) <= EMBED_CACHE_TTL {
+            return Some(entry.post.clone());
+        }
+        self.activity_entries.remove(id);
+        None
+    }
+
+    pub fn insert_activity(&mut self, id: &str, post: crate::parsers::ParsedPost, now: Instant) {
+        if self.activity_entries.len() >= EMBED_CACHE_MAX && !self.activity_entries.contains_key(id)
+        {
+            if let Some(oldest) = self
+                .activity_entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.stored_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.activity_entries.remove(&oldest);
+            }
+        }
+        self.activity_entries.insert(
+            id.to_owned(),
+            CachedActivity {
+                post,
+                stored_at: now,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsers::ParsedPost;
+
+    fn activity_post() -> ParsedPost {
+        ParsedPost {
+            author_name: "Author".into(),
+            text: "Post body".into(),
+            allow_discord_markdown: false,
+            image_links: Vec::new(),
+            url: "https://www.facebook.com/groups/example/posts/123".into(),
+            date: 0,
+            likes: "null".into(),
+            comments: "null".into(),
+            shares: "null".into(),
+            video_links: Vec::new(),
+            thumbnail: None,
+        }
+    }
 
     #[test]
     fn embed_cache_expires_and_bounds_entries() {
@@ -78,5 +131,45 @@ mod tests {
             cache.insert(&format!("p/{i}"), "x".into(), now);
         }
         assert!(cache.entries.len() <= EMBED_CACHE_MAX);
+    }
+
+    #[test]
+    fn activity_cache_expires_and_bounds_entries() {
+        let mut cache = EmbedCache::default();
+        let now = Instant::now();
+        let post = activity_post();
+
+        cache.insert_activity("123", post.clone(), now);
+        assert_eq!(
+            cache.get_activity("123", now).map(|cached| cached.text),
+            Some(post.text)
+        );
+        assert!(cache
+            .get_activity("123", now + EMBED_CACHE_TTL + Duration::from_secs(1))
+            .is_none());
+
+        for i in 0..=EMBED_CACHE_MAX {
+            cache.insert_activity(
+                &format!("activity/{i}"),
+                activity_post(),
+                now + Duration::from_millis(i as u64),
+            );
+        }
+        assert!(cache.activity_entries.len() <= EMBED_CACHE_MAX);
+        assert!(cache
+            .get_activity(
+                "activity/0",
+                now + Duration::from_millis((EMBED_CACHE_MAX + 1) as u64)
+            )
+            .is_none());
+        assert_eq!(
+            cache
+                .get_activity(
+                    &format!("activity/{}", EMBED_CACHE_MAX),
+                    now + Duration::from_millis((EMBED_CACHE_MAX + 1) as u64)
+                )
+                .map(|cached| cached.text),
+            Some("Post body".into())
+        );
     }
 }

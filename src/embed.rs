@@ -235,7 +235,7 @@ fn format_reactions(likes: &str, cmts: &str, shares: &str) -> String {
     parts.join(" • ").replace(',', ".")
 }
 
-pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
+pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32, activity_enabled: bool) -> String {
     let mut images = post.image_links.clone();
     let mut extra = String::new();
     if images.len() > 4 {
@@ -264,6 +264,11 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
         "video"
     };
     let oembed = oembed_link_tag(&post.author_name, &post.url, kind);
+    let activity = if activity_enabled {
+        crate::activity::alternate_link(&post.url)
+    } else {
+        String::new()
+    };
 
     format!(
         r##"<!DOCTYPE html>
@@ -280,6 +285,7 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     {image_meta}
     <link rel="canonical" href="{url_q}"/>
     {oembed}
+    {activity}
     <meta http-equiv="refresh" content="0;url={url_q}"/>
     <meta name="twitter:card" content="summary_large_image"/>
     <meta name="theme-color" content="#0866ff"/>
@@ -297,6 +303,7 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
         url_q = url_q,
         image_meta = image_meta,
         oembed = oembed,
+        activity = activity,
     )
 }
 
@@ -571,7 +578,7 @@ mod tests {
 
     #[test]
     fn full_embed_emits_image_and_escapes_attribute() {
-        let html = format_full_post_embed(&sample_post(), 0);
+        let html = format_full_post_embed(&sample_post(), 0, false);
 
         assert!(html.contains(r#"<meta property="og:image" content="https://img.example/p.jpg"/>"#));
         assert!(html.contains("Title &quot;quote&quot;"));
@@ -580,10 +587,29 @@ mod tests {
 
     #[test]
     fn full_embed_advertises_oembed_link() {
-        let html = format_full_post_embed(&sample_post(), 0);
+        let html = format_full_post_embed(&sample_post(), 0, false);
         let mime = ["application/json", "oembed"].join("+");
         assert!(html.contains(&format!(r#"type="{mime}""#)));
         assert!(html.contains("/oembed.json?author="));
+    }
+
+    #[test]
+    fn full_embed_advertises_activity_status() {
+        let post = sample_post();
+        let id = crate::activity::status_id(&post.url).unwrap();
+
+        let html = format_full_post_embed(&post, 0, true);
+
+        assert!(html.contains(&format!("/users/facebed/statuses/{id}")));
+        assert!(html.contains(r#"type="application/activity+json""#));
+    }
+
+    #[test]
+    fn full_embed_omits_activity_status_when_disabled() {
+        let html = format_full_post_embed(&sample_post(), 0, false);
+
+        assert!(!html.contains("/users/facebed/statuses/"));
+        assert!(!html.contains(r#"type="application/activity+json""#));
     }
 
     #[test]
