@@ -262,7 +262,9 @@ pub fn format_full_post_embed(
     let post_date = format_timestamp(post.date, tz_offset);
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
-    let kind = if post.video_links.is_empty() {
+    let kind = if activity_origin.is_some() {
+        "rich"
+    } else if post.video_links.is_empty() {
         "link"
     } else {
         "video"
@@ -593,6 +595,7 @@ mod tests {
         let mime = ["application/json", "oembed"].join("+");
         assert!(html.contains(&format!(r#"type="{mime}""#)));
         assert!(html.contains("/oembed.json?author="));
+        assert!(html.contains("&amp;type=link"));
     }
 
     #[test]
@@ -606,6 +609,7 @@ mod tests {
             "https://facebed.example/users/facebed/statuses/{id}"
         )));
         assert!(html.contains(r#"type="application/activity+json""#));
+        assert!(html.contains("&amp;type=rich"));
     }
 
     #[test]
