@@ -63,8 +63,10 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         .enumerate()
         .map(|(index, url)| {
             json!({
-                "id": format!("{id}-{index}"), "type": "image", "url": url,
-                "preview_url": url, "remote_url": null, "description": null, "meta": null,
+                "id": (index + 1).to_string(), "type": "image", "url": url,
+                "preview_url": null, "remote_url": null, "preview_remote_url": null,
+                "text_url": null, "description": null,
+                "meta": { "original": { "width": 0, "height": 0 } },
             })
         })
         .collect::<Vec<_>>();
@@ -116,7 +118,7 @@ fn status_content(post: &crate::parsers::ParsedPost) -> String {
 mod tests {
     use super::{alternate_link, decode_status_path, status_id, status_json};
     use crate::parsers::ParsedPost;
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
         ParsedPost {
@@ -204,7 +206,8 @@ mod tests {
     }
 
     #[test]
-    fn status_json_keeps_three_image_attachments_in_source_order() {
+    fn status_json_keeps_mastodon_image_attachments_in_source_order() {
+        // Given
         let post = post(
             "gallery".to_owned(),
             vec![
@@ -214,17 +217,30 @@ mod tests {
             ],
         );
 
+        // When
         let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
         let attachments = json["media_attachments"].as_array().unwrap();
 
+        // Then
         assert_eq!(attachments.len(), 3);
-        for (attachment, url) in attachments.iter().zip([
-            "https://img.example/first.jpg",
-            "https://img.example/second.jpg",
-            "https://img.example/third.jpg",
-        ]) {
-            assert_eq!(attachment["type"], "image");
-            assert_eq!(attachment["url"], url);
+        for (index, (attachment, url)) in attachments
+            .iter()
+            .zip([
+                "https://img.example/first.jpg",
+                "https://img.example/second.jpg",
+                "https://img.example/third.jpg",
+            ])
+            .enumerate()
+        {
+            assert_eq!(
+                attachment,
+                &json!({
+                    "id": (index + 1).to_string(), "type": "image", "url": url,
+                    "preview_url": null, "remote_url": null, "preview_remote_url": null,
+                    "text_url": null, "description": null,
+                    "meta": { "original": { "width": 0, "height": 0 } },
+                })
+            );
         }
     }
 
