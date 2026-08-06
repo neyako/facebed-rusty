@@ -2,6 +2,7 @@ use crate::url_clean;
 use chrono::{SecondsFormat, TimeZone, Utc};
 use html_escape::encode_text;
 use serde_json::json;
+use url::Url;
 
 const MAX_STATUS_BYTES: usize = 2_048;
 
@@ -39,10 +40,17 @@ pub fn decode_status_path(id: &str) -> Option<String> {
     Some(url_clean::clean_path(&post_url))
 }
 
-pub fn alternate_link(post_url: &str) -> String {
+pub fn alternate_link(post_url: &str, public_origin: &str) -> String {
+    let Ok(origin) = Url::parse(public_origin) else {
+        return String::new();
+    };
+    if !matches!(origin.scheme(), "http" | "https") || origin.host_str().is_none() {
+        return String::new();
+    }
+    let origin = origin.origin().ascii_serialization();
     status_id(post_url).map_or_else(String::new, |id| {
         format!(
-            r#"<link href="/users/facebed/statuses/{id}" rel="alternate" type="application/activity+json"/>"#
+            r#"<link href="{origin}/users/facebed/statuses/{id}" rel="alternate" type="application/activity+json"/>"#
         )
     })
 }
@@ -160,17 +168,20 @@ mod tests {
     }
 
     #[test]
-    fn alternate_link_uses_status_id_for_facebook_posts() {
+    fn alternate_link_uses_absolute_origin_for_facebook_posts() {
         let post_url = "https://www.facebook.com/posts/123";
         let id = status_id(post_url).unwrap();
 
         assert_eq!(
-            alternate_link(post_url),
+            alternate_link(post_url, "https://facebed.example"),
             format!(
-                r#"<link href="/users/facebed/statuses/{id}" rel="alternate" type="application/activity+json"/>"#
+                r#"<link href="https://facebed.example/users/facebed/statuses/{id}" rel="alternate" type="application/activity+json"/>"#
             )
         );
-        assert_eq!(alternate_link("https://example.com/x"), "");
+        assert_eq!(
+            alternate_link("https://example.com/x", "https://facebed.example"),
+            ""
+        );
     }
 
     #[test]

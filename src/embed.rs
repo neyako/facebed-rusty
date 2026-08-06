@@ -235,7 +235,11 @@ fn format_reactions(likes: &str, cmts: &str, shares: &str) -> String {
     parts.join(" • ").replace(',', ".")
 }
 
-pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32, activity_enabled: bool) -> String {
+pub fn format_full_post_embed(
+    post: &ParsedPost,
+    tz_offset: i32,
+    activity_origin: Option<&str>,
+) -> String {
     let mut images = post.image_links.clone();
     let mut extra = String::new();
     if images.len() > 4 {
@@ -264,11 +268,9 @@ pub fn format_full_post_embed(post: &ParsedPost, tz_offset: i32, activity_enable
         "video"
     };
     let oembed = oembed_link_tag(&post.author_name, &post.url, kind);
-    let activity = if activity_enabled {
-        crate::activity::alternate_link(&post.url)
-    } else {
-        String::new()
-    };
+    let activity = activity_origin.map_or_else(String::new, |origin| {
+        crate::activity::alternate_link(&post.url, origin)
+    });
 
     format!(
         r##"<!DOCTYPE html>
@@ -578,7 +580,7 @@ mod tests {
 
     #[test]
     fn full_embed_emits_image_and_escapes_attribute() {
-        let html = format_full_post_embed(&sample_post(), 0, false);
+        let html = format_full_post_embed(&sample_post(), 0, None);
 
         assert!(html.contains(r#"<meta property="og:image" content="https://img.example/p.jpg"/>"#));
         assert!(html.contains("Title &quot;quote&quot;"));
@@ -587,7 +589,7 @@ mod tests {
 
     #[test]
     fn full_embed_advertises_oembed_link() {
-        let html = format_full_post_embed(&sample_post(), 0, false);
+        let html = format_full_post_embed(&sample_post(), 0, None);
         let mime = ["application/json", "oembed"].join("+");
         assert!(html.contains(&format!(r#"type="{mime}""#)));
         assert!(html.contains("/oembed.json?author="));
@@ -598,15 +600,17 @@ mod tests {
         let post = sample_post();
         let id = crate::activity::status_id(&post.url).unwrap();
 
-        let html = format_full_post_embed(&post, 0, true);
+        let html = format_full_post_embed(&post, 0, Some("https://facebed.example"));
 
-        assert!(html.contains(&format!("/users/facebed/statuses/{id}")));
+        assert!(html.contains(&format!(
+            "https://facebed.example/users/facebed/statuses/{id}"
+        )));
         assert!(html.contains(r#"type="application/activity+json""#));
     }
 
     #[test]
     fn full_embed_omits_activity_status_when_disabled() {
-        let html = format_full_post_embed(&sample_post(), 0, false);
+        let html = format_full_post_embed(&sample_post(), 0, None);
 
         assert!(!html.contains("/users/facebed/statuses/"));
         assert!(!html.contains(r#"type="application/activity+json""#));

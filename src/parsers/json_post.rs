@@ -3,10 +3,11 @@ use crate::fetch::{get_json_block_texts, FetchedPage, JsonBlockText};
 use crate::jq;
 use crate::parsers::util::{interaction_counts, val_str_at, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
-use crate::url_clean::ensure_absolute;
+use crate::url_clean::{self, ensure_absolute};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
+use url::Url;
 
 pub struct JsonPostParser;
 
@@ -99,16 +100,14 @@ fn parse_page(
     })
 }
 
-/// Find the JSON block describing the requested post. When `post_id` is provided, only
-/// blocks whose serialized payload mentions that ID are accepted — without this guard
-/// FB feeds (group landing pages, ad-injected feeds) cause the parser to latch onto
-/// whichever featured/suggested post happens to be the biggest block, returning a
-/// completely unrelated embed (e.g. a Meta-for-Business ad).
+/// Find the JSON block describing the requested post. When `post_id` is provided, the
+/// selected story's canonical URL must carry that exact ID. Without this guard, FB feeds
+/// can make the parser latch onto a larger featured or suggested post instead.
 fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Value> {
     // First pass: id-aware match.
     if let Some(pid) = post_id {
         for block in blocks {
-            if !block.text.contains("i18n_reaction_count") || !block.text.contains(pid) {
+            if !block.text.contains("i18n_reaction_count") {
                 continue;
             }
             let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
@@ -117,17 +116,17 @@ fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Valu
             if !jq::has(&bloc, &["i18n_reaction_count"]) {
                 continue;
             }
-            return Some(bloc);
+            let Some(story_url) = get_root_node(&bloc)
+                .and_then(|root| root.pointer("/content/story/wwwURL"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if canonical_story_post_id(story_url).as_deref() == Some(pid) {
+                return Some(bloc);
+            }
         }
-        // No block matched a numeric requested id — return None so the caller can
-        // raise NoData/Parse instead of serving a wrong-post embed. Falling back
-        // to any i18n_reaction_count block here is what produced the bug.
-        //
-        // pfbid URLs can be rewritten by FB to a different canonical pfbid inside
-        // the JSON, so keep the older fallback for non-numeric ids.
-        if pid.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
+        return None;
     }
 
     // No id available (very old paths) — fall back to first reaction block.
@@ -265,6 +264,70 @@ fn extract_post_id(post_path: &str) -> Option<String> {
         .find_map(|m| m.map(|x| x.as_str().to_owned()))
 }
 
+fn canonical_story_post_id(story_url: &str) -> Option<String> {
+    if story_url.trim() != story_url || story_url.contains('\\') {
+        return None;
+    }
+    let parsed = Url::parse(story_url).ok()?;
+    let host = parsed.host_str()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !url_clean::is_facebook_page_host(host)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+    {
+        return None;
+    }
+
+    let identity_queries = parsed
+        .query_pairs()
+        .filter(|(key, _)| matches!(key.as_ref(), "story_fbid" | "multi_permalinks"))
+        .collect::<Vec<_>>();
+
+    let path = parsed.path().strip_prefix('/')?;
+    let path = path.strip_suffix('/').unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    let path_id = match segments.as_slice() {
+        ["groups", _, "posts", id] | ["groups", _, "permalink", id] => Some(*id),
+        [owner, "posts", id] if *owner != "groups" => Some(*id),
+        [owner, "posts", _, id] if *owner != "groups" => Some(*id),
+        ["permalink", id] => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = path_id {
+        if !identity_queries.is_empty() {
+            return None;
+        }
+        return valid_post_id(id).then(|| id.to_owned());
+    }
+
+    let query_key = if matches!(segments.as_slice(), ["story.php"] | ["permalink.php"]) {
+        "story_fbid"
+    } else if matches!(segments.as_slice(), ["groups", _]) {
+        "multi_permalinks"
+    } else {
+        return None;
+    };
+
+    let [(key, id)] = identity_queries.as_slice() else {
+        return None;
+    };
+    if key.as_ref() != query_key || !valid_post_id(id) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn valid_post_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 fn is_group_post_path(post_path: &str) -> bool {
     post_path.trim_start_matches('/').starts_with("groups/")
 }
@@ -315,7 +378,221 @@ fn get_group_name(blocks: &[JsonBlockText]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_post_id, is_group_post_path, should_try_partial_fetch, PostBlockScanner};
+    use super::{
+        extract_post_id, get_post_json, get_root_node, is_group_post_path,
+        should_try_partial_fetch, PostBlockScanner,
+    };
+    use crate::fetch::JsonBlockText;
+    use serde_json::json;
+
+    fn post_block(story_url: &str, marker: &str) -> JsonBlockText {
+        JsonBlockText {
+            text: json!({
+                "i18n_reaction_count": "1",
+                "data": {
+                    "comet_ufi_summary_and_actions_renderer": {},
+                    "content": { "story": {
+                        "wwwURL": story_url,
+                        "actors": [{"id": marker, "name": marker}],
+                        "message": {"text": marker}
+                    }}
+                }
+            })
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn pfbid_canonical_rewrite_without_exact_id_fails_closed() {
+        let mut unrelated = post_block(
+            "https://www.facebook.com/quata.pham/posts/pfbidUNRELATED",
+            "unrelated",
+        );
+        let mut unrelated_json: serde_json::Value = serde_json::from_str(&unrelated.text).unwrap();
+        unrelated_json["data"]["content"]["story"]["request_id"] = json!("pfbidREQUESTED");
+        unrelated.text = unrelated_json.to_string();
+        let blocks = vec![
+            unrelated,
+            post_block(
+                "https://www.facebook.com/dantech0xff/posts/pfbidCANONICAL",
+                "target",
+            ),
+        ];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_rewrite_rejects_ambiguous_stories_from_requested_owner() {
+        let blocks = vec![
+            post_block(
+                "https://www.facebook.com/dantech0xff/posts/pfbidFIRST",
+                "first",
+            ),
+            post_block(
+                "https://www.facebook.com/dantech0xff/posts/pfbidSECOND",
+                "second",
+            ),
+        ];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_ignores_requested_id_in_unrelated_story_query() {
+        let blocks = vec![
+            post_block(
+                "https://www.facebook.com/quata.pham/posts/pfbidUNRELATED?next=pfbidREQUESTED",
+                "unrelated",
+            ),
+            post_block(
+                "https://www.facebook.com/dantech0xff/posts/pfbidREQUESTED",
+                "target",
+            ),
+        ];
+
+        let selected = get_post_json(&blocks, Some("pfbidREQUESTED")).unwrap();
+
+        assert_eq!(
+            get_root_node(&selected)
+                .and_then(|root| root.pointer("/content/story/wwwURL"))
+                .and_then(|url| url.as_str()),
+            Some("https://www.facebook.com/dantech0xff/posts/pfbidREQUESTED")
+        );
+    }
+
+    #[test]
+    fn numeric_id_match_ignores_requested_id_in_unrelated_story_data() {
+        let mut unrelated =
+            post_block("https://www.facebook.com/quata.pham/posts/999", "unrelated");
+        let mut unrelated_json: serde_json::Value = serde_json::from_str(&unrelated.text).unwrap();
+        unrelated_json["data"]["content"]["story"]["request_id"] = json!("123");
+        unrelated.text = unrelated_json.to_string();
+        let blocks = vec![
+            unrelated,
+            post_block("https://www.facebook.com/dantech0xff/posts/123", "target"),
+        ];
+
+        let selected = get_post_json(&blocks, Some("123")).unwrap();
+
+        assert_eq!(
+            get_root_node(&selected)
+                .and_then(|root| root.pointer("/content/story/wwwURL"))
+                .and_then(|url| url.as_str()),
+            Some("https://www.facebook.com/dantech0xff/posts/123")
+        );
+    }
+
+    #[test]
+    fn pfbid_rewrite_rejects_matching_owner_from_non_facebook_host() {
+        let blocks = vec![post_block(
+            "https://example.com/dantech0xff/posts/pfbidCANONICAL",
+            "external",
+        )];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_rejects_non_facebook_story_url() {
+        let blocks = vec![post_block(
+            "https://example.com/dantech0xff/posts/pfbidREQUESTED",
+            "external",
+        )];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_ignores_requested_path_inside_unrelated_query() {
+        let blocks = vec![post_block(
+            "https://www.facebook.com/somewhere?next=/posts/pfbidREQUESTED",
+            "unrelated",
+        )];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_rejects_story_fbid_on_unrelated_path() {
+        let blocks = vec![post_block(
+            "https://www.facebook.com/somewhere?story_fbid=pfbidREQUESTED",
+            "unrelated",
+        )];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_rejects_protocol_relative_external_url() {
+        let blocks = vec![post_block("//example.com/posts/pfbidREQUESTED", "external")];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_accepts_story_php_identity_query() {
+        let blocks = vec![post_block(
+            "https://www.facebook.com/story.php?story_fbid=pfbidREQUESTED&id=123",
+            "target",
+        )];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_some());
+    }
+
+    #[test]
+    fn numeric_exact_match_accepts_group_multi_permalink_identity_query() {
+        let blocks = vec![post_block(
+            "https://www.facebook.com/groups/123/?multi_permalinks=456",
+            "target",
+        )];
+
+        assert!(get_post_json(&blocks, Some("456")).is_some());
+    }
+
+    #[test]
+    fn pfbid_exact_match_rejects_ambiguous_identity_path() {
+        let blocks = vec![post_block(
+            "https://www.facebook.com/owner/posts/slug/pfbidREQUESTED/permalink/pfbidOTHER",
+            "ambiguous",
+        )];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_rejects_empty_path_segments() {
+        for story_url in [
+            "https://www.facebook.com/owner//posts/pfbidREQUESTED",
+            "https://www.facebook.com//owner/posts/pfbidREQUESTED",
+        ] {
+            let blocks = vec![post_block(story_url, "malformed")];
+
+            assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+        }
+    }
+
+    #[test]
+    fn pfbid_exact_match_rejects_conflicting_identity_query() {
+        let blocks = vec![post_block(
+            "https://www.facebook.com/owner/posts/pfbidREQUESTED?story_fbid=pfbidOTHER",
+            "ambiguous",
+        )];
+
+        assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_exact_match_rejects_noncanonical_url_syntax() {
+        for story_url in [
+            "https://www.facebook.com:444/owner/posts/pfbidREQUESTED",
+            "https://www.facebook.com/owner\\posts\\pfbidREQUESTED",
+        ] {
+            let blocks = vec![post_block(story_url, "noncanonical")];
+
+            assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+        }
+    }
 
     #[test]
     fn extracts_numeric_post_id() {

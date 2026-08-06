@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/media", get(media))
         .route("/api/v1/statuses/:id", get(activity_status))
+        .route("/users/facebed/statuses/:id", get(activity_status))
         .route("/*path", get(catch_all))
         .with_state(state)
 }
@@ -391,6 +392,7 @@ async fn catch_all(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let is_bot = crawler::is_crawler(ua);
+    let activity_origin = request_origin(&headers);
     info!(path = %path, bot = is_bot, ua = %ua, "request");
     let started = Instant::now();
 
@@ -403,7 +405,15 @@ async fn catch_all(
             .collect();
         if types.iter().any(|t| t.contains('3')) {
             let cleaned = url_clean::clean_path(&path);
-            return process(&state, &cleaned, ParserKind::Photocom).await;
+            return process(
+                &state,
+                PostRequest {
+                    path: &cleaned,
+                    kind: ParserKind::Photocom,
+                    activity_origin: activity_origin.as_deref(),
+                },
+            )
+            .await;
         }
     }
 
@@ -493,7 +503,44 @@ async fn catch_all(
     };
 
     info!(working = %working, kind = ?kind, "dispatch");
-    process_with_deadline(&state, &working, kind, started).await
+    process_with_deadline(
+        &state,
+        PostRequest {
+            path: &working,
+            kind,
+            activity_origin: activity_origin.as_deref(),
+        },
+        started,
+    )
+    .await
+}
+
+fn request_origin(headers: &HeaderMap) -> Option<String> {
+    let host = headers.get(axum::http::header::HOST)?.to_str().ok()?.trim();
+    let mut forwarded_proto = headers.get_all("x-forwarded-proto").iter();
+    let scheme = match forwarded_proto.next() {
+        Some(value) => {
+            if forwarded_proto.next().is_some() {
+                return None;
+            }
+            value.to_str().ok()?.trim()
+        }
+        None => "https",
+    };
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let parsed = Url::parse(&format!("{scheme}://{host}")).ok()?;
+    if parsed.host_str().is_none()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
 }
 
 fn path_only(s: &str) -> Option<String> {
@@ -674,7 +721,26 @@ enum ParserKind {
     Comment,
 }
 
-async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
+#[derive(Clone, Copy)]
+struct PostRequest<'a> {
+    path: &'a str,
+    kind: ParserKind,
+    activity_origin: Option<&'a str>,
+}
+
+impl PostRequest<'_> {
+    fn cache_key(&self) -> String {
+        self.activity_origin.map_or_else(
+            || self.path.to_owned(),
+            |origin| format!("{origin}\n{}", self.path),
+        )
+    }
+}
+
+async fn process(state: &AppState, request: PostRequest<'_>) -> Response {
+    let path = request.path;
+    let kind = request.kind;
+    let cache_key = request.cache_key();
     state
         .metrics
         .requests
@@ -683,7 +749,7 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
     {
         let now = Instant::now();
         if let Ok(mut cache) = state.embed_cache.lock() {
-            if let Some(body) = cache.get(path, now) {
+            if let Some(body) = cache.get(&cache_key, now) {
                 info!(path = %path, cached = true, "embed cache hit");
                 return html_response(body);
             }
@@ -762,14 +828,14 @@ async fn process(state: &AppState, path: &str, kind: ParserKind) -> Response {
                     }
                 }
                 let render_started = Instant::now();
-                let body = render_with_size_check(state, &post, kind).await;
+                let body = render_with_size_check(state, &post, request).await;
                 if let Ok(mut cache) = state.embed_cache.lock() {
                     if activity_eligible(&post, kind) {
                         if let Some(id) = crate::activity::status_id(&post.url) {
                             cache.insert_activity(&id, post.clone(), Instant::now());
                         }
                     }
-                    cache.insert(path, body.clone(), Instant::now());
+                    cache.insert(&cache_key, body.clone(), Instant::now());
                 }
                 info!(
                     path = %path,
@@ -827,12 +893,12 @@ const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(8500);
 
 async fn process_with_deadline(
     state: &AppState,
-    path: &str,
-    kind: ParserKind,
+    request: PostRequest<'_>,
     started: Instant,
 ) -> Response {
+    let path = request.path;
     let elapsed = started.elapsed();
-    let full_scrape = process(state, path, kind);
+    let full_scrape = process(state, request);
     tokio::pin!(full_scrape);
 
     if let Some(remaining) = DISCORD_RESPONSE_BUDGET.checked_sub(elapsed) {
@@ -914,7 +980,8 @@ fn activity_eligible(post: &ParsedPost, kind: ParserKind) -> bool {
     matches!(kind, ParserKind::JsonPost | ParserKind::SinglePhoto) && post.video_links.is_empty()
 }
 
-fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
+fn render(post: &ParsedPost, tz: i32, request: PostRequest<'_>) -> String {
+    let kind = request.kind;
     // Reels/Watch always render as a video card. For mixed-media JsonPosts (video
     // + images), prefer the image-grid embed so Discord can show the photos and
     // text — Discord only renders one og:video per embed anyway, so the video
@@ -924,14 +991,21 @@ fn render(post: &ParsedPost, tz: i32, kind: ParserKind) -> String {
     if force_reel || video_only {
         format_reel_post_embed(post, tz)
     } else {
-        format_full_post_embed(post, tz, activity_eligible(post, kind))
+        let activity_origin = request
+            .activity_origin
+            .filter(|_| activity_eligible(post, kind));
+        format_full_post_embed(post, tz, activity_origin)
     }
 }
 
-async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: ParserKind) -> String {
+async fn render_with_size_check(
+    state: &AppState,
+    post: &ParsedPost,
+    request: PostRequest<'_>,
+) -> String {
     let tz = state.config.load().timezone;
     let Some(video_url) = post.video_links.first() else {
-        return render(post, tz, kind);
+        return render(post, tz, request);
     };
     let Some(size) = state.fetcher.head_content_length(video_url).await else {
         // Server didn't advertise Content-Length — assume it's fine and let
@@ -941,10 +1015,10 @@ async fn render_with_size_check(state: &AppState, post: &ParsedPost, kind: Parse
             url = %post.url,
             "video size unavailable; rendering inline video embed"
         );
-        return render(post, tz, kind);
+        return render(post, tz, request);
     };
     if size <= DISCORD_VIDEO_BYTE_LIMIT {
-        return render(post, tz, kind);
+        return render(post, tz, request);
     }
     info!(
         url = %post.url,
@@ -1056,8 +1130,204 @@ mod tests {
     use super::{
         activity_eligible, activity_error_response, activity_path, build_healthz_json,
         build_oembed_json, group_multi_permalink_path, is_facebook_url, media_target_allowed,
-        rewrite_videos_path, scope_key, select_kind, strip_comment_id, ParserKind,
+        request_origin, rewrite_videos_path, router, scope_key, select_kind, strip_comment_id,
+        AppState, Metrics, ParserKind,
     };
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let config = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::config::Config::default(),
+        ));
+        let cookies = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::cookies::CookieJar::empty(),
+        ));
+        let fetcher = Arc::new(crate::fetch::Fetcher::new(cookies.clone()).expect("test fetcher"));
+        let ctx = Arc::new(crate::parsers::ParserCtx {
+            fetcher: fetcher.clone(),
+            cookies,
+            config: config.clone(),
+        });
+
+        AppState {
+            config,
+            ctx,
+            notifier: crate::notifier::Notifier::new(String::new(), fetcher.client().clone()),
+            fetcher,
+            embed_cache: Arc::new(std::sync::Mutex::new(
+                crate::embed_cache::EmbedCache::default(),
+            )),
+            fetch_limit: Arc::new(tokio::sync::Semaphore::new(0)),
+            metrics: Arc::new(Metrics::default()),
+            started_at: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_alias_returns_cached_status_json_when_preloaded() {
+        // Given
+        let state = test_state();
+        let post = activity_post();
+        let id = crate::activity::status_id(&post.url).expect("activity status id");
+        let expected = crate::activity::status_json(&id, &post);
+        state
+            .embed_cache
+            .lock()
+            .expect("activity cache")
+            .insert_activity(&id, post, Instant::now());
+        let request = Request::builder()
+            .uri(format!("/users/facebed/statuses/{id}"))
+            .body(Body::empty())
+            .expect("activity request");
+
+        // When
+        let response = router(state)
+            .oneshot(request)
+            .await
+            .expect("route response");
+
+        // Then
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static(
+                "application/json; charset=utf-8"
+            ))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("activity response body");
+        assert_eq!(&body[..], expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn bot_request_selects_matching_origin_over_other_and_legacy_cache() {
+        // Given
+        let state = test_state();
+        let path = "groups/example/posts/123";
+        {
+            let mut cache = state.embed_cache.lock().expect("embed cache");
+            cache.insert(
+                &format!("https://origin-a.example\n{path}"),
+                "origin-a cached HTML".into(),
+                Instant::now(),
+            );
+            cache.insert(
+                &format!("https://origin-b.example\n{path}"),
+                "origin-b cached HTML".into(),
+                Instant::now(),
+            );
+            cache.insert(path, "legacy cached HTML".into(), Instant::now());
+        }
+        let request = Request::builder()
+            .uri(format!("/{path}"))
+            .header(header::HOST, "origin-b.example")
+            .header("x-forwarded-proto", "https")
+            .header(header::USER_AGENT, "Discordbot/2.0")
+            .body(Body::empty())
+            .expect("bot request");
+
+        // When
+        let response = router(state)
+            .oneshot(request)
+            .await
+            .expect("route response");
+
+        // Then
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("cached response body");
+        assert_eq!(&body[..], b"origin-b cached HTML");
+    }
+
+    #[test]
+    fn request_origin_uses_forwarded_https_host() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("facebed.example"),
+        );
+        headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("https"),
+        );
+
+        assert_eq!(
+            request_origin(&headers).as_deref(),
+            Some("https://facebed.example")
+        );
+    }
+
+    #[test]
+    fn request_origin_rejects_authority_with_userinfo_path_or_query() {
+        for host in [
+            "attacker@facebed.example",
+            "facebed.example/hidden",
+            "facebed.example?next=hidden",
+        ] {
+            // Given
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::HOST,
+                axum::http::HeaderValue::from_static(host),
+            );
+
+            // When
+            let origin = request_origin(&headers);
+
+            // Then
+            assert_eq!(origin, None, "host must be rejected: {host}");
+        }
+    }
+
+    #[test]
+    fn request_origin_rejects_unsupported_forwarded_proto() {
+        // Given
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("facebed.example"),
+        );
+        headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("ftp"),
+        );
+
+        // When
+        let origin = request_origin(&headers);
+
+        // Then
+        assert_eq!(origin, None);
+    }
+
+    #[test]
+    fn request_origin_rejects_multi_valued_forwarded_proto() {
+        // Given
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("facebed.example"),
+        );
+        headers.append(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("https"),
+        );
+        headers.append(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("http"),
+        );
+
+        // When
+        let origin = request_origin(&headers);
+
+        // Then
+        assert_eq!(origin, None);
+    }
 
     fn activity_post() -> crate::parsers::ParsedPost {
         crate::parsers::ParsedPost {
