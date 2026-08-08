@@ -76,9 +76,11 @@ fn parse_page(
 ) -> FacebedResult<ParsedPostDraft> {
     let html = page.document();
     let blocks = get_json_block_texts(html, true);
-    let post_json = get_post_json(&blocks, post_id).ok_or_else(|| {
-        FacebedError::parse_with("cannot find post json", page.html.clone(), page.url.clone())
-    })?;
+    let canonical_post_id = canonical_page_post_id(html);
+    let post_json = get_post_json_for_page(&blocks, post_id, canonical_post_id.as_deref())
+        .ok_or_else(|| {
+            FacebedError::parse_with("cannot find post json", page.html.clone(), page.url.clone())
+        })?;
     let root = get_root_node(&post_json).ok_or_else(|| {
         FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
     })?;
@@ -144,10 +146,17 @@ fn parse_page(
     })
 }
 
-/// Find the JSON block describing the requested post. When `post_id` is provided, the
-/// selected story's canonical URL must carry that exact ID. Without this guard, FB feeds
-/// can make the parser latch onto a larger featured or suggested post instead.
+/// Select the requested story using its URL ID or Facebook's page-canonical post ID.
+#[cfg(test)]
 fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Value> {
+    get_post_json_for_page(blocks, post_id, None)
+}
+
+fn get_post_json_for_page(
+    blocks: &[JsonBlockText],
+    post_id: Option<&str>,
+    canonical_post_id: Option<&str>,
+) -> Option<Value> {
     // First pass: id-aware match.
     if let Some(pid) = post_id {
         for block in blocks {
@@ -160,13 +169,13 @@ fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Valu
             if !jq::has(&bloc, &["i18n_reaction_count"]) {
                 continue;
             }
-            let Some(story_url) = get_root_node(&bloc)
-                .and_then(|root| root.pointer("/content/story/wwwURL"))
-                .and_then(Value::as_str)
+            let Some(story) = get_root_node(&bloc).and_then(|root| root.pointer("/content/story"))
             else {
                 continue;
             };
-            if canonical_story_post_id(story_url).as_deref() == Some(pid) {
+            if story_matches_post_id(story, pid)
+                || canonical_post_id.is_some_and(|id| story_matches_post_id(story, id))
+            {
                 return Some(bloc);
             }
         }
@@ -186,6 +195,45 @@ fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Valu
         }
     }
     None
+}
+
+fn story_matches_post_id(story: &Value, post_id: &str) -> bool {
+    story
+        .get("post_id")
+        .is_some_and(|value| value_matches_post_id(value, post_id))
+        || story
+            .get("wwwURL")
+            .and_then(Value::as_str)
+            .and_then(canonical_story_post_id)
+            .as_deref()
+            == Some(post_id)
+}
+
+fn value_matches_post_id(value: &Value, post_id: &str) -> bool {
+    match value {
+        Value::String(value) => value == post_id,
+        Value::Number(value) => value.to_string() == post_id,
+        _ => false,
+    }
+}
+
+static PAGE_CANONICAL_LINK_SEL: Lazy<scraper::Selector> =
+    Lazy::new(|| scraper::Selector::parse(r#"link[rel="canonical"]"#).unwrap());
+static PAGE_OG_URL_SEL: Lazy<scraper::Selector> =
+    Lazy::new(|| scraper::Selector::parse(r#"meta[property="og:url"]"#).unwrap());
+
+fn canonical_page_post_id(html: &scraper::Html) -> Option<String> {
+    [
+        (&*PAGE_CANONICAL_LINK_SEL, "href"),
+        (&*PAGE_OG_URL_SEL, "content"),
+    ]
+    .into_iter()
+    .find_map(|(selector, attribute)| {
+        html.select(selector)
+            .next()
+            .and_then(|element| element.value().attr(attribute))
+            .and_then(canonical_story_post_id)
+    })
 }
 
 fn should_try_partial_fetch(post_id: Option<&str>) -> bool {
@@ -414,10 +462,12 @@ fn get_root_node(post_json: &Value) -> Option<&Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_post_id, get_post_json, get_root_node, group_handle_from_post_path,
-        is_group_post_path, should_try_partial_fetch, PostBlockScanner,
+        canonical_page_post_id, extract_post_id, get_post_json, get_post_json_for_page,
+        get_root_node, group_handle_from_post_path, is_group_post_path, should_try_partial_fetch,
+        PostBlockScanner,
     };
     use crate::fetch::JsonBlockText;
+    use scraper::Html;
     use serde_json::json;
 
     fn post_block(story_url: &str, marker: &str) -> JsonBlockText {
@@ -455,6 +505,52 @@ mod tests {
         ];
 
         assert!(get_post_json(&blocks, Some("pfbidREQUESTED")).is_none());
+    }
+
+    #[test]
+    fn pfbid_rewrite_accepts_story_proven_by_page_canonical_post_id() {
+        // Given
+        let mut target = post_block(
+            "https://www.facebook.com/dantech0xff/posts/pfbidCANONICAL",
+            "target",
+        );
+        let mut target_json: serde_json::Value = serde_json::from_str(&target.text).unwrap();
+        target_json["data"]["content"]["story"]["post_id"] = json!("28131981629721302");
+        target.text = target_json.to_string();
+        let blocks = vec![
+            post_block(
+                "https://www.facebook.com/quata.pham/posts/pfbidUNRELATED",
+                "unrelated",
+            ),
+            target,
+        ];
+
+        // When
+        let selected =
+            get_post_json_for_page(&blocks, Some("pfbidREQUESTED"), Some("28131981629721302"))
+                .unwrap();
+
+        // Then
+        assert_eq!(
+            get_root_node(&selected)
+                .and_then(|root| root.pointer("/content/story/post_id"))
+                .and_then(|id| id.as_str()),
+            Some("28131981629721302")
+        );
+    }
+
+    #[test]
+    fn page_canonical_post_id_extracts_slugged_numeric_permalink() {
+        // Given
+        let html = Html::parse_document(
+            r#"<meta property="og:url" content="https://www.facebook.com/volecong/posts/summer-trip/28131981629721302/">"#,
+        );
+
+        // When / Then
+        assert_eq!(
+            canonical_page_post_id(&html).as_deref(),
+            Some("28131981629721302")
+        );
     }
 
     #[test]
