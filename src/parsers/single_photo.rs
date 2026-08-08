@@ -1,7 +1,9 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
-use crate::parsers::util::{interaction_counts, val_str_at};
+use crate::parsers::util::{
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, interaction_counts, val_str_at,
+};
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
 use serde_json::Value;
@@ -29,8 +31,9 @@ impl Parser for SinglePhotoParser {
             )
         })?;
         let text = longest_post_text(&content_node);
-        let author = content_node
-            .pointer("/owner/name")
+        let owner = content_node.get("owner").unwrap_or(&Value::Null);
+        let author = owner
+            .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
@@ -49,7 +52,9 @@ impl Parser for SinglePhotoParser {
 
         Ok(ParsedPost {
             author_name: author,
-            author_handle: None,
+            author_id: author_id_in_node(owner),
+            author_handle: author_handle_in_node(owner),
+            author_avatar_url: author_avatar_in_node(owner),
             context: None,
             text: text.trim().to_owned(),
             allow_discord_markdown: false,
@@ -110,6 +115,7 @@ fn get_single_image(blocks: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{get_content_node, get_single_image, longest_post_text};
+    use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
     #[test]
@@ -117,11 +123,21 @@ mod tests {
         let blocks = vec![json!({
             "message_preferred_body": {},
             "container_story": {},
-            "data": {"owner": {"name": "Photog"}},
+            "data": {"owner": {
+                "id": "44",
+                "name": "Photog",
+                "profile_picture": {"uri": "https://img.example/photog.jpg"}
+            }},
             "prefetch_uris_v2": [{"uri": "https://img.example/single.jpg"}]
         })];
 
-        assert!(get_content_node(&blocks).is_some());
+        let content = get_content_node(&blocks).unwrap();
+        let owner = content.get("owner").unwrap();
+        assert_eq!(author_id_in_node(owner).as_deref(), Some("44"));
+        assert_eq!(
+            author_avatar_in_node(owner).as_deref(),
+            Some("https://img.example/photog.jpg")
+        );
         assert_eq!(
             get_single_image(&blocks).as_deref(),
             Some("https://img.example/single.jpg")

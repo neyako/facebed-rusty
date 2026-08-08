@@ -1,5 +1,5 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::{get_json_block_texts, profile_handle_from_url, FetchedPage, JsonBlockText};
+use crate::fetch::{get_json_block_texts, FetchedPage, JsonBlockText};
 use crate::jq;
 use crate::parsers::util::{interaction_counts, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
@@ -105,7 +105,7 @@ fn parse_page(
     };
     let post_content = story.get_text().trim().to_owned();
     let group_handle = group_handle_from_post_path(post_path).map(str::to_owned);
-    let embedded_handle = profile_handle_from_url(&story.author_url);
+    let embedded_handle = story.author_handle.clone();
     let unresolved_author_id = embedded_handle
         .is_none()
         .then(|| story.author_id.clone())
@@ -125,7 +125,9 @@ fn parse_page(
     Ok(ParsedPostDraft {
         post: ParsedPost {
             author_name: story.author_name,
+            author_id: (!story.author_id.is_empty()).then_some(story.author_id),
             author_handle,
+            author_avatar_url: story.author_avatar_url,
             context,
             text: post_content,
             allow_discord_markdown: is_group_post_path(post_path),

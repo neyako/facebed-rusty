@@ -1,7 +1,9 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
-use crate::parsers::util::{human_format, val_str_at};
+use crate::parsers::util::{
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format, val_str_at,
+};
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
 
@@ -32,8 +34,9 @@ impl Parser for PhotocomParser {
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_owned();
-        let owner_name = data
-            .pointer("/owner/name")
+        let owner = data.get("owner").unwrap_or(&Value::Null);
+        let owner_name = owner
+            .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
@@ -59,7 +62,9 @@ impl Parser for PhotocomParser {
 
         Ok(ParsedPost {
             author_name: format!("{} (💬)", owner_name),
-            author_handle: None,
+            author_id: author_id_in_node(owner),
+            author_handle: author_handle_in_node(owner),
+            author_avatar_url: author_avatar_in_node(owner),
             context: None,
             text,
             allow_discord_markdown: false,
@@ -107,21 +112,39 @@ fn get_attached_image_and_url(blocks: &[Value]) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_attached_image_and_url, get_reaction_count};
+    use super::{get_attached_image_and_url, get_content_node, get_reaction_count};
+    use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
     #[test]
     fn finds_reaction_count_and_attached_image() {
-        let blocks = vec![json!({
-            "attached_comment": {},
-            "unified_reactors": {"count": 5},
-            "currMedia": {
-                "image": {"uri": "https://img.example/comment.jpg"},
-                "attached_comment": {"feedback": {"url": "https://www.facebook.com/c"}}
-            }
-        })];
+        let blocks = vec![
+            json!({
+                "attached_comment": {},
+                "result": {"data": {"owner": {
+                    "id": "55",
+                    "name": "Comment Owner",
+                    "profile_picture_depth_0": {"uri": "https://img.example/comment-owner.jpg"}
+                }}}
+            }),
+            json!({
+                "attached_comment": {},
+                "unified_reactors": {"count": 5},
+                "currMedia": {
+                    "image": {"uri": "https://img.example/comment.jpg"},
+                    "attached_comment": {"feedback": {"url": "https://www.facebook.com/c"}}
+                }
+            }),
+        ];
 
         assert_eq!(get_reaction_count(&blocks), Some(5));
+        let content = get_content_node(&blocks).unwrap();
+        let owner = content.pointer("/data/owner").unwrap();
+        assert_eq!(author_id_in_node(owner).as_deref(), Some("55"));
+        assert_eq!(
+            author_avatar_in_node(owner).as_deref(),
+            Some("https://img.example/comment-owner.jpg")
+        );
         assert_eq!(
             get_attached_image_and_url(&blocks),
             Some((

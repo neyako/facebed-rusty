@@ -3,8 +3,8 @@ use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::json_post::parse_fetched_post;
 use crate::parsers::util::{
-    human_format, images_from_post, thumbnail_in_node, val_str_at, video_link_in_node,
-    videos_from_post,
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
+    images_from_post, thumbnail_in_node, val_str_at, video_link_in_node, videos_from_post,
 };
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx, PostContext};
 use crate::url_clean::ensure_absolute;
@@ -164,7 +164,9 @@ fn parsed_post_from_comment(
 
     Ok(ParsedPost {
         author_name: format!("{author_name} (💬)"),
-        author_handle: None,
+        author_id: author_id_in_node(author),
+        author_handle: author_handle_in_node(author),
+        author_avatar_url: author_avatar_in_node(author),
         context: parent.map(|post| PostContext {
             author_name: post.author_name.clone(),
             text: post.text.clone(),
@@ -225,7 +227,12 @@ mod tests {
                         {"node": {
                             "id": "Y29tbWVudDo5OTlfMTEx",           // base64("comment:999_111")
                             "legacy_fbid": "111",
-                            "author": {"name": "Alice", "id": "42"},
+                            "author": {
+                                "name": "Alice",
+                                "id": "42",
+                                "url": "https://www.facebook.com/alice.example",
+                                "profile_picture_depth_0": {"uri": "https://img.example/alice.jpg"}
+                            },
                             "preferred_body": {"text": "first!"},
                             "created_time": 1750000000,
                             "feedback": {"url": "https://www.facebook.com/x?comment_id=111"},
@@ -233,7 +240,12 @@ mod tests {
                         }},
                         {"node": {
                             "id": "Y29tbWVudDo5OTlfMjIy",           // base64("comment:999_222")
-                            "author": {"name": "Bob", "id": "43"},
+                            "author": {
+                                "name": "Bob",
+                                "id": "43",
+                                "url": "https://www.facebook.com/bob.example",
+                                "profile_picture": {"uri": "https://img.example/bob.jpg"}
+                            },
                             "preferred_body": {"text": "video reply"},
                             "created_time": 1750000100,
                             "attachments": [{"style_type_renderer": {"attachment": {"media": {
@@ -307,6 +319,12 @@ mod tests {
         let post = parsed_post_from_comment(node, "reel/999?comment_id=222", None).unwrap();
 
         assert_eq!(post.author_name, "Bob (💬)");
+        assert_eq!(post.author_id.as_deref(), Some("43"));
+        assert_eq!(post.author_handle.as_deref(), Some("bob.example"));
+        assert_eq!(
+            post.author_avatar_url.as_deref(),
+            Some("https://img.example/bob.jpg")
+        );
         assert_eq!(post.text, "video reply");
         assert_eq!(post.date, 1750000100);
         assert_eq!(
@@ -341,7 +359,9 @@ mod tests {
         let node = find_comment_node(&blocks, "111").unwrap();
         let parent = ParsedPost {
             author_name: "Parent Author".into(),
+            author_id: None,
             author_handle: Some("parent.author".into()),
+            author_avatar_url: None,
             context: None,
             text: "parent text".into(),
             allow_discord_markdown: true,

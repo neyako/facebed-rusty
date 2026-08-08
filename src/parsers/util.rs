@@ -1,7 +1,9 @@
 use crate::error::FacebedError;
+use crate::fetch::profile_handle_from_url;
 use crate::jq;
 use crate::parsers::PostContext;
 use serde_json::Value;
+use url::Url;
 
 /// Python `Utils.human_format`. Integer → `1.23K`/`4.5M` style, non-int → unchanged.
 pub fn human_format(num: &Value) -> String {
@@ -48,10 +50,58 @@ pub fn val_str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
+pub fn author_id_in_node(node: &Value) -> Option<String> {
+    let node = node.get("owner_as_page").unwrap_or(node);
+    match node.get("id")? {
+        Value::String(id) if !id.is_empty() => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+pub fn author_handle_in_node(node: &Value) -> Option<String> {
+    let node = node.get("owner_as_page").unwrap_or(node);
+    val_str_at(node, "username")
+        .filter(|username| !username.is_empty())
+        .map(str::to_owned)
+        .or_else(|| val_str_at(node, "url").and_then(profile_handle_from_url))
+}
+
+pub fn author_avatar_in_node(node: &Value) -> Option<String> {
+    let node = node.get("owner_as_page").unwrap_or(node);
+    for key in [
+        "profile_picture",
+        "profile_picture_depth_0",
+        "profile_picture_depth_1",
+        "profile_pic_url",
+        "profile_pic_url_hd",
+        "profilePictureUrl",
+    ] {
+        let Some(value) = node.get(key) else {
+            continue;
+        };
+        let Some(raw) = value
+            .as_str()
+            .or_else(|| value.get("uri").and_then(Value::as_str))
+            .or_else(|| value.get("url").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let Ok(url) = Url::parse(raw) else {
+            continue;
+        };
+        if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
+            return Some(raw.to_owned());
+        }
+    }
+    None
+}
+
 /// `Story` from Python — used by JsonParser. Recursive: attached_story is the shared/quoted post.
 pub struct Story<'a> {
     pub author_name: String,
-    pub author_url: String,
+    pub author_handle: Option<String>,
+    pub author_avatar_url: Option<String>,
     pub text: String,
     pub image_links: Vec<String>,
     pub video_links: Vec<String>,
@@ -71,7 +121,8 @@ impl<'a> Story<'a> {
             .first()
             .ok_or_else(|| FacebedError::parse("story.actors[0] missing"))?;
         let author_name = val_str_at(actor, "name").unwrap_or("").to_owned();
-        let author_url = val_str_at(actor, "url").unwrap_or("").to_owned();
+        let author_handle = author_handle_in_node(actor);
+        let author_avatar_url = author_avatar_in_node(actor);
         let author_id = match actor.get("id") {
             Some(Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
@@ -115,7 +166,8 @@ impl<'a> Story<'a> {
 
         Ok(Self {
             author_name,
-            author_url,
+            author_handle,
+            author_avatar_url,
             text,
             image_links,
             video_links,
@@ -406,8 +458,71 @@ pub fn interaction_counts(
 
 #[cfg(test)]
 mod tests {
-    use super::{images_from_post, interaction_counts, Story};
+    use super::{
+        author_avatar_in_node, author_handle_in_node, author_id_in_node, images_from_post,
+        interaction_counts, Story,
+    };
     use serde_json::json;
+
+    #[test]
+    fn selected_author_identity_uses_profile_fields() {
+        // Given
+        let author = json!({
+            "id": "100012345",
+            "url": "https://www.facebook.com/example.author",
+            "profile_picture": {"uri": "https://scontent.example/avatar.jpg"}
+        });
+
+        // When / Then
+        assert_eq!(author_id_in_node(&author).as_deref(), Some("100012345"));
+        assert_eq!(
+            author_handle_in_node(&author).as_deref(),
+            Some("example.author")
+        );
+        assert_eq!(
+            author_avatar_in_node(&author).as_deref(),
+            Some("https://scontent.example/avatar.jpg")
+        );
+    }
+
+    #[test]
+    fn selected_author_avatar_supports_facebook_and_instagram_shapes() {
+        // Given
+        let cases = [
+            (
+                json!({"profile_picture_depth_0": {"uri": "https://img.example/depth.jpg"}}),
+                "https://img.example/depth.jpg",
+            ),
+            (
+                json!({"profile_pic_url": "https://img.example/profile.jpg"}),
+                "https://img.example/profile.jpg",
+            ),
+            (
+                json!({"profilePictureUrl": {"url": "https://img.example/camel.jpg"}}),
+                "https://img.example/camel.jpg",
+            ),
+        ];
+
+        // When / Then
+        for (author, expected) in cases {
+            assert_eq!(author_avatar_in_node(&author).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn selected_author_identity_rejects_missing_or_invalid_values() {
+        // Given
+        let author = json!({
+            "id": "",
+            "url": "https://www.facebook.com/profile.php?id=100",
+            "profile_picture": {"uri": "ftp://img.example/avatar.jpg"}
+        });
+
+        // When / Then
+        assert_eq!(author_id_in_node(&author), None);
+        assert_eq!(author_handle_in_node(&author), None);
+        assert_eq!(author_avatar_in_node(&author), None);
+    }
 
     #[test]
     fn skips_sticker_attachment() {
@@ -439,7 +554,12 @@ mod tests {
     #[test]
     fn story_extracts_author_text_and_photo() {
         let story = Story::from_json(&json!({
-            "actors": [{"name": "Test Author", "id": "100"}],
+            "actors": [{
+                "name": "Test Author",
+                "id": "100",
+                "url": "https://www.facebook.com/test.author",
+                "profile_picture": {"uri": "https://img.example/author.jpg"}
+            }],
             "message": {"text": "hello world"},
             "wwwURL": "https://www.facebook.com/groups/1/posts/2",
             "attachment": {
@@ -451,6 +571,11 @@ mod tests {
 
         assert_eq!(story.author_name, "Test Author");
         assert_eq!(story.author_id, "100");
+        assert_eq!(story.author_handle.as_deref(), Some("test.author"));
+        assert_eq!(
+            story.author_avatar_url.as_deref(),
+            Some("https://img.example/author.jpg")
+        );
         assert_eq!(story.text, "hello world");
         assert_eq!(story.url, "https://www.facebook.com/groups/1/posts/2");
         assert_eq!(

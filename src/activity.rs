@@ -58,25 +58,49 @@ pub fn alternate_link(post_url: &str, public_origin: &str) -> String {
 }
 
 pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
-    let username = post.author_handle.as_deref().unwrap_or("facebed");
-    let acct = post
+    let username = post
         .author_handle
-        .as_ref()
-        .map_or_else(|| "facebed".to_owned(), |handle| format!("{handle}@fb.com"));
-    let attachments = post
-        .image_links
-        .iter()
-        .take(4)
-        .enumerate()
-        .map(|(index, url)| {
-            json!({
-                "id": (index + 1).to_string(), "type": "image", "url": url,
-                "preview_url": null, "remote_url": null, "preview_remote_url": null,
-                "text_url": null, "description": null,
-                "meta": { "original": { "width": 0, "height": 0 } },
+        .as_deref()
+        .or(post.author_id.as_deref())
+        .unwrap_or("facebed");
+    let account_id = post.author_id.as_deref().unwrap_or(username);
+    let profile_avatar = post
+        .author_handle
+        .as_deref()
+        .and_then(facebook_profile_avatar);
+    let avatar = post
+        .author_avatar_url
+        .as_deref()
+        .or(profile_avatar.as_deref())
+        .unwrap_or(ACCOUNT_AVATAR_URL);
+    let attachments = if post.image_links.is_empty() {
+        post.video_links
+            .first()
+            .map(|url| {
+                json!({
+                    "id": "1", "type": "video", "url": url,
+                    "preview_url": post.thumbnail, "remote_url": null,
+                    "preview_remote_url": null, "text_url": null, "description": null,
+                    "meta": { "original": { "width": 0, "height": 0 } },
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        post.image_links
+            .iter()
+            .take(4)
+            .enumerate()
+            .map(|(index, url)| {
+                json!({
+                    "id": (index + 1).to_string(), "type": "image", "url": url,
+                    "preview_url": null, "remote_url": null, "preview_remote_url": null,
+                    "text_url": null, "description": null,
+                    "meta": { "original": { "width": 0, "height": 0 } },
+                })
+            })
+            .collect::<Vec<_>>()
+    };
     json!({
         "id": id, "url": post.url, "uri": post.url, "created_at": created_at(post.date),
         "in_reply_to_id": null, "in_reply_to_account_id": null, "edited_at": null,
@@ -85,11 +109,11 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         "replies_count": 0, "reblogs_count": 0, "favourites_count": 0,
         "application": { "name": "Facebed", "website": null },
         "account": {
-            "id": "facebed", "username": username, "acct": acct,
+            "id": account_id, "username": username, "acct": username,
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
             "note": "", "url": post.url,
-            "avatar": ACCOUNT_AVATAR_URL, "avatar_static": ACCOUNT_AVATAR_URL,
+            "avatar": avatar, "avatar_static": avatar,
             "header": ACCOUNT_HEADER_URL, "header_static": ACCOUNT_HEADER_URL,
             "followers_count": 0, "following_count": 0, "statuses_count": 0,
             "last_status_at": null,
@@ -97,6 +121,13 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         "media_attachments": attachments, "mentions": [], "tags": [], "emojis": [],
     })
     .to_string()
+}
+
+fn facebook_profile_avatar(handle: &str) -> Option<String> {
+    let mut url = Url::parse("https://graph.facebook.com/").ok()?;
+    url.path_segments_mut().ok()?.push(handle).push("picture");
+    url.query_pairs_mut().append_pair("type", "small");
+    Some(url.into())
 }
 
 fn created_at(date: i64) -> String {

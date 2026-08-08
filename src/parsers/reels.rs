@@ -1,7 +1,10 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
-use crate::parsers::util::{human_format, thumbnail_in_node, val_str_at, video_link_in_node};
+use crate::parsers::util::{
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
+    thumbnail_in_node, val_str_at, video_link_in_node,
+};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
 
@@ -72,7 +75,9 @@ impl Parser for ReelsParser {
 
         Ok(ParsedPost {
             author_name: op_name,
-            author_handle: None,
+            author_id: author_id_in_node(&owner),
+            author_handle: author_handle_in_node(&owner),
+            author_avatar_url: author_avatar_in_node(&owner),
             context: None,
             text: post_text,
             allow_discord_markdown: false,
@@ -336,6 +341,7 @@ impl ValueExt for Value {
 #[cfg(test)]
 mod tests {
     use super::find_owner_with_name;
+    use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
     #[test]
@@ -348,7 +354,11 @@ mod tests {
         let content = json!({
             "id": "123",
             "short_form_video_context": {
-                "video_owner": {"id": "right", "name": "Right Creator"}
+                "video_owner": {
+                    "id": "right",
+                    "name": "Right Creator",
+                    "profile_picture": {"uri": "https://img.example/reel.jpg"}
+                }
             }
         });
 
@@ -357,6 +367,11 @@ mod tests {
         assert_eq!(
             owner.get("name").and_then(|v| v.as_str()),
             Some("Right Creator")
+        );
+        assert_eq!(author_id_in_node(&owner).as_deref(), Some("right"));
+        assert_eq!(
+            author_avatar_in_node(&owner).as_deref(),
+            Some("https://img.example/reel.jpg")
         );
     }
 

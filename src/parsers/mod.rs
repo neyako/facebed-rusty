@@ -23,7 +23,9 @@ pub struct PostContext {
 #[derive(Debug, Clone)]
 pub struct ParsedPost {
     pub author_name: String,
+    pub author_id: Option<String>,
     pub author_handle: Option<String>,
+    pub author_avatar_url: Option<String>,
     pub context: Option<PostContext>,
     pub text: String,
     /// Let trusted FB-authored Markdown render in Discord embed descriptions.
@@ -56,10 +58,21 @@ impl ParserCtx {
     }
 }
 
+pub async fn resolve_facebook_author_handle(ctx: &ParserCtx, mut post: ParsedPost) -> ParsedPost {
+    if post.author_handle.is_none() {
+        if let Some(author_id) = post.author_id.as_deref() {
+            post.author_handle = ctx.fetcher.resolve_profile_handle(author_id).await;
+        }
+    }
+    post
+}
+
 pub fn banned_post(url: &str) -> ParsedPost {
     ParsedPost {
         author_name: "Banned".into(),
+        author_id: None,
         author_handle: None,
+        author_avatar_url: None,
         context: None,
         text: "This user is banned by the operators of this embed server".into(),
         allow_discord_markdown: false,

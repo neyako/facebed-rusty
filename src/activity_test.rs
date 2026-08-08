@@ -6,7 +6,9 @@ use url::Url;
 fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
     ParsedPost {
         author_name: "Example Author".to_owned(),
+        author_id: Some("100012345".to_owned()),
         author_handle: Some("example.author".to_owned()),
+        author_avatar_url: Some("https://img.example/avatar.jpg".to_owned()),
         context: None,
         text,
         allow_discord_markdown: false,
@@ -22,7 +24,7 @@ fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
 }
 
 #[test]
-fn status_json_uses_real_handle_with_short_facebook_domain() {
+fn status_json_uses_bare_real_handle_without_platform_domain() {
     // Given
     let post = post("qualified account".to_owned(), vec![]);
 
@@ -31,8 +33,9 @@ fn status_json_uses_real_handle_with_short_facebook_domain() {
 
     // Then
     assert_eq!(json["account"]["display_name"], "Example Author");
+    assert_eq!(json["account"]["id"], "100012345");
     assert_eq!(json["account"]["username"], "example.author");
-    assert_eq!(json["account"]["acct"], "example.author@fb.com");
+    assert_eq!(json["account"]["acct"], "example.author");
     assert_eq!(
         json["account"]["url"],
         "https://www.facebook.com/groups/example/posts/123"
@@ -197,7 +200,10 @@ fn status_json_uses_absolute_https_account_images() {
 #[test]
 fn status_json_uses_facebed_logo_for_avatar_and_banner_for_header() {
     // Given
-    let post = post("text-only".to_owned(), vec![]);
+    let mut post = post("text-only".to_owned(), vec![]);
+    post.author_avatar_url = None;
+    post.author_handle = None;
+    post.author_id = None;
 
     // When
     let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
@@ -213,6 +219,63 @@ fn status_json_uses_facebed_logo_for_avatar_and_banner_for_header() {
         "https://facebed.neyahub.com/banner.png"
     );
     assert_eq!(json["account"]["header_static"], json["account"]["header"]);
+}
+
+#[test]
+fn status_json_uses_facebook_profile_picture_when_handle_has_no_embedded_avatar() {
+    // Given
+    let mut post = post("text-only".to_owned(), vec![]);
+    post.author_avatar_url = None;
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert_eq!(
+        json["account"]["avatar"],
+        "https://graph.facebook.com/example.author/picture?type=small"
+    );
+    assert_eq!(json["account"]["avatar_static"], json["account"]["avatar"]);
+}
+
+#[test]
+fn status_json_uses_real_author_avatar_when_available() {
+    // Given
+    let post = post("text-only".to_owned(), vec![]);
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert_eq!(json["account"]["avatar"], "https://img.example/avatar.jpg");
+    assert_eq!(json["account"]["avatar_static"], json["account"]["avatar"]);
+}
+
+#[test]
+fn status_json_uses_video_attachment_when_post_has_no_images() {
+    // Given
+    let mut post = post("video".to_owned(), vec![]);
+    post.video_links = vec!["https://video.example/post.mp4".to_owned()];
+    post.thumbnail = Some("https://img.example/post.jpg".to_owned());
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert_eq!(
+        json["media_attachments"],
+        json!([{
+            "id": "1",
+            "type": "video",
+            "url": "https://video.example/post.mp4",
+            "preview_url": "https://img.example/post.jpg",
+            "remote_url": null,
+            "preview_remote_url": null,
+            "text_url": null,
+            "description": null,
+            "meta": {"original": {"width": 0, "height": 0}}
+        }])
+    );
 }
 
 #[test]

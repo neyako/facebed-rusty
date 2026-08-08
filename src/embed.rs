@@ -333,7 +333,11 @@ pub fn format_full_post_embed(
     )
 }
 
-pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
+pub fn format_reel_post_embed(
+    post: &ParsedPost,
+    tz_offset: i32,
+    activity_origin: Option<&str>,
+) -> String {
     let video_meta = post
         .video_links
         .iter()
@@ -352,6 +356,9 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
     let oembed = oembed_link_tag(&post.author_name, &post.url, "video");
+    let activity = activity_origin.map_or_else(String::new, |origin| {
+        crate::activity::alternate_link(&post.url, origin)
+    });
     let description = format_post_description(post);
 
     format!(
@@ -373,6 +380,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
 
     <link rel="canonical" href="{url_q}"/>
     {oembed}
+    {activity}
     <meta http-equiv="refresh" content="0;url={url_q}"/>
     <meta name="twitter:card" content="player"/>
     <meta name="theme-color" content="#0866ff"/>
@@ -386,6 +394,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
         url_q = url_q,
         video_meta = video_meta,
         oembed = oembed,
+        activity = activity,
     )
 }
 
@@ -393,12 +402,19 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
 /// (~25 MB). Shows the thumbnail as `og:image`, the post text as description,
 /// and a "video too big to embed" hint in the site name. Click-through goes
 /// to the canonical post URL.
-pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String {
+pub fn format_oversized_video_embed(
+    post: &ParsedPost,
+    tz_offset: i32,
+    activity_origin: Option<&str>,
+) -> String {
     let thumb = post.thumbnail.clone().unwrap_or_default();
     let post_date = format_timestamp(post.date, tz_offset);
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
     let description = format_post_description(post);
+    let activity = activity_origin.map_or_else(String::new, |origin| {
+        crate::activity::alternate_link(&post.url, origin)
+    });
     let image_meta = if thumb.is_empty() {
         String::new()
     } else {
@@ -422,6 +438,7 @@ pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String
     <meta property="og:url" content="{url_q}"/>
     {image_meta}
     <link rel="canonical" href="{url_q}"/>
+    {activity}
     <meta http-equiv="refresh" content="0;url={url_q}"/>
     <meta name="twitter:card" content="summary_large_image"/>
     <meta name="theme-color" content="#0866ff"/>
@@ -434,6 +451,7 @@ pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String
         reactions = reactions,
         url_q = url_q,
         image_meta = image_meta,
+        activity = activity,
     )
 }
 
@@ -510,13 +528,18 @@ pub fn credit() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_description_text, format_full_post_embed, format_reel_post_embed};
+    use super::{
+        format_description_text, format_full_post_embed, format_oversized_video_embed,
+        format_reel_post_embed,
+    };
     use crate::parsers::{ParsedPost, PostContext};
 
     fn sample_post() -> ParsedPost {
         ParsedPost {
             author_name: r#"Title "quote""#.into(),
+            author_id: None,
             author_handle: None,
+            author_avatar_url: None,
             context: None,
             text: "body text".into(),
             allow_discord_markdown: false,
@@ -701,11 +724,26 @@ mod tests {
         post.image_links.clear();
         post.video_links = vec!["https://video.fbcdn.net/v.mp4".into()];
 
-        let html = format_reel_post_embed(&post, 0);
+        let html = format_reel_post_embed(&post, 0, Some("https://facebed.example"));
 
         assert!(
             html.contains(r#"<meta property="og:video" content="https://video.fbcdn.net/v.mp4"/>"#)
         );
         assert!(html.contains(r#"<meta name="twitter:card" content="player"/>"#));
+        assert!(html.contains(r#"type="application/activity+json""#));
+        assert!(html.contains("https://facebed.example/users/facebed/statuses/"));
+    }
+
+    #[test]
+    fn oversized_video_embed_advertises_activity_status() {
+        let mut post = sample_post();
+        post.image_links.clear();
+        post.video_links = vec!["https://video.fbcdn.net/large.mp4".into()];
+        post.thumbnail = Some("https://img.example/large.jpg".into());
+
+        let html = format_oversized_video_embed(&post, 0, Some("https://facebed.example"));
+
+        assert!(html.contains(r#"type="application/activity+json""#));
+        assert!(html.contains("https://facebed.example/users/facebed/statuses/"));
     }
 }

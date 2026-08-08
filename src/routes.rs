@@ -10,8 +10,8 @@ use crate::fetch::{resolve_share_link, Fetcher, ACCOUNT_OVERRIDE};
 use crate::notifier::Notifier;
 use crate::parsers::{
     comment::CommentParser, json_post::JsonPostParser, photocom::PhotocomParser,
-    reels::ReelsParser, single_photo::SinglePhotoParser, stories::StoriesParser,
-    video_watch::VideoWatchParser, ParsedPost, Parser, ParserCtx,
+    reels::ReelsParser, resolve_facebook_author_handle, single_photo::SinglePhotoParser,
+    stories::StoriesParser, video_watch::VideoWatchParser, ParsedPost, Parser, ParserCtx,
 };
 use crate::url_clean;
 use axum::extract::State;
@@ -163,11 +163,7 @@ async fn activity_status(
 
     if let Ok(mut cache) = state.embed_cache.lock() {
         if let Some(post) = cache.get_activity(&id, Instant::now()) {
-            return if post.video_links.is_empty() {
-                json_response(crate::activity::status_json(&id, &post))
-            } else {
-                activity_error_response(StatusCode::NOT_FOUND)
-            };
+            return json_response(crate::activity::status_json(&id, &post));
         }
     }
 
@@ -178,8 +174,8 @@ async fn activity_status(
     let post = match tokio::time::timeout(DISCORD_RESPONSE_BUDGET, run_parser(&state, &path, kind))
         .await
     {
-        Ok(Ok(post)) if post.video_links.is_empty() => post,
-        Ok(Ok(_)) | Ok(Err(_)) => return activity_error_response(StatusCode::NOT_FOUND),
+        Ok(Ok(post)) => post,
+        Ok(Err(_)) => return activity_error_response(StatusCode::NOT_FOUND),
         Err(_) => return activity_error_response(StatusCode::SERVICE_UNAVAILABLE),
     };
 
@@ -605,20 +601,16 @@ fn activity_path(id: &str) -> Result<(String, ParserKind), StatusCode> {
                 .any(|(key, value)| key == "type" && value.contains('3'))
         })
         .unwrap_or(false);
-    if crate::parsers::comment::comment_id_in(&path).is_some() || is_photocom {
-        return Err(StatusCode::NOT_FOUND);
+    if is_photocom {
+        return Ok((path, ParserKind::Photocom));
+    }
+    if crate::parsers::comment::comment_id_in(&path).is_some() {
+        return Ok((path, ParserKind::Comment));
     }
 
     match select_kind(&path) {
-        Some(kind @ ParserKind::JsonPost) | Some(kind @ ParserKind::SinglePhoto) => {
-            Ok((path, kind))
-        }
-        Some(ParserKind::Photocom)
-        | Some(ParserKind::Reels)
-        | Some(ParserKind::Watch)
-        | Some(ParserKind::Stories)
-        | Some(ParserKind::Comment)
-        | None => Err(StatusCode::NOT_FOUND),
+        Some(kind) => Ok((path, kind)),
+        None => Err(StatusCode::NOT_FOUND),
     }
 }
 
@@ -830,7 +822,7 @@ async fn process(state: &AppState, request: PostRequest<'_>) -> Response {
                 let render_started = Instant::now();
                 let body = render_with_size_check(state, &post, request).await;
                 if let Ok(mut cache) = state.embed_cache.lock() {
-                    if activity_eligible(&post, kind) {
+                    if activity_eligible(&post) {
                         if let Some(id) = crate::activity::status_id(&post.url) {
                             cache.insert_activity(&id, post.clone(), Instant::now());
                         }
@@ -929,7 +921,7 @@ async fn run_parser(
     path: &str,
     kind: ParserKind,
 ) -> Result<ParsedPost, FacebedError> {
-    match kind {
+    let post = match kind {
         ParserKind::JsonPost => JsonPostParser.process(&state.ctx, path).await,
         ParserKind::SinglePhoto => SinglePhotoParser.process(&state.ctx, path).await,
         ParserKind::Photocom => PhotocomParser.process(&state.ctx, path).await,
@@ -956,7 +948,8 @@ async fn run_parser(
                 other => other,
             }
         }
-    }
+    }?;
+    Ok(resolve_facebook_author_handle(&state.ctx, post).await)
 }
 
 fn is_retryable(e: &FacebedError) -> bool {
@@ -976,12 +969,13 @@ fn is_retryable(e: &FacebedError) -> bool {
 /// caption + link embed instead of an `og:video`.
 const DISCORD_VIDEO_BYTE_LIMIT: u64 = 25 * 1024 * 1024;
 
-fn activity_eligible(post: &ParsedPost, kind: ParserKind) -> bool {
-    matches!(kind, ParserKind::JsonPost | ParserKind::SinglePhoto) && post.video_links.is_empty()
+fn activity_eligible(post: &ParsedPost) -> bool {
+    crate::activity::status_id(&post.url).is_some()
 }
 
 fn render(post: &ParsedPost, tz: i32, request: PostRequest<'_>) -> String {
     let kind = request.kind;
+    let activity_origin = request.activity_origin.filter(|_| activity_eligible(post));
     // Reels/Watch always render as a video card. For mixed-media JsonPosts (video
     // + images), prefer the image-grid embed so Discord can show the photos and
     // text — Discord only renders one og:video per embed anyway, so the video
@@ -989,11 +983,8 @@ fn render(post: &ParsedPost, tz: i32, request: PostRequest<'_>) -> String {
     let force_reel = matches!(kind, ParserKind::Reels | ParserKind::Watch);
     let video_only = !post.video_links.is_empty() && post.image_links.is_empty();
     if force_reel || video_only {
-        format_reel_post_embed(post, tz)
+        format_reel_post_embed(post, tz, activity_origin)
     } else {
-        let activity_origin = request
-            .activity_origin
-            .filter(|_| activity_eligible(post, kind));
         format_full_post_embed(post, tz, activity_origin)
     }
 }
@@ -1026,7 +1017,8 @@ async fn render_with_size_check(
         limit = DISCORD_VIDEO_BYTE_LIMIT,
         "video oversized for Discord media proxy — falling back to thumbnail embed"
     );
-    format_oversized_video_embed(post, tz)
+    let activity_origin = request.activity_origin.filter(|_| activity_eligible(post));
+    format_oversized_video_embed(post, tz, activity_origin)
 }
 
 /// Apply cooldown and alerting appropriate to a failed attempt's cause.
@@ -1205,6 +1197,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_alias_returns_cached_video_status_json_when_preloaded() {
+        // Given
+        let state = test_state();
+        let mut post = activity_post();
+        post.video_links = vec!["https://video.example/post.mp4".into()];
+        post.thumbnail = Some("https://img.example/post.jpg".into());
+        let id = crate::activity::status_id(&post.url).expect("activity status id");
+        let expected = crate::activity::status_json(&id, &post);
+        state
+            .embed_cache
+            .lock()
+            .expect("activity cache")
+            .insert_activity(&id, post, Instant::now());
+        let request = Request::builder()
+            .uri(format!("/users/facebed/statuses/{id}"))
+            .body(Body::empty())
+            .expect("activity request");
+
+        // When
+        let response = router(state)
+            .oneshot(request)
+            .await
+            .expect("route response");
+
+        // Then
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("activity response body");
+        assert_eq!(&body[..], expected.as_bytes());
+    }
+
+    #[tokio::test]
     async fn bot_request_selects_matching_origin_over_other_and_legacy_cache() {
         // Given
         let state = test_state();
@@ -1332,7 +1357,9 @@ mod tests {
     fn activity_post() -> crate::parsers::ParsedPost {
         crate::parsers::ParsedPost {
             author_name: "Author".into(),
+            author_id: None,
             author_handle: None,
+            author_avatar_url: None,
             context: None,
             text: "Post".into(),
             allow_discord_markdown: false,
@@ -1348,27 +1375,19 @@ mod tests {
     }
 
     #[test]
-    fn activity_eligibility_requires_video_free_json_or_single_photo() {
+    fn activity_eligibility_accepts_facebook_posts_with_any_media_type() {
         let post = activity_post();
 
-        assert!(activity_eligible(&post, ParserKind::JsonPost));
-        assert!(activity_eligible(&post, ParserKind::SinglePhoto));
-        for kind in [
-            ParserKind::Photocom,
-            ParserKind::Reels,
-            ParserKind::Watch,
-            ParserKind::Stories,
-            ParserKind::Comment,
-        ] {
-            assert!(!activity_eligible(&post, kind));
-        }
+        assert!(activity_eligible(&post));
 
         let mut mixed = post;
         mixed
             .video_links
             .push("https://video.example/post.mp4".into());
-        assert!(!activity_eligible(&mixed, ParserKind::JsonPost));
-        assert!(!activity_eligible(&mixed, ParserKind::SinglePhoto));
+        assert!(activity_eligible(&mixed));
+
+        mixed.url = "https://example.com/not-facebook".into();
+        assert!(!activity_eligible(&mixed));
     }
 
     #[test]
@@ -1403,12 +1422,22 @@ mod tests {
     }
 
     #[test]
-    fn activity_path_accepts_video_free_parser_kinds() {
+    fn activity_path_accepts_every_supported_parser_kind() {
         let group = crate::activity::status_id("https://www.facebook.com/groups/example/posts/123")
             .unwrap();
         let photo =
             crate::activity::status_id("https://www.facebook.com/photo.php?fbid=123&id=456")
                 .unwrap();
+        let photocom =
+            crate::activity::status_id("https://www.facebook.com/photo.php?fbid=123&id=456&type=3")
+                .unwrap();
+        let reel = crate::activity::status_id("https://www.facebook.com/reel/123").unwrap();
+        let watch = crate::activity::status_id("https://www.facebook.com/watch?v=123").unwrap();
+        let story = crate::activity::status_id("https://www.facebook.com/stories/123/abc").unwrap();
+        let comment = crate::activity::status_id(
+            "https://www.facebook.com/groups/example/posts/123?comment_id=456",
+        )
+        .unwrap();
 
         assert!(matches!(
             activity_path(&group),
@@ -1418,22 +1447,28 @@ mod tests {
             activity_path(&photo),
             Ok((path, ParserKind::SinglePhoto)) if path == "photo.php?fbid=123&id=456"
         ));
-    }
-
-    #[test]
-    fn activity_path_rejects_video_story_and_comment_kinds() {
-        for url in [
-            "https://www.facebook.com/stories/123/abc",
-            "https://www.facebook.com/reel/123",
-            "https://www.facebook.com/watch?v=123",
-            "https://www.facebook.com/groups/example/posts/123?comment_id=456",
-        ] {
-            let id = crate::activity::status_id(url).unwrap();
-            assert!(matches!(
-                activity_path(&id),
-                Err(axum::http::StatusCode::NOT_FOUND)
-            ));
-        }
+        assert!(matches!(
+            activity_path(&photocom),
+            Ok((path, ParserKind::Photocom))
+                if path == "photo.php?fbid=123&id=456&type=3"
+        ));
+        assert!(matches!(
+            activity_path(&reel),
+            Ok((path, ParserKind::Reels)) if path == "reel/123"
+        ));
+        assert!(matches!(
+            activity_path(&watch),
+            Ok((path, ParserKind::Watch)) if path == "watch?v=123"
+        ));
+        assert!(matches!(
+            activity_path(&story),
+            Ok((path, ParserKind::Stories)) if path == "stories/123/abc"
+        ));
+        assert!(matches!(
+            activity_path(&comment),
+            Ok((path, ParserKind::Comment))
+                if path == "groups/example/posts/123?comment_id=456"
+        ));
     }
 
     #[test]

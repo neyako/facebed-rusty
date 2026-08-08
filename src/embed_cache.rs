@@ -96,7 +96,9 @@ mod tests {
     fn activity_post() -> ParsedPost {
         ParsedPost {
             author_name: "Author".into(),
+            author_id: None,
             author_handle: None,
+            author_avatar_url: None,
             context: None,
             text: "Post body".into(),
             allow_discord_markdown: false,

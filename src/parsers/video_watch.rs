@@ -1,7 +1,10 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
-use crate::parsers::util::{human_format, thumbnail_in_node, val_str_at, video_link_in_node};
+use crate::parsers::util::{
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
+    thumbnail_in_node, val_str_at, video_link_in_node,
+};
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
 use once_cell::sync::Lazy;
@@ -42,13 +45,14 @@ impl Parser for VideoWatchParser {
             .map(str::to_owned)
             .or(target_video_id)
             .unwrap_or_default();
-        let op_name = get_op_name(&blocks, &content_node, &video_id).ok_or_else(|| {
+        let owner = get_op_owner(&blocks, &content_node, &video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid watch link (opn)",
                 page.html.clone(),
                 page.url.clone(),
             )
         })?;
+        let op_name = owner_name_from_candidate(&owner).unwrap_or_default();
         let text = content_node
             .pointer("/title/text")
             .and_then(|v| v.as_str())
@@ -72,7 +76,9 @@ impl Parser for VideoWatchParser {
 
         Ok(ParsedPost {
             author_name: op_name,
-            author_handle: None,
+            author_id: author_id_in_node(&owner),
+            author_handle: author_handle_in_node(&owner),
+            author_avatar_url: author_avatar_in_node(&owner),
             context: None,
             text,
             allow_discord_markdown: false,
@@ -133,58 +139,63 @@ fn thumbnail_in_target_blocks(blocks: &[Value], video_id: &str) -> Option<String
         .find_map(thumbnail_in_node)
 }
 
+#[cfg(test)]
 fn get_op_name(blocks: &[Value], content_node: &Value, video_id: &str) -> Option<String> {
-    if let Some(name) = owner_name_in_node(content_node) {
-        return Some(name);
+    get_op_owner(blocks, content_node, video_id).and_then(|owner| owner_name_from_candidate(&owner))
+}
+
+fn get_op_owner(blocks: &[Value], content_node: &Value, video_id: &str) -> Option<Value> {
+    if let Some(owner) = owner_in_node(content_node) {
+        return Some(owner);
     }
     if !video_id.is_empty() {
         for bloc in blocks {
             if block_mentions_id(bloc, video_id) {
-                if let Some(name) = owner_name_in_node(bloc) {
-                    return Some(name);
+                if let Some(owner) = owner_in_node(bloc) {
+                    return Some(owner);
                 }
             }
         }
     }
     for bloc in blocks {
         if jq::has(bloc, &["is_additional_profile_plus"]) {
-            if let Some(name) = jq::first(bloc, "owner").and_then(owner_name_from_candidate) {
-                return Some(name);
+            if let Some(owner) = jq::first(bloc, "owner") {
+                if owner_name_from_candidate(owner).is_some() {
+                    return Some(owner.clone());
+                }
             }
         }
     }
     for bloc in blocks {
         if let Some(owner) = jq::first(bloc, "owner") {
-            if owner.is_object() {
-                if let Some(name) = owner_name_from_candidate(owner) {
-                    return Some(name);
-                }
+            if owner.is_object() && owner_name_from_candidate(owner).is_some() {
+                return Some(owner.clone());
             }
         }
     }
     None
 }
 
-fn owner_name_in_node(node: &Value) -> Option<String> {
+fn owner_in_node(node: &Value) -> Option<Value> {
     for key in ["video_owner", "owner", "owning_profile", "owner_as_page"] {
         if let Some(owner) = node.get(key) {
-            if let Some(name) = owner_name_from_candidate(owner) {
-                return Some(name);
+            if owner_name_from_candidate(owner).is_some() {
+                return Some(owner.clone());
             }
         }
     }
     for key in ["video_owner", "owner", "owning_profile", "owner_as_page"] {
         for owner in jq::all(node, key) {
-            if let Some(name) = owner_name_from_candidate(owner) {
-                return Some(name);
+            if owner_name_from_candidate(owner).is_some() {
+                return Some(owner.clone());
             }
         }
     }
     for actors in jq::all(node, "actors") {
         if let Some(arr) = actors.as_array() {
             for actor in arr {
-                if let Some(name) = owner_name_from_candidate(actor) {
-                    return Some(name);
+                if owner_name_from_candidate(actor).is_some() {
+                    return Some(actor.clone());
                 }
             }
         }
@@ -285,7 +296,8 @@ fn find_creation_time(blocks: &[Value]) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_content_node, get_op_name, get_video_link, target_video_id};
+    use super::{get_content_node, get_op_name, get_op_owner, get_video_link, target_video_id};
+    use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use scraper::Html;
     use serde_json::json;
 
@@ -294,12 +306,22 @@ mod tests {
         let blocks = vec![json!({"owner": {"id": "wrong", "name": "Wrong Sidebar"}})];
         let content = json!({
             "id": "123",
-            "owner": {"id": "right", "name": "Right Creator"}
+            "owner": {
+                "id": "right",
+                "name": "Right Creator",
+                "profile_picture": {"uri": "https://img.example/watch.jpg"}
+            }
         });
 
         assert_eq!(
             get_op_name(&blocks, &content, "123").as_deref(),
             Some("Right Creator")
+        );
+        let owner = get_op_owner(&blocks, &content, "123").unwrap();
+        assert_eq!(author_id_in_node(&owner).as_deref(), Some("right"));
+        assert_eq!(
+            author_avatar_in_node(&owner).as_deref(),
+            Some("https://img.example/watch.jpg")
         );
     }
 

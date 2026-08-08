@@ -15,7 +15,9 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
-use crate::parsers::util::val_str_at;
+use crate::parsers::util::{
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, val_str_at,
+};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
 use serde_json::Value;
@@ -61,30 +63,13 @@ impl Parser for StoriesParser {
             FacebedError::parse_with("Invalid story (media)", page.html.clone(), page.url.clone())
         })?;
 
-        let mut image_links = Vec::new();
-        let mut video_links = Vec::new();
-
-        if let Some(playable) = media
-            .get("playable_url_quality_hd")
-            .and_then(|v| v.as_str())
-        {
-            video_links.push(playable.to_owned());
-        } else if let Some(playable) = media.get("playable_url").and_then(|v| v.as_str()) {
-            video_links.push(playable.to_owned());
-        } else if let Some(thumb) = media
-            .pointer("/preferred_thumbnail/image/uri")
-            .and_then(|v| v.as_str())
-        {
-            image_links.push(thumb.to_owned());
-        } else if let Some(uri) = media.pointer("/image/uri").and_then(|v| v.as_str()) {
-            image_links.push(uri.to_owned());
-        } else {
-            return Err(FacebedError::parse_with(
+        let (image_links, video_links, thumbnail) = story_media(media).ok_or_else(|| {
+            FacebedError::parse_with(
                 "Invalid story (no media url)",
                 page.html.clone(),
                 page.url.clone(),
-            ));
-        }
+            )
+        })?;
 
         if ctx.is_banned(&author_id) {
             return Ok(banned_post(&permalink));
@@ -92,7 +77,9 @@ impl Parser for StoriesParser {
 
         Ok(ParsedPost {
             author_name,
-            author_handle: None,
+            author_id: owner.and_then(author_id_in_node),
+            author_handle: owner.and_then(author_handle_in_node),
+            author_avatar_url: owner.and_then(author_avatar_in_node),
             context: None,
             text: String::new(),
             allow_discord_markdown: false,
@@ -103,8 +90,29 @@ impl Parser for StoriesParser {
             comments: "null".into(),
             shares: "null".into(),
             video_links,
-            thumbnail: None,
+            thumbnail,
         })
+    }
+}
+
+fn story_media(media: &Value) -> Option<(Vec<String>, Vec<String>, Option<String>)> {
+    let preview = media
+        .pointer("/preferred_thumbnail/image/uri")
+        .and_then(Value::as_str)
+        .or_else(|| media.pointer("/image/uri").and_then(Value::as_str));
+    let video = media
+        .get("playable_url_quality_hd")
+        .and_then(Value::as_str)
+        .or_else(|| media.get("playable_url").and_then(Value::as_str));
+
+    match (video, preview) {
+        (Some(video), preview) => Some((
+            Vec::new(),
+            vec![video.to_owned()],
+            preview.map(str::to_owned),
+        )),
+        (None, Some(image)) => Some((vec![image.to_owned()], Vec::new(), None)),
+        (None, None) => None,
     }
 }
 
@@ -160,13 +168,18 @@ fn find_bucket_containing<'a>(root: &'a Value, needle: &Value) -> Option<&'a Val
 
 #[cfg(test)]
 mod tests {
-    use super::find_story_bucket_and_node;
+    use super::{find_story_bucket_and_node, story_media};
+    use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
     #[test]
     fn finds_bucket_and_story_node() {
         let blocks = vec![json!({
-            "owner": {"id": "9", "name": "Story Owner"},
+            "owner": {
+                "id": "9",
+                "name": "Story Owner",
+                "profile_picture": {"uri": "https://img.example/story-owner.jpg"}
+            },
             "unified_stories_with_notes": {
                 "edges": [{"node": {
                     "creation_time": 123,
@@ -184,5 +197,30 @@ mod tests {
             node.get("creation_time").and_then(|v| v.as_i64()),
             Some(123)
         );
+        let owner = bucket.get("owner").unwrap();
+        assert_eq!(author_id_in_node(owner).as_deref(), Some("9"));
+        assert_eq!(
+            author_avatar_in_node(owner).as_deref(),
+            Some("https://img.example/story-owner.jpg")
+        );
+    }
+
+    #[test]
+    fn video_story_keeps_its_preview_image_for_activity() {
+        // Given
+        let media = json!({
+            "playable_url": "https://video.example/story.mp4",
+            "preferred_thumbnail": {
+                "image": {"uri": "https://img.example/story.jpg"}
+            }
+        });
+
+        // When
+        let (images, videos, thumbnail) = story_media(&media).unwrap();
+
+        // Then
+        assert!(images.is_empty());
+        assert_eq!(videos, ["https://video.example/story.mp4"]);
+        assert_eq!(thumbnail.as_deref(), Some("https://img.example/story.jpg"));
     }
 }
