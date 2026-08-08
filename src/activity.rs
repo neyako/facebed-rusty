@@ -106,20 +106,7 @@ fn created_at(date: i64) -> String {
 }
 
 fn status_content(post: &crate::parsers::ParsedPost) -> String {
-    let mut content = encode_text(&post.text).to_string().replace('\n', "<br>");
-    for (icon, count) in [
-        ("❤️", &post.likes),
-        ("💬", &post.comments),
-        ("🔁", &post.shares),
-    ] {
-        if count != "null" {
-            content.push_str("<br>");
-            content.push_str(icon);
-            content.push(' ');
-            content.push_str(&encode_text(count));
-        }
-    }
-    content
+    encode_text(&post.text).to_string().replace('\n', "<br>")
 }
 
 #[cfg(test)]

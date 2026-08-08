@@ -103,7 +103,9 @@ fn status_json_preserves_long_escaped_text_without_media() {
         .unwrap()
         .contains("&lt;unsafe&gt;&amp;"));
     assert!(json["content"].as_str().unwrap().contains("<br>"));
-    assert!(json["content"].as_str().unwrap().contains("❤️ 7"));
+    assert!(!json["content"].as_str().unwrap().contains("❤️ 7"));
+    assert!(!json["content"].as_str().unwrap().contains("💬"));
+    assert!(!json["content"].as_str().unwrap().contains("🔁 2"));
     assert_eq!(json["media_attachments"].as_array().unwrap().len(), 0);
 }
 
