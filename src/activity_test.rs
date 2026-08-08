@@ -195,6 +195,27 @@ fn status_json_uses_absolute_https_account_images() {
 }
 
 #[test]
+fn status_json_uses_facebed_logo_for_avatar_and_banner_for_header() {
+    // Given
+    let post = post("text-only".to_owned(), vec![]);
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert_eq!(
+        json["account"]["avatar"],
+        "https://facebed.neyahub.com/favicon.ico"
+    );
+    assert_eq!(json["account"]["avatar_static"], json["account"]["avatar"]);
+    assert_eq!(
+        json["account"]["header"],
+        "https://facebed.neyahub.com/banner.png"
+    );
+    assert_eq!(json["account"]["header_static"], json["account"]["header"]);
+}
+
+#[test]
 fn status_json_keeps_mastodon_image_attachments_in_source_order() {
     // Given
     let post = post(

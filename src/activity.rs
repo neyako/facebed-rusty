@@ -5,7 +5,8 @@ use serde_json::json;
 use url::Url;
 
 const MAX_STATUS_BYTES: usize = 2_048;
-const ACCOUNT_IMAGE_URL: &str = "https://facebed.neyahub.com/banner.png";
+const ACCOUNT_AVATAR_URL: &str = "https://facebed.neyahub.com/favicon.ico";
+const ACCOUNT_HEADER_URL: &str = "https://facebed.neyahub.com/banner.png";
 
 pub fn status_id(post_url: &str) -> Option<String> {
     if post_url.len() > MAX_STATUS_BYTES || !url_clean::is_facebook_page_url(post_url) {
@@ -88,8 +89,8 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
             "note": "", "url": post.url,
-            "avatar": ACCOUNT_IMAGE_URL, "avatar_static": ACCOUNT_IMAGE_URL,
-            "header": ACCOUNT_IMAGE_URL, "header_static": ACCOUNT_IMAGE_URL,
+            "avatar": ACCOUNT_AVATAR_URL, "avatar_static": ACCOUNT_AVATAR_URL,
+            "header": ACCOUNT_HEADER_URL, "header_static": ACCOUNT_HEADER_URL,
             "followers_count": 0, "following_count": 0, "statuses_count": 0,
             "last_status_at": null,
         },
