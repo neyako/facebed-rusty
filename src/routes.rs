@@ -1333,6 +1333,7 @@ mod tests {
         crate::parsers::ParsedPost {
             author_name: "Author".into(),
             author_handle: None,
+            context: None,
             text: "Post".into(),
             allow_discord_markdown: false,
             image_links: vec!["https://img.example/post.jpg".into()],

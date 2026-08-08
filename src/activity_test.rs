@@ -1,5 +1,5 @@
 use super::{alternate_link, decode_status_path, status_id, status_json};
-use crate::parsers::ParsedPost;
+use crate::parsers::{ParsedPost, PostContext};
 use serde_json::{json, Value};
 use url::Url;
 
@@ -7,6 +7,7 @@ fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
     ParsedPost {
         author_name: "Example Author".to_owned(),
         author_handle: Some("example.author".to_owned()),
+        context: None,
         text,
         allow_discord_markdown: false,
         image_links: image_links.into_iter().map(str::to_owned).collect(),
@@ -107,6 +108,65 @@ fn status_json_preserves_long_escaped_text_without_media() {
     assert!(!json["content"].as_str().unwrap().contains("💬"));
     assert!(!json["content"].as_str().unwrap().contains("🔁 2"));
     assert_eq!(json["media_attachments"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn status_json_renders_safe_group_markdown_as_activity_html() {
+    // Given
+    let mut post = post(
+        "> quoted <unsafe>&\n# **Heading**\n\\**literal**\n**unmatched".to_owned(),
+        vec![],
+    );
+    post.allow_discord_markdown = true;
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let content = json["content"].as_str().unwrap();
+
+    // Then
+    assert!(content.contains("<blockquote>quoted &lt;unsafe&gt;&amp;</blockquote>"));
+    assert!(content.contains("<strong>Heading</strong>"));
+    assert!(!content.contains("# **Heading**"));
+    assert!(content.contains(r"\**literal**"));
+    assert!(content.contains("**unmatched"));
+}
+
+#[test]
+fn status_json_keeps_non_group_markdown_literal() {
+    // Given
+    let post = post("> quote\n# **Heading**".to_owned(), vec![]);
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let content = json["content"].as_str().unwrap();
+
+    // Then
+    assert!(content.contains("&gt; quote<br># **Heading**"));
+    assert!(!content.contains("<blockquote>"));
+    assert!(!content.contains("<strong>"));
+}
+
+#[test]
+fn status_json_renders_focal_post_before_original_context() {
+    // Given
+    let mut post = post("focal text".to_owned(), vec![]);
+    post.context = Some(PostContext {
+        author_name: "Original Author".to_owned(),
+        text: "original <unsafe>& text".to_owned(),
+        url: "https://www.facebook.com/original/posts/456".to_owned(),
+    });
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let content = json["content"].as_str().unwrap();
+
+    // Then
+    assert!(content.starts_with("focal text<br><blockquote>"));
+    assert!(content.contains("<strong>Original Author</strong>"));
+    assert!(content.contains("original &lt;unsafe&gt;&amp; text"));
+    assert!(content
+        .contains(r#"<a href="https://www.facebook.com/original/posts/456">Original post</a>"#));
+    assert!(content.ends_with("</blockquote>"));
 }
 
 #[test]

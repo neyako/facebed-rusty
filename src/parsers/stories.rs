@@ -93,6 +93,7 @@ impl Parser for StoriesParser {
         Ok(ParsedPost {
             author_name,
             author_handle: None,
+            context: None,
             text: String::new(),
             allow_discord_markdown: false,
             image_links,

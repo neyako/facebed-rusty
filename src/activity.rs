@@ -1,6 +1,6 @@
 use crate::url_clean;
 use chrono::{SecondsFormat, TimeZone, Utc};
-use html_escape::encode_text;
+use html_escape::{encode_quoted_attribute, encode_text};
 use serde_json::json;
 use url::Url;
 
@@ -106,7 +106,136 @@ fn created_at(date: i64) -> String {
 }
 
 fn status_content(post: &crate::parsers::ParsedPost) -> String {
-    encode_text(&post.text).to_string().replace('\n', "<br>")
+    let mut content = if post.allow_discord_markdown {
+        render_activity_markdown(&post.text)
+    } else {
+        encode_text(&post.text).to_string().replace('\n', "<br>")
+    };
+    if let Some(context) = &post.context {
+        content.push_str("<br><blockquote><strong>");
+        content.push_str(&encode_text(&context.author_name));
+        content.push_str("</strong>");
+        if !context.text.is_empty() {
+            content.push_str("<br>");
+            content.push_str(&encode_text(&context.text).replace('\n', "<br>"));
+        }
+        if !context.url.is_empty() {
+            content.push_str("<br><a href=\"");
+            content.push_str(&encode_quoted_attribute(&context.url));
+            content.push_str("\">Original post</a>");
+        }
+        content.push_str("</blockquote>");
+    }
+    content
+}
+
+fn render_activity_markdown(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            output.push_str("<br>");
+        }
+        render_activity_markdown_line(&mut output, line);
+    }
+    output
+}
+
+fn render_activity_markdown_line(output: &mut String, line: &str) {
+    let whitespace_end = line
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .map(|(index, _)| index)
+        .unwrap_or(line.len());
+    output.push_str(&encode_text(&line[..whitespace_end]));
+    let mut rest = &line[whitespace_end..];
+
+    let heading_markers = rest
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if (1..=6).contains(&heading_markers) && rest[heading_markers..].starts_with(' ') {
+        rest = rest[heading_markers..].trim_start_matches(' ');
+    }
+
+    if rest == ">" || rest.starts_with("> ") {
+        output.push_str("<blockquote>");
+        render_activity_inline(output, rest.strip_prefix("> ").unwrap_or(""));
+        output.push_str("</blockquote>");
+        return;
+    }
+
+    render_activity_inline(output, rest);
+}
+
+fn render_activity_inline(output: &mut String, text: &str) {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut markers = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == '\\' {
+            index += 2;
+            continue;
+        }
+        if characters[index] == '*'
+            && characters
+                .get(index + 1)
+                .is_some_and(|character| *character == '*')
+        {
+            markers.push(index);
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+
+    let paired_markers = markers.len() - (markers.len() % 2);
+    let opens = markers
+        .iter()
+        .take(paired_markers)
+        .step_by(2)
+        .copied()
+        .collect::<Vec<_>>();
+    let closes = markers
+        .iter()
+        .take(paired_markers)
+        .skip(1)
+        .step_by(2)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut plain = String::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == '\\' {
+            plain.push('\\');
+            if let Some(next) = characters.get(index + 1) {
+                plain.push(*next);
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if opens.binary_search(&index).is_ok() {
+            flush_activity_text(output, &mut plain);
+            output.push_str("<strong>");
+            index += 2;
+            continue;
+        }
+        if closes.binary_search(&index).is_ok() {
+            flush_activity_text(output, &mut plain);
+            output.push_str("</strong>");
+            index += 2;
+            continue;
+        }
+        plain.push(characters[index]);
+        index += 1;
+    }
+    flush_activity_text(output, &mut plain);
+}
+
+fn flush_activity_text(output: &mut String, plain: &mut String) {
+    output.push_str(&encode_text(plain));
+    plain.clear();
 }
 
 #[cfg(test)]

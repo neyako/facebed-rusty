@@ -59,6 +59,15 @@ async fn resolve_author_handle(ctx: &ParserCtx, mut draft: ParsedPostDraft) -> P
     draft.post
 }
 
+pub(crate) fn parse_fetched_post(
+    ctx: &ParserCtx,
+    post_path: &str,
+    page: &FetchedPage,
+) -> FacebedResult<ParsedPost> {
+    let post_id = extract_post_id(post_path);
+    parse_page(ctx, post_path, post_id.as_deref(), page).map(|draft| draft.post)
+}
+
 fn parse_page(
     ctx: &ParserCtx,
     post_path: &str,
@@ -111,11 +120,13 @@ fn parse_page(
     }
 
     let thumbnail = crate::parsers::util::thumbnail_in_node(story_json);
+    let context = story.context();
 
     Ok(ParsedPostDraft {
         post: ParsedPost {
             author_name: story.author_name,
             author_handle,
+            context,
             text: post_content,
             allow_discord_markdown: is_group_post_path(post_path),
             image_links: story.image_links,

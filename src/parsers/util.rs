@@ -1,5 +1,6 @@
 use crate::error::FacebedError;
 use crate::jq;
+use crate::parsers::PostContext;
 use serde_json::Value;
 
 /// Python `Utils.human_format`. Integer → `1.23K`/`4.5M` style, non-int → unchanged.
@@ -126,10 +127,15 @@ impl<'a> Story<'a> {
     }
 
     pub fn get_text(&self) -> String {
-        match &self.attached {
-            Some(a) => format!("{}\n╰┈➤ {}\n{}", self.text, a.author_name, a.text),
-            None => self.text.clone(),
-        }
+        self.text.clone()
+    }
+
+    pub fn context(&self) -> Option<PostContext> {
+        self.attached.as_deref().map(|attached| PostContext {
+            author_name: attached.author_name.clone(),
+            text: attached.get_text().trim().to_owned(),
+            url: attached.url.clone(),
+        })
     }
 }
 
@@ -481,22 +487,24 @@ mod tests {
     }
 
     #[test]
-    fn story_appends_shared_attached_story_text() {
+    fn story_keeps_shared_attached_story_as_separate_context() {
         let story = Story::from_json(&json!({
             "actors": [{"name": "Outer", "id": "1"}],
             "message": {"text": "outer text"},
             "wwwURL": "https://www.facebook.com/o",
             "attached_story": {
                 "actors": [{"name": "Inner", "id": "2"}],
-                "message": {"text": "inner text"}
+                "message": {"text": "inner text"},
+                "wwwURL": "https://www.facebook.com/i"
             }
         }))
         .unwrap();
 
-        let combined = story.get_text();
-        assert!(combined.contains("outer text"));
-        assert!(combined.contains("╰┈➤ Inner"));
-        assert!(combined.contains("inner text"));
+        assert_eq!(story.get_text(), "outer text");
+        let context = story.context().unwrap();
+        assert_eq!(context.author_name, "Inner");
+        assert_eq!(context.text, "inner text");
+        assert_eq!(context.url, "https://www.facebook.com/i");
     }
 
     #[test]

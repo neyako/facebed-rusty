@@ -13,10 +13,18 @@ pub mod stories;
 pub mod util;
 pub mod video_watch;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostContext {
+    pub author_name: String,
+    pub text: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedPost {
     pub author_name: String,
     pub author_handle: Option<String>,
+    pub context: Option<PostContext>,
     pub text: String,
     /// Let trusted FB-authored Markdown render in Discord embed descriptions.
     pub allow_discord_markdown: bool,
@@ -52,6 +60,7 @@ pub fn banned_post(url: &str) -> ParsedPost {
     ParsedPost {
         author_name: "Banned".into(),
         author_handle: None,
+        context: None,
         text: "This user is banned by the operators of this embed server".into(),
         allow_discord_markdown: false,
         image_links: Vec::new(),

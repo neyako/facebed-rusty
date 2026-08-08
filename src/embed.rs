@@ -85,6 +85,24 @@ fn format_description_text(s: &str, allow_discord_markdown: bool) -> String {
     render_group_markdown(s)
 }
 
+fn format_post_description(post: &ParsedPost) -> String {
+    let mut output = format_description_text(&post.text, post.allow_discord_markdown);
+    if let Some(context) = &post.context {
+        output.push_str("\n\n> **");
+        output.push_str(&escape_markdown(&context.author_name));
+        output.push_str("**");
+        for line in context.text.split('\n') {
+            output.push_str("\n> ");
+            output.push_str(&escape_markdown(line));
+        }
+        if !context.url.is_empty() {
+            output.push_str("\n> Original post: ");
+            output.push_str(&context.url);
+        }
+    }
+    output
+}
+
 /// Render trusted FB-group-post text for a Discord embed description.
 /// FB stores plain text, but group posters often write Markdown intending
 /// formatting. Render a safe subset (bold, blockquote) and neutralize the rest.
@@ -282,6 +300,7 @@ pub fn format_full_post_embed(
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(&post.url, origin)
     });
+    let description = format_post_description(post);
 
     format!(
         r##"<!DOCTYPE html>
@@ -305,10 +324,7 @@ pub fn format_full_post_embed(
         credit = CREDIT,
         site_name = site_name,
         title = escape_attr(&post.author_name),
-        desc = escape_attr(&format_description_text(
-            truncate_chars(&post.text, 4096),
-            post.allow_discord_markdown,
-        )),
+        desc = escape_attr(truncate_chars(&description, 4096)),
         extra = extra,
         url_q = url_q,
         image_meta = image_meta,
@@ -336,6 +352,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
     let oembed = oembed_link_tag(&post.author_name, &post.url, "video");
+    let description = format_post_description(post);
 
     format!(
         r##"<!DOCTYPE html>
@@ -363,10 +380,7 @@ pub fn format_reel_post_embed(post: &ParsedPost, tz_offset: i32) -> String {
 </html>"##,
         credit = CREDIT,
         title = escape_attr(&post.author_name),
-        desc = escape_attr(&format_description_text(
-            truncate_chars(&post.text, 4096),
-            post.allow_discord_markdown,
-        )),
+        desc = escape_attr(truncate_chars(&description, 4096)),
         post_date = post_date,
         reactions = reactions,
         url_q = url_q,
@@ -384,6 +398,7 @@ pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String
     let post_date = format_timestamp(post.date, tz_offset);
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
+    let description = format_post_description(post);
     let image_meta = if thumb.is_empty() {
         String::new()
     } else {
@@ -414,10 +429,7 @@ pub fn format_oversized_video_embed(post: &ParsedPost, tz_offset: i32) -> String
 </html>"##,
         credit = CREDIT,
         title = escape_attr(&post.author_name),
-        desc = escape_attr(&format_description_text(
-            truncate_chars(&post.text, 4096),
-            post.allow_discord_markdown,
-        )),
+        desc = escape_attr(truncate_chars(&description, 4096)),
         post_date = post_date,
         reactions = reactions,
         url_q = url_q,
@@ -499,12 +511,13 @@ pub fn credit() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{format_description_text, format_full_post_embed, format_reel_post_embed};
-    use crate::parsers::ParsedPost;
+    use crate::parsers::{ParsedPost, PostContext};
 
     fn sample_post() -> ParsedPost {
         ParsedPost {
             author_name: r#"Title "quote""#.into(),
             author_handle: None,
+            context: None,
             text: "body text".into(),
             allow_discord_markdown: false,
             image_links: vec!["https://img.example/p.jpg".into()],
@@ -647,6 +660,31 @@ mod tests {
 
         // Then
         assert!(html.contains("⌚ 2024/01/01 07:00:00 UTC+7"));
+    }
+
+    #[test]
+    fn full_embed_orders_focal_text_before_original_context() {
+        // Given
+        let mut post = sample_post();
+        post.text = "FOCALSENTINEL".into();
+        post.context = Some(PostContext {
+            author_name: "ORIGINALAUTHOR".into(),
+            text: "ORIGINALTEXT <unsafe>".into(),
+            url: "https://www.facebook.com/original/posts/456".into(),
+        });
+
+        // When
+        let html = format_full_post_embed(&post, 0, Some("https://facebed.example"));
+
+        // Then
+        let focal = html.find("FOCALSENTINEL").unwrap();
+        let author = html.find("ORIGINALAUTHOR").unwrap();
+        let original = html.find("ORIGINALTEXT").unwrap();
+        let link = html
+            .find("https://www.facebook.com/original/posts/456")
+            .unwrap();
+        assert!(focal < author && author < original && original < link);
+        assert!(!html.contains("ORIGINALTEXT <unsafe>"));
     }
 
     #[test]

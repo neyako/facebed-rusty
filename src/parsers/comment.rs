@@ -1,11 +1,12 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
+use crate::parsers::json_post::parse_fetched_post;
 use crate::parsers::util::{
     human_format, images_from_post, thumbnail_in_node, val_str_at, video_link_in_node,
     videos_from_post,
 };
-use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
+use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx, PostContext};
 use crate::url_clean::ensure_absolute;
 use serde_json::Value;
 use url::Url;
@@ -124,7 +125,11 @@ fn comment_reactions(node: &Value) -> Value {
     Value::Null
 }
 
-fn parsed_post_from_comment(node: &Value, post_path: &str) -> FacebedResult<ParsedPost> {
+fn parsed_post_from_comment(
+    node: &Value,
+    post_path: &str,
+    parent: Option<&ParsedPost>,
+) -> FacebedResult<ParsedPost> {
     let author = node
         .get("author")
         .ok_or_else(|| FacebedError::parse("comment author missing (cau)"))?;
@@ -160,6 +165,11 @@ fn parsed_post_from_comment(node: &Value, post_path: &str) -> FacebedResult<Pars
     Ok(ParsedPost {
         author_name: format!("{author_name} (💬)"),
         author_handle: None,
+        context: parent.map(|post| PostContext {
+            author_name: post.author_name.clone(),
+            text: post.text.clone(),
+            url: post.url.clone(),
+        }),
         text,
         allow_discord_markdown: false,
         image_links,
@@ -179,6 +189,7 @@ impl Parser for CommentParser {
         let comment_id = comment_id_in(post_path)
             .ok_or_else(|| FacebedError::parse("comment path without comment_id"))?;
         let page = ctx.fetcher.fetch(post_path, true).await?;
+        let parent = parse_fetched_post(ctx, post_path, &page).ok();
         let blocks = get_json_blocks(page.document(), true);
         let Some(node) = find_comment_node(&blocks, &comment_id) else {
             // Deep replies / stale ids aren't server-rendered. NoData (not
@@ -192,7 +203,7 @@ impl Parser for CommentParser {
                 return Ok(banned_post(&ensure_absolute(post_path)));
             }
         }
-        parsed_post_from_comment(node, post_path).map_err(|e| match e {
+        parsed_post_from_comment(node, post_path, parent.as_ref()).map_err(|e| match e {
             FacebedError::Parse { message, .. } => {
                 FacebedError::parse_with(message, page.html.clone(), page.url.clone())
             }
@@ -293,7 +304,7 @@ mod tests {
     fn extracts_parsed_post_fields_from_comment_node() {
         let blocks = vec![comment_block()];
         let node = find_comment_node(&blocks, "222").unwrap();
-        let post = parsed_post_from_comment(node, "reel/999?comment_id=222").unwrap();
+        let post = parsed_post_from_comment(node, "reel/999?comment_id=222", None).unwrap();
 
         assert_eq!(post.author_name, "Bob (💬)");
         assert_eq!(post.text, "video reply");
@@ -314,12 +325,47 @@ mod tests {
     fn text_only_comment_uses_feedback_url_and_reactions() {
         let blocks = vec![comment_block()];
         let node = find_comment_node(&blocks, "111").unwrap();
-        let post = parsed_post_from_comment(node, "reel/999?comment_id=111").unwrap();
+        let post = parsed_post_from_comment(node, "reel/999?comment_id=111", None).unwrap();
 
         assert_eq!(post.author_name, "Alice (💬)");
         assert_eq!(post.text, "first!");
         assert_eq!(post.likes, "7");
         assert_eq!(post.url, "https://www.facebook.com/x?comment_id=111");
         assert!(post.video_links.is_empty());
+    }
+
+    #[test]
+    fn comment_keeps_parent_post_as_context() {
+        // Given
+        let blocks = vec![comment_block()];
+        let node = find_comment_node(&blocks, "111").unwrap();
+        let parent = ParsedPost {
+            author_name: "Parent Author".into(),
+            author_handle: Some("parent.author".into()),
+            context: None,
+            text: "parent text".into(),
+            allow_discord_markdown: true,
+            image_links: Vec::new(),
+            url: "https://www.facebook.com/groups/example/posts/999".into(),
+            date: 1,
+            likes: "1".into(),
+            comments: "2".into(),
+            shares: "3".into(),
+            video_links: Vec::new(),
+            thumbnail: None,
+        };
+
+        // When
+        let post =
+            parsed_post_from_comment(node, "reel/999?comment_id=111", Some(&parent)).unwrap();
+
+        // Then
+        assert_eq!(post.text, "first!");
+        assert_eq!(post.context.as_ref().unwrap().author_name, "Parent Author");
+        assert_eq!(post.context.as_ref().unwrap().text, "parent text");
+        assert_eq!(
+            post.context.as_ref().unwrap().url,
+            "https://www.facebook.com/groups/example/posts/999"
+        );
     }
 }

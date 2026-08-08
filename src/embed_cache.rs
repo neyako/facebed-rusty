@@ -97,6 +97,7 @@ mod tests {
         ParsedPost {
             author_name: "Author".into(),
             author_handle: None,
+            context: None,
             text: "Post body".into(),
             allow_discord_markdown: false,
             image_links: Vec::new(),
