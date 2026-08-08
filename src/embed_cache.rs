@@ -96,6 +96,7 @@ mod tests {
     fn activity_post() -> ParsedPost {
         ParsedPost {
             author_name: "Author".into(),
+            author_handle: None,
             text: "Post body".into(),
             allow_discord_markdown: false,
             image_links: Vec::new(),

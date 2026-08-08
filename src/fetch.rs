@@ -357,6 +357,38 @@ impl Fetcher {
         value
     }
 
+    pub async fn resolve_profile_handle(&self, author_id: &str) -> Option<String> {
+        if author_id.is_empty() || !author_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let mut profile_url = Url::parse("https://www.facebook.com/profile.php").ok()?;
+        profile_url.query_pairs_mut().append_pair("id", author_id);
+        let account_count = self.cookies.load().len();
+        let account_order = if account_count == 0 {
+            vec![None]
+        } else {
+            share_account_order(self).into_iter().map(Some).collect()
+        };
+
+        for account_index in account_order {
+            let mut request = self.client.head(profile_url.as_str());
+            for (key, value) in HEADERS {
+                request = request.header(*key, *value);
+            }
+            request = attach_share_identity(self, request, account_index, DEFAULT_USER_AGENT);
+            let Ok(response) = request.send().await else {
+                continue;
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            if let Some(handle) = profile_handle_from_url(response.url().as_str()) {
+                return Some(handle);
+            }
+        }
+        None
+    }
+
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
         let started = Instant::now();
@@ -784,6 +816,38 @@ fn facebook_path_from_url(raw: &str) -> Option<String> {
     Some(out)
 }
 
+pub(crate) fn profile_handle_from_url(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw).ok()?;
+    if !parsed.host_str().is_some_and(is_facebook_page_host) {
+        return None;
+    }
+    let mut segments = parsed
+        .path_segments()?
+        .filter(|segment| !segment.is_empty());
+    let handle = segments.next()?;
+    if segments.next().is_some()
+        || matches!(
+            handle,
+            "checkpoint"
+                | "groups"
+                | "help"
+                | "login"
+                | "me"
+                | "photo.php"
+                | "profile.php"
+                | "recover"
+                | "reel"
+                | "settings"
+                | "share"
+                | "story.php"
+                | "watch"
+        )
+    {
+        return None;
+    }
+    Some(handle.to_owned())
+}
+
 /// Pull the post's canonical URL out of an FB share-page HTML body. Tries
 /// `<link rel="canonical">` first, falls back to `<meta property="og:url">`.
 /// Skips values that point back at /share/ to avoid loops.
@@ -1048,8 +1112,8 @@ mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
         head_target_usable, is_group_landing_target, is_post_like_share_target, probe_page_type,
-        share_resolution_usable, MediaSizeCache, PageType, ResolvedShare, VIDEO_HEAD_CACHE_MAX,
-        VIDEO_HEAD_CACHE_TTL,
+        profile_handle_from_url, share_resolution_usable, MediaSizeCache, PageType, ResolvedShare,
+        VIDEO_HEAD_CACHE_MAX, VIDEO_HEAD_CACHE_TTL,
     };
     use scraper::Html;
     use std::time::{Duration, Instant};
@@ -1060,6 +1124,27 @@ mod tests {
             facebook_path_from_url("https://www.facebook.com/watch/?v=123&rdid=x"),
             Some("watch/?v=123&rdid=x".into())
         );
+    }
+
+    #[test]
+    fn profile_handle_uses_redirected_facebook_vanity_path() {
+        // Given
+        let profile_url = "https://www.facebook.com/nguyen.jerry.3532/";
+
+        // When
+        let handle = profile_handle_from_url(profile_url);
+
+        // Then
+        assert_eq!(handle.as_deref(), Some("nguyen.jerry.3532"));
+        assert_eq!(
+            profile_handle_from_url("https://www.facebook.com/profile.php?id=123"),
+            None
+        );
+        assert_eq!(
+            profile_handle_from_url("https://www.facebook.com/login/"),
+            None
+        );
+        assert_eq!(profile_handle_from_url("https://example.com/alice"), None);
     }
 
     #[test]

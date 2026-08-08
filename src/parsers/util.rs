@@ -50,6 +50,7 @@ pub fn val_str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 /// `Story` from Python — used by JsonParser. Recursive: attached_story is the shared/quoted post.
 pub struct Story<'a> {
     pub author_name: String,
+    pub author_url: String,
     pub text: String,
     pub image_links: Vec<String>,
     pub video_links: Vec<String>,
@@ -69,6 +70,7 @@ impl<'a> Story<'a> {
             .first()
             .ok_or_else(|| FacebedError::parse("story.actors[0] missing"))?;
         let author_name = val_str_at(actor, "name").unwrap_or("").to_owned();
+        let author_url = val_str_at(actor, "url").unwrap_or("").to_owned();
         let author_id = match actor.get("id") {
             Some(Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
@@ -112,6 +114,7 @@ impl<'a> Story<'a> {
 
         Ok(Self {
             author_name,
+            author_url,
             text,
             image_links,
             video_links,
@@ -337,32 +340,67 @@ pub fn extract_link_card(story_json: &Value) -> Option<(String, String)> {
     None
 }
 
-pub fn interaction_counts(post_json: &Value) -> Result<(String, String, String), FacebedError> {
-    let pf = jq::first(post_json, "comet_ufi_summary_and_actions_renderer")
+pub fn interaction_counts(
+    post_json: &Value,
+    post_id: Option<&str>,
+) -> Result<(String, String, String), FacebedError> {
+    let renderers = jq::all(post_json, "comet_ufi_summary_and_actions_renderer");
+    let pf = post_id
+        .and_then(|id| {
+            renderers.iter().copied().find(|renderer| {
+                renderer
+                    .pointer("/feedback/subscription_target_id")
+                    .is_some_and(|value| val_str(value) == id)
+            })
+        })
+        .or_else(|| renderers.first().copied())
         .ok_or_else(|| FacebedError::parse("missing comet_ufi_summary_and_actions_renderer"))?;
     let fb = pf
         .get("feedback")
         .ok_or_else(|| FacebedError::parse("missing feedback"))?;
-    let reactions = fb
-        .get("i18n_reaction_count")
-        .map(val_str)
+    let adaptive = fb
+        .get("adaptive_ufi_action_renderers")
+        .and_then(Value::as_array);
+    let reactions = adaptive
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                jq::first(item, "reaction_count").and_then(|count| count.get("count"))
+            })
+        })
+        .map(human_format)
+        .or_else(|| fb.get("i18n_reaction_count").map(val_str))
         .unwrap_or_else(|| "0".into());
-    let shares = fb
-        .get("i18n_share_count")
-        .map(val_str)
+    let shares = adaptive
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                jq::first(item, "share_count").and_then(|count| count.get("count"))
+            })
+        })
+        .map(human_format)
+        .or_else(|| fb.get("i18n_share_count").map(val_str))
         .unwrap_or_else(|| "0".into());
-    let comments = fb
-        .get("comment_rendering_instance")
-        .and_then(|c| c.get("comments"))
-        .and_then(|c| c.get("total_count"))
-        .map(val_str)
+    let comments = adaptive
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                jq::first(item, "comment_rendering_instance")
+                    .and_then(|comments| comments.get("comments"))
+                    .and_then(|comments| comments.get("total_count"))
+            })
+        })
+        .map(human_format)
+        .or_else(|| {
+            fb.get("comment_rendering_instance")
+                .and_then(|comments| comments.get("comments"))
+                .and_then(|comments| comments.get("total_count"))
+                .map(val_str)
+        })
         .unwrap_or_else(|| "0".into());
     Ok((reactions, comments, shares))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{images_from_post, Story};
+    use super::{images_from_post, interaction_counts, Story};
     use serde_json::json;
 
     #[test]
@@ -459,5 +497,51 @@ mod tests {
         assert!(combined.contains("outer text"));
         assert!(combined.contains("╰┈➤ Inner"));
         assert!(combined.contains("inner text"));
+    }
+
+    #[test]
+    fn interaction_counts_selects_focal_adaptive_ufi_renderer() {
+        // Given
+        let post = json!({
+            "payload": [
+                {
+                    "comet_ufi_summary_and_actions_renderer": {
+                        "feedback": {
+                            "subscription_target_id": "decoy",
+                            "i18n_reaction_count": "999",
+                            "i18n_share_count": "999",
+                            "comment_rendering_instance": {
+                                "comments": {"total_count": 999}
+                            }
+                        }
+                    }
+                },
+                {
+                    "comet_ufi_summary_and_actions_renderer": {
+                        "feedback": {
+                            "subscription_target_id": "2337103290413283",
+                            "i18n_reaction_count": "0",
+                            "i18n_share_count": "0",
+                            "comment_rendering_instance": {
+                                "comments": {"total_count": 0}
+                            },
+                            "adaptive_ufi_action_renderers": [
+                                {"feedback": {"reaction_count": {"count": 19}}},
+                                {"feedback": {"comment_rendering_instance": {
+                                    "comments": {"total_count": 77}
+                                }}},
+                                {"feedback": {"share_count": {"count": 0}}}
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        // When
+        let counts = interaction_counts(&post, Some("2337103290413283")).unwrap();
+
+        // Then
+        assert_eq!(counts, ("19".into(), "77".into(), "0".into()));
     }
 }

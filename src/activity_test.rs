@@ -6,6 +6,7 @@ use url::Url;
 fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
     ParsedPost {
         author_name: "Example Author".to_owned(),
+        author_handle: Some("example.author".to_owned()),
         text,
         allow_discord_markdown: false,
         image_links: image_links.into_iter().map(str::to_owned).collect(),
@@ -17,6 +18,24 @@ fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
         video_links: Vec::new(),
         thumbnail: None,
     }
+}
+
+#[test]
+fn status_json_uses_real_handle_with_short_facebook_domain() {
+    // Given
+    let post = post("qualified account".to_owned(), vec![]);
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert_eq!(json["account"]["display_name"], "Example Author");
+    assert_eq!(json["account"]["username"], "example.author");
+    assert_eq!(json["account"]["acct"], "example.author@fb.com");
+    assert_eq!(
+        json["account"]["url"],
+        "https://www.facebook.com/groups/example/posts/123"
+    );
 }
 
 #[test]

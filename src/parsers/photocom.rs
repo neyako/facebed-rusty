@@ -59,6 +59,7 @@ impl Parser for PhotocomParser {
 
         Ok(ParsedPost {
             author_name: format!("{} (💬)", owner_name),
+            author_handle: None,
             text,
             allow_discord_markdown: false,
             image_links: vec![image],

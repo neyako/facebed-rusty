@@ -57,6 +57,11 @@ pub fn alternate_link(post_url: &str, public_origin: &str) -> String {
 }
 
 pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
+    let username = post.author_handle.as_deref().unwrap_or("facebed");
+    let acct = post
+        .author_handle
+        .as_ref()
+        .map_or_else(|| "facebed".to_owned(), |handle| format!("{handle}@fb.com"));
     let attachments = post
         .image_links
         .iter()
@@ -79,7 +84,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         "replies_count": 0, "reblogs_count": 0, "favourites_count": 0,
         "application": { "name": "Facebed", "website": null },
         "account": {
-            "id": "facebed", "username": "facebed", "acct": "facebed",
+            "id": "facebed", "username": username, "acct": acct,
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
             "note": "", "url": post.url,

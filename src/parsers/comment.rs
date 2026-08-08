@@ -159,6 +159,7 @@ fn parsed_post_from_comment(node: &Value, post_path: &str) -> FacebedResult<Pars
 
     Ok(ParsedPost {
         author_name: format!("{author_name} (💬)"),
+        author_handle: None,
         text,
         allow_discord_markdown: false,
         image_links,

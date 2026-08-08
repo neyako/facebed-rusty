@@ -1332,6 +1332,7 @@ mod tests {
     fn activity_post() -> crate::parsers::ParsedPost {
         crate::parsers::ParsedPost {
             author_name: "Author".into(),
+            author_handle: None,
             text: "Post".into(),
             allow_discord_markdown: false,
             image_links: vec!["https://img.example/post.jpg".into()],

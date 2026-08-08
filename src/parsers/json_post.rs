@@ -1,7 +1,7 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::{get_json_block_texts, FetchedPage, JsonBlockText};
+use crate::fetch::{get_json_block_texts, profile_handle_from_url, FetchedPage, JsonBlockText};
 use crate::jq;
-use crate::parsers::util::{interaction_counts, val_str_at, Story};
+use crate::parsers::util::{interaction_counts, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::{self, ensure_absolute};
 use once_cell::sync::Lazy;
@@ -11,6 +11,11 @@ use url::Url;
 
 pub struct JsonPostParser;
 
+struct ParsedPostDraft {
+    post: ParsedPost,
+    unresolved_author_id: Option<String>,
+}
+
 #[async_trait::async_trait]
 impl Parser for JsonPostParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
@@ -18,22 +23,40 @@ impl Parser for JsonPostParser {
         if should_try_partial_fetch(post_id.as_deref()) {
             let pid = post_id.clone().unwrap_or_default();
             let mut scanner = PostBlockScanner::default();
-            let page = ctx
-                .fetcher
-                .fetch_until(post_path, true, |bytes| scanner.found_match(bytes, &pid))
-                .await?;
-            match parse_page(ctx, post_path, post_id.as_deref(), &page) {
-                Ok(post) => return Ok(post),
-                Err(e) if page.is_partial() => {
+            let (is_partial, parsed) = {
+                let page = ctx
+                    .fetcher
+                    .fetch_until(post_path, true, |bytes| scanner.found_match(bytes, &pid))
+                    .await?;
+                (
+                    page.is_partial(),
+                    parse_page(ctx, post_path, post_id.as_deref(), &page),
+                )
+            };
+            match parsed {
+                Ok(draft) => return Ok(resolve_author_handle(ctx, draft).await),
+                Err(e) if is_partial => {
                     tracing::warn!(path = %post_path, error = %e, "partial post parse failed; retrying full fetch");
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        let page = ctx.fetcher.fetch(post_path, true).await?;
-        parse_page(ctx, post_path, post_id.as_deref(), &page)
+        let parsed = {
+            let page = ctx.fetcher.fetch(post_path, true).await?;
+            parse_page(ctx, post_path, post_id.as_deref(), &page)
+        };
+        Ok(resolve_author_handle(ctx, parsed?).await)
     }
+}
+
+async fn resolve_author_handle(ctx: &ParserCtx, mut draft: ParsedPostDraft) -> ParsedPost {
+    if let Some(author_id) = draft.unresolved_author_id {
+        if let Some(handle) = ctx.fetcher.resolve_profile_handle(&author_id).await {
+            draft.post.author_handle = Some(handle);
+        }
+    }
+    draft.post
 }
 
 fn parse_page(
@@ -41,7 +64,7 @@ fn parse_page(
     post_path: &str,
     post_id: Option<&str>,
     page: &FetchedPage,
-) -> FacebedResult<ParsedPost> {
+) -> FacebedResult<ParsedPostDraft> {
     let html = page.document();
     let blocks = get_json_block_texts(html, true);
     let post_json = get_post_json(&blocks, post_id).ok_or_else(|| {
@@ -50,7 +73,7 @@ fn parse_page(
     let root = get_root_node(&post_json).ok_or_else(|| {
         FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
     })?;
-    let (likes, cmts, shares) = interaction_counts(root)?;
+    let (likes, cmts, shares) = interaction_counts(root, post_id)?;
 
     let post_date = root
         .pointer("/context_layout/story/comet_sections/metadata")
@@ -72,31 +95,39 @@ fn parse_page(
         story.url.clone()
     };
     let post_content = story.get_text().trim().to_owned();
-    let group_name = get_group_name(&blocks);
-    let mut link_header = story.author_name.clone();
-    if !group_name.is_empty() {
-        link_header.push_str(" • ");
-        link_header.push_str(&group_name);
-    }
+    let group_handle = group_handle_from_post_path(post_path).map(str::to_owned);
+    let embedded_handle = profile_handle_from_url(&story.author_url);
+    let unresolved_author_id = embedded_handle
+        .is_none()
+        .then(|| story.author_id.clone())
+        .filter(|author_id| !author_id.is_empty());
+    let author_handle = embedded_handle.or(group_handle);
 
     if ctx.is_banned(&story.author_id) {
-        return Ok(banned_post(&post_url));
+        return Ok(ParsedPostDraft {
+            post: banned_post(&post_url),
+            unresolved_author_id: None,
+        });
     }
 
     let thumbnail = crate::parsers::util::thumbnail_in_node(story_json);
 
-    Ok(ParsedPost {
-        author_name: link_header,
-        text: post_content,
-        allow_discord_markdown: is_group_post_path(post_path),
-        image_links: story.image_links,
-        url: post_url,
-        date: post_date,
-        likes,
-        comments: cmts,
-        shares,
-        video_links: story.video_links,
-        thumbnail,
+    Ok(ParsedPostDraft {
+        post: ParsedPost {
+            author_name: story.author_name,
+            author_handle,
+            text: post_content,
+            allow_discord_markdown: is_group_post_path(post_path),
+            image_links: story.image_links,
+            url: post_url,
+            date: post_date,
+            likes,
+            comments: cmts,
+            shares,
+            video_links: story.video_links,
+            thumbnail,
+        },
+        unresolved_author_id,
     })
 }
 
@@ -332,6 +363,18 @@ fn is_group_post_path(post_path: &str) -> bool {
     post_path.trim_start_matches('/').starts_with("groups/")
 }
 
+fn group_handle_from_post_path(post_path: &str) -> Option<&str> {
+    let mut segments = post_path
+        .split('?')
+        .next()?
+        .trim_start_matches('/')
+        .split('/');
+    match (segments.next(), segments.next()) {
+        (Some("groups"), Some(handle)) if !handle.is_empty() => Some(handle),
+        _ => None,
+    }
+}
+
 fn get_root_node(post_json: &Value) -> Option<&Value> {
     // normal: data has comet_ufi_summary..., node_v2 or node
     let data = jq::first(post_json, "data")?;
@@ -355,32 +398,11 @@ fn get_root_node(post_json: &Value) -> Option<&Value> {
     Some(cs)
 }
 
-fn get_group_name(blocks: &[JsonBlockText]) -> String {
-    for block in blocks {
-        if !block.text.contains("group_member_profiles")
-            || !block.text.contains("formatted_count_text")
-        {
-            continue;
-        }
-        let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
-            continue;
-        };
-        if jq::has(&bloc, &["group_member_profiles", "formatted_count_text"]) {
-            for group in jq::all(&bloc, "group") {
-                if let Some(name) = val_str_at(group, "name") {
-                    return name.to_owned();
-                }
-            }
-        }
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_post_id, get_post_json, get_root_node, is_group_post_path,
-        should_try_partial_fetch, PostBlockScanner,
+        extract_post_id, get_post_json, get_root_node, group_handle_from_post_path,
+        is_group_post_path, should_try_partial_fetch, PostBlockScanner,
     };
     use crate::fetch::JsonBlockText;
     use serde_json::json;
@@ -611,6 +633,16 @@ mod tests {
             "/groups/sportsbook6vn/posts/1372570601398684/"
         ));
         assert!(!is_group_post_path("some.page/posts/1372570601398684/"));
+    }
+
+    #[test]
+    fn group_handle_uses_group_vanity_segment() {
+        // Given / When / Then
+        assert_eq!(
+            group_handle_from_post_path("groups/cuongsac/permalink/1440980791332233/"),
+            Some("cuongsac")
+        );
+        assert_eq!(group_handle_from_post_path("some.page/posts/123"), None);
     }
 
     #[test]

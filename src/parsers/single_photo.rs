@@ -38,7 +38,7 @@ impl Parser for SinglePhotoParser {
             .get("created_time")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        let (likes, cmts, shares) = interaction_counts(&interaction)?;
+        let (likes, cmts, shares) = interaction_counts(&interaction, None)?;
         let image = get_single_image(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "cannot find single image",
@@ -49,6 +49,7 @@ impl Parser for SinglePhotoParser {
 
         Ok(ParsedPost {
             author_name: author,
+            author_handle: None,
             text: text.trim().to_owned(),
             allow_discord_markdown: false,
             image_links: vec![image],

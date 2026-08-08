@@ -16,6 +16,7 @@ pub mod video_watch;
 #[derive(Debug, Clone)]
 pub struct ParsedPost {
     pub author_name: String,
+    pub author_handle: Option<String>,
     pub text: String,
     /// Let trusted FB-authored Markdown render in Discord embed descriptions.
     pub allow_discord_markdown: bool,
@@ -50,6 +51,7 @@ impl ParserCtx {
 pub fn banned_post(url: &str) -> ParsedPost {
     ParsedPost {
         author_name: "Banned".into(),
+        author_handle: None,
         text: "This user is banned by the operators of this embed server".into(),
         allow_discord_markdown: false,
         image_links: Vec::new(),

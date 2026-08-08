@@ -259,8 +259,17 @@ pub fn format_full_post_embed(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let post_date = format_timestamp(post.date, tz_offset);
+    let post_date = if activity_origin.is_some() {
+        String::new()
+    } else {
+        format_timestamp(post.date, tz_offset)
+    };
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
+    let site_name = [CREDIT, &post_date, &reactions]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     let url_q = quote(&post.url);
     let kind = if activity_origin.is_some() {
         "rich"
@@ -282,9 +291,7 @@ pub fn format_full_post_embed(
     <meta charset="UTF-8"/>
     <meta property="og:title" content="{title}"/>
     <meta property="og:description" content="{desc}"/>
-    <meta property="og:site_name" content="{credit}
-{post_date}
-{reactions}{extra}"/>
+    <meta property="og:site_name" content="{site_name}{extra}"/>
     <meta property="og:url" content="{url_q}"/>
     {image_meta}
     <link rel="canonical" href="{url_q}"/>
@@ -296,13 +303,12 @@ pub fn format_full_post_embed(
 </head>
 </html>"##,
         credit = CREDIT,
+        site_name = site_name,
         title = escape_attr(&post.author_name),
         desc = escape_attr(&format_description_text(
             truncate_chars(&post.text, 4096),
             post.allow_discord_markdown,
         )),
-        post_date = post_date,
-        reactions = reactions,
         extra = extra,
         url_q = url_q,
         image_meta = image_meta,
@@ -498,6 +504,7 @@ mod tests {
     fn sample_post() -> ParsedPost {
         ParsedPost {
             author_name: r#"Title "quote""#.into(),
+            author_handle: None,
             text: "body text".into(),
             allow_discord_markdown: false,
             image_links: vec!["https://img.example/p.jpg".into()],
@@ -610,6 +617,36 @@ mod tests {
         )));
         assert!(html.contains(r#"type="application/activity+json""#));
         assert!(html.contains("&amp;type=rich"));
+    }
+
+    #[test]
+    fn activity_full_embed_omits_detailed_timestamp_but_keeps_counters() {
+        // Given
+        let mut post = sample_post();
+        post.date = 1_704_067_200;
+        post.likes = "19".into();
+        post.comments = "77".into();
+        post.shares = "0".into();
+
+        // When
+        let html = format_full_post_embed(&post, 7, Some("https://facebed.example"));
+
+        // Then
+        assert!(!html.contains("⌚ 2024/01/01 07:00:00 UTC+7"));
+        assert!(html.contains("❤️ 19 • 💬 77 • 🔁 0"));
+    }
+
+    #[test]
+    fn non_activity_full_embed_keeps_detailed_timestamp() {
+        // Given
+        let mut post = sample_post();
+        post.date = 1_704_067_200;
+
+        // When
+        let html = format_full_post_embed(&post, 7, None);
+
+        // Then
+        assert!(html.contains("⌚ 2024/01/01 07:00:00 UTC+7"));
     }
 
     #[test]
