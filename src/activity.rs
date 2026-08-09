@@ -63,6 +63,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         .as_deref()
         .or(post.author_id.as_deref())
         .unwrap_or("facebed");
+    let acct = format!("{username}@fb.com");
     let account_id = post.author_id.as_deref().unwrap_or(username);
     let profile_avatar = post
         .author_handle
@@ -109,7 +110,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         "replies_count": 0, "reblogs_count": 0, "favourites_count": 0,
         "application": { "name": "Facebed", "website": null },
         "account": {
-            "id": account_id, "username": username, "acct": username,
+            "id": account_id, "username": username, "acct": acct,
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
             "note": "", "url": post.url,
@@ -144,17 +145,24 @@ fn status_content(post: &crate::parsers::ParsedPost) -> String {
         encode_text(&post.text).to_string().replace('\n', "<br>")
     };
     if let Some(context) = &post.context {
-        content.push_str("<br><blockquote><strong>");
+        if !content.is_empty() {
+            content.push_str("<br><br>");
+        }
+        content.push_str("<blockquote>");
+        if !context.url.is_empty() {
+            content.push_str("<a href=\"");
+            content.push_str(&encode_quoted_attribute(&context.url));
+            content.push_str("\">");
+        }
+        content.push_str("<strong>Quoting ");
         content.push_str(&encode_text(&context.author_name));
         content.push_str("</strong>");
-        if !context.text.is_empty() {
-            content.push_str("<br>");
-            content.push_str(&encode_text(&context.text).replace('\n', "<br>"));
-        }
         if !context.url.is_empty() {
-            content.push_str("<br><a href=\"");
-            content.push_str(&encode_quoted_attribute(&context.url));
-            content.push_str("\">Original post</a>");
+            content.push_str("</a>");
+        }
+        if !context.text.is_empty() {
+            content.push_str("<br><br>");
+            content.push_str(&encode_text(&context.text).replace('\n', "<br>"));
         }
         content.push_str("</blockquote>");
     }

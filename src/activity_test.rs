@@ -24,7 +24,7 @@ fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
 }
 
 #[test]
-fn status_json_uses_bare_real_handle_without_platform_domain() {
+fn status_json_uses_short_facebook_account_domain() {
     // Given
     let post = post("qualified account".to_owned(), vec![]);
 
@@ -35,7 +35,7 @@ fn status_json_uses_bare_real_handle_without_platform_domain() {
     assert_eq!(json["account"]["display_name"], "Example Author");
     assert_eq!(json["account"]["id"], "100012345");
     assert_eq!(json["account"]["username"], "example.author");
-    assert_eq!(json["account"]["acct"], "example.author");
+    assert_eq!(json["account"]["acct"], "example.author@fb.com");
     assert_eq!(
         json["account"]["url"],
         "https://www.facebook.com/groups/example/posts/123"
@@ -150,7 +150,7 @@ fn status_json_keeps_non_group_markdown_literal() {
 }
 
 #[test]
-fn status_json_renders_focal_post_before_original_context() {
+fn status_json_links_quoted_post_heading_with_fixupx_spacing() {
     // Given
     let mut post = post("focal text".to_owned(), vec![]);
     post.context = Some(PostContext {
@@ -164,12 +164,10 @@ fn status_json_renders_focal_post_before_original_context() {
     let content = json["content"].as_str().unwrap();
 
     // Then
-    assert!(content.starts_with("focal text<br><blockquote>"));
-    assert!(content.contains("<strong>Original Author</strong>"));
-    assert!(content.contains("original &lt;unsafe&gt;&amp; text"));
-    assert!(content
-        .contains(r#"<a href="https://www.facebook.com/original/posts/456">Original post</a>"#));
-    assert!(content.ends_with("</blockquote>"));
+    assert_eq!(
+        content,
+        r#"focal text<br><br><blockquote><a href="https://www.facebook.com/original/posts/456"><strong>Quoting Original Author</strong></a><br><br>original &lt;unsafe&gt;&amp; text</blockquote>"#
+    );
 }
 
 #[test]
