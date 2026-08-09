@@ -160,15 +160,14 @@ fn get_post_json_for_page(
     // First pass: id-aware match.
     if let Some(pid) = post_id {
         for block in blocks {
-            if !block.text.contains("i18n_reaction_count") {
+            let contains_candidate_id = block.text.contains(pid)
+                || canonical_post_id.is_some_and(|id| block.text.contains(id));
+            if !contains_candidate_id {
                 continue;
             }
             let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
                 continue;
             };
-            if !jq::has(&bloc, &["i18n_reaction_count"]) {
-                continue;
-            }
             let Some(story) = get_root_node(&bloc).and_then(|root| root.pointer("/content/story"))
             else {
                 continue;
@@ -589,6 +588,33 @@ mod tests {
                 .and_then(|root| root.pointer("/content/story/wwwURL"))
                 .and_then(|url| url.as_str()),
             Some("https://www.facebook.com/dantech0xff/posts/pfbidREQUESTED")
+        );
+    }
+
+    #[test]
+    fn exact_id_match_accepts_structured_reaction_count_without_i18n_label() {
+        // Given
+        let mut target = post_block(
+            "https://www.facebook.com/lazzyrabbii/posts/pfbidREQUESTED",
+            "target",
+        );
+        let mut target_json: serde_json::Value = serde_json::from_str(&target.text).unwrap();
+        target_json
+            .as_object_mut()
+            .unwrap()
+            .remove("i18n_reaction_count");
+        target_json["data"]["comet_ufi_summary_and_actions_renderer"]["feedback"] = json!({"adaptive_ufi_action_renderers": [{
+            "feedback": {"reaction_count": {"count": 0}}
+        }]});
+        target.text = target_json.to_string();
+
+        // When
+        let selected = get_post_json(&[target], Some("pfbidREQUESTED"));
+
+        // Then
+        assert!(
+            selected.is_some(),
+            "exact story identity should not require an i18n reaction label"
         );
     }
 
