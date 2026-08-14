@@ -72,11 +72,6 @@ fn walk_all<'a>(root: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     }
 }
 
-/// Find the last occurrence of `key` (in walk order).
-pub fn last<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
-    all(root, key).into_iter().last()
-}
-
 /// True iff *every* key exists somewhere in the tree.
 pub fn has(root: &Value, keys: &[&str]) -> bool {
     keys.iter().all(|k| first(root, k).is_some())

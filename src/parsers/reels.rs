@@ -258,35 +258,35 @@ fn get_reaction_counts(
     }
     let bloc = matched[0];
 
-    let first_fb = jq::first(bloc, "feedback")?;
-    let last_fb = jq::last(bloc, "feedback")?;
-    let (first_fb, last_fb) = if first_fb
-        .to_string()
-        .contains("cross_universe_feedback_info")
-    {
-        (last_fb, first_fb)
-    } else {
-        (first_fb, last_fb)
-    };
-
-    let ig_cmts = last_fb
-        .pointer("/cross_universe_feedback_info/ig_comment_count")
+    let feedback = jq::all(bloc, "feedback");
+    let likes = feedback
+        .iter()
+        .find_map(|value| {
+            value
+                .pointer("/unified_reactors/count")
+                .or_else(|| {
+                    value.pointer("/cross_universe_feedback_info/aggregated_reaction_count")
+                })
+                .or_else(|| value.pointer("/cross_universe_feedback_info/ig_reaction_count"))
+        })
         .cloned()
         .unwrap_or(Value::Null);
-    let likes = first_fb
-        .pointer("/unified_reactors/count")
+    let cmts = feedback
+        .iter()
+        .find_map(|value| {
+            if is_ig {
+                value
+                    .pointer("/cross_universe_feedback_info/ig_comment_count")
+                    .or_else(|| value.get("total_comment_count"))
+            } else {
+                value.get("total_comment_count")
+            }
+        })
         .cloned()
         .unwrap_or(Value::Null);
-    let cmts = if is_ig {
-        ig_cmts
-    } else {
-        last_fb
-            .get("total_comment_count")
-            .cloned()
-            .unwrap_or(Value::Null)
-    };
-    let shares = last_fb
-        .get("share_count_reduced")
+    let shares = feedback
+        .iter()
+        .find_map(|value| value.get("share_count_reduced"))
         .cloned()
         .unwrap_or(Value::Null);
 
@@ -340,7 +340,7 @@ impl ValueExt for Value {
 
 #[cfg(test)]
 mod tests {
-    use super::find_owner_with_name;
+    use super::{find_owner_with_name, get_reaction_counts};
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
@@ -394,5 +394,27 @@ mod tests {
             owner.get("name").and_then(|v| v.as_str()),
             Some("Right Creator")
         );
+    }
+
+    #[test]
+    fn reaction_counts_select_feedback_by_fields_not_tree_order() {
+        let blocks = vec![json!({
+            "a_nested_reaction": {
+                "feedback": {
+                    "cross_universe_feedback_info": {},
+                    "unified_reactors": {"count": 26452}
+                }
+            },
+            "feedback": {
+                "cross_universe_feedback_info": {},
+                "total_comment_count": 172,
+                "share_count_reduced": "325"
+            },
+            "id": "video-story"
+        })];
+
+        let counts = get_reaction_counts(&blocks, false, "video-story");
+
+        assert_eq!(counts, Some(("26.452K".into(), "172".into(), "325".into())));
     }
 }
