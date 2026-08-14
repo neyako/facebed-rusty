@@ -426,7 +426,12 @@ pub fn interaction_counts(
             })
         })
         .map(human_format)
-        .or_else(|| fb.get("i18n_reaction_count").map(val_str))
+        .or_else(|| fb.pointer("/reaction_count/count").map(human_format))
+        .or_else(|| {
+            fb.get("i18n_reaction_count")
+                .filter(|count| !count.is_null())
+                .map(val_str)
+        })
         .unwrap_or_else(|| "0".into());
     let shares = adaptive
         .and_then(|items| {
@@ -676,5 +681,28 @@ mod tests {
 
         // Then
         assert_eq!(counts, ("19".into(), "77".into(), "0".into()));
+    }
+
+    #[test]
+    fn interaction_counts_uses_structured_reactions_when_localized_label_is_null() {
+        let post = json!({
+            "comet_ufi_summary_and_actions_renderer": {
+                "feedback": {
+                    "subscription_target_id": "123",
+                    "reaction_count": {"count": 863},
+                    "i18n_reaction_count": null,
+                    "adaptive_ufi_action_renderers": [
+                        {"feedback": {"comment_rendering_instance": {
+                            "comments": {"total_count": 248}
+                        }}},
+                        {"feedback": {"share_count": {"count": 19}}}
+                    ]
+                }
+            }
+        });
+
+        let counts = interaction_counts(&post, Some("123")).unwrap();
+
+        assert_eq!(counts, ("863".into(), "248".into(), "19".into()));
     }
 }

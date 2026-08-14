@@ -352,7 +352,11 @@ pub fn format_reel_post_embed(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let post_date = format_timestamp(post.date, tz_offset);
+    let post_date = if activity_origin.is_some() {
+        String::new()
+    } else {
+        format_timestamp(post.date, tz_offset)
+    };
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
     let oembed = oembed_link_tag(&post.author_name, &post.url, "video");
@@ -408,7 +412,11 @@ pub fn format_oversized_video_embed(
     activity_origin: Option<&str>,
 ) -> String {
     let thumb = post.thumbnail.clone().unwrap_or_default();
-    let post_date = format_timestamp(post.date, tz_offset);
+    let post_date = if activity_origin.is_some() {
+        String::new()
+    } else {
+        format_timestamp(post.date, tz_offset)
+    };
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
     let description = format_post_description(post);
@@ -732,6 +740,26 @@ mod tests {
         assert!(html.contains(r#"<meta name="twitter:card" content="player"/>"#));
         assert!(html.contains(r#"type="application/activity+json""#));
         assert!(html.contains("https://facebed.example/users/facebed/statuses/"));
+    }
+
+    #[test]
+    fn activity_video_embeds_omit_detailed_timestamp_and_keep_counters() {
+        let mut post = sample_post();
+        post.date = 1_704_067_200;
+        post.likes = "19".into();
+        post.comments = "77".into();
+        post.shares = "3".into();
+        post.image_links.clear();
+        post.video_links = vec!["https://video.fbcdn.net/v.mp4".into()];
+        post.thumbnail = Some("https://img.example/video.jpg".into());
+
+        let reel = format_reel_post_embed(&post, 7, Some("https://facebed.example"));
+        let oversized = format_oversized_video_embed(&post, 7, Some("https://facebed.example"));
+
+        for html in [reel, oversized] {
+            assert!(!html.contains("⌚ 2024/01/01 07:00:00 UTC+7"));
+            assert!(html.contains("❤️ 19 • 💬 77 • 🔁 3"));
+        }
     }
 
     #[test]
