@@ -73,6 +73,7 @@ pub fn author_avatar_in_node(node: &Value) -> Option<String> {
         "profile_picture",
         "profile_picture_depth_0",
         "profile_picture_depth_1",
+        "displayPicture",
         "profile_pic_url",
         "profile_pic_url_hd",
         "profilePictureUrl",
@@ -512,6 +513,22 @@ mod tests {
         for (author, expected) in cases {
             assert_eq!(author_avatar_in_node(&author).as_deref(), Some(expected));
         }
+    }
+
+    #[test]
+    fn selected_reel_author_avatar_uses_display_picture() {
+        // Given
+        let author = json!({
+            "id": "100019239972388",
+            "name": "Nikolai Aksenov",
+            "displayPicture": {"uri": "https://scontent.example/reel-avatar.jpg"}
+        });
+
+        // When / Then
+        assert_eq!(
+            author_avatar_in_node(&author).as_deref(),
+            Some("https://scontent.example/reel-avatar.jpg")
+        );
     }
 
     #[test]
