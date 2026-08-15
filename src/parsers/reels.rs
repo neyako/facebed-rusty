@@ -58,7 +58,7 @@ impl Parser for ReelsParser {
             .unwrap_or_else(|| crate::url_clean::ensure_absolute(post_path));
 
         let date = find_creation_time(&blocks).unwrap_or(0);
-        let post_text = find_message_text(&blocks);
+        let post_text = find_message_text(&blocks, &content_node, &video_id);
 
         let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, &video_id).unwrap_or((
             "null".into(),
@@ -218,17 +218,68 @@ fn find_creation_time(blocks: &[Value]) -> Option<i64> {
     None
 }
 
-fn find_message_text(blocks: &[Value]) -> String {
-    for bloc in blocks {
-        for msg in jq::all(bloc, "message") {
-            if let Some(t) = msg.get("text").and_then(|v| v.as_str()) {
-                if !t.is_empty() {
-                    return t.to_owned();
-                }
+fn find_message_text(blocks: &[Value], content_node: &Value, video_id: &str) -> String {
+    if let Some(text) = first_message_text(content_node) {
+        return text;
+    }
+    if !video_id.is_empty() {
+        for block in blocks {
+            if let Some(text) = linked_message_text(block, video_id) {
+                return text;
             }
+        }
+        return String::new();
+    }
+    for bloc in blocks {
+        if let Some(text) = first_message_text(bloc) {
+            return text;
         }
     }
     String::new()
+}
+
+fn first_message_text(node: &Value) -> Option<String> {
+    for key in ["message", "message_preferred_body"] {
+        if let Some(text) = node
+            .get(key)
+            .and_then(message_text)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text);
+        }
+    }
+    jq::all(node, "message")
+        .into_iter()
+        .find_map(|message| message_text(message).filter(|text| !text.is_empty()))
+}
+
+fn message_text(message: &Value) -> Option<String> {
+    message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn linked_message_text(node: &Value, video_id: &str) -> Option<String> {
+    match node {
+        Value::Object(map) => {
+            let linked = ["id", "video_id", "videoId", "videoID"]
+                .iter()
+                .filter_map(|key| map.get(*key))
+                .any(|value| value_matches_id(value, video_id));
+            if linked {
+                if let Some(text) = first_message_text(node) {
+                    return Some(text);
+                }
+            }
+            map.values()
+                .find_map(|child| linked_message_text(child, video_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| linked_message_text(child, video_id)),
+        _ => None,
+    }
 }
 
 fn get_reaction_counts(
@@ -340,7 +391,7 @@ impl ValueExt for Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_owner_with_name, get_reaction_counts};
+    use super::{find_message_text, find_owner_with_name, get_reaction_counts};
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
@@ -416,5 +467,45 @@ mod tests {
         let counts = get_reaction_counts(&blocks, false, "video-story");
 
         assert_eq!(counts, Some(("26.452".into(), "172".into(), "325".into())));
+    }
+
+    #[test]
+    fn caption_lookup_does_not_return_unrelated_video_message() {
+        let content_node = json!({"id": "focal-video"});
+        let blocks = vec![
+            json!({
+                "id": "sidebar-video",
+                "message": {"text": "DECOY CAPTION"}
+            }),
+            json!({
+                "id": "focal-video",
+                "message": {"text": "FOCAL CAPTION"}
+            }),
+        ];
+
+        assert_eq!(
+            find_message_text(&blocks, &content_node, "focal-video"),
+            "FOCAL CAPTION"
+        );
+    }
+
+    #[test]
+    fn caption_lookup_keeps_legacy_fallback_without_video_link() {
+        let blocks = vec![json!({"message": {"text": "LEGACY CAPTION"}})];
+
+        assert_eq!(find_message_text(&blocks, &json!({}), ""), "LEGACY CAPTION");
+    }
+
+    #[test]
+    fn caption_lookup_does_not_fallback_to_decoy_when_focal_message_is_missing() {
+        let blocks = vec![json!({
+            "id": "sidebar-video",
+            "message": {"text": "DECOY CAPTION"}
+        })];
+
+        assert_eq!(
+            find_message_text(&blocks, &json!({"id": "focal-video"}), "focal-video"),
+            ""
+        );
     }
 }
