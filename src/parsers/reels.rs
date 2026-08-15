@@ -7,6 +7,7 @@ use crate::parsers::util::{
 };
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
+use std::collections::HashSet;
 
 pub struct ReelsParser;
 
@@ -145,6 +146,9 @@ fn select_content_node(
                 return Some(selected_content(media, context, Some(target_video_id)));
             }
         }
+        if let Some((media, context)) = find_creation_story_media(blocks, target_video_id) {
+            return Some(selected_content(media, context, Some(target_video_id)));
+        }
     }
     None
 }
@@ -170,6 +174,125 @@ fn is_strict_content_story(candidate: &Value) -> bool {
         || jq::first(candidate, "videoDeliveryResponseFragment").is_some()
         || jq::first(candidate, "videoDeliveryLegacyFields").is_some()
         || jq::first(candidate, "playable_url").is_some()
+}
+
+fn find_creation_story_media(blocks: &[Value], target_video_id: &str) -> Option<(Value, Value)> {
+    let mut candidates = Vec::new();
+    for block in blocks {
+        for story in jq::all(block, "creation_story") {
+            let Some(attachments) = story.get("attachments").and_then(Value::as_array) else {
+                continue;
+            };
+            for attachment in attachments {
+                let Some(media) = attachment.get("media").filter(|media| media.is_object()) else {
+                    continue;
+                };
+                if !matches_target_delivery(media, target_video_id) {
+                    continue;
+                }
+                let Some(owner_id) = media
+                    .get("owner")
+                    .and_then(owner_id_for_post)
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                candidates.push((media, owner_id));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let owner_ids: HashSet<_> = candidates
+        .iter()
+        .map(|(_, owner_id)| owner_id.as_str())
+        .collect();
+    if owner_ids.len() != 1 {
+        return None;
+    }
+    let (media, owner_id) = &candidates[0];
+    let context = find_target_media_context(blocks, target_video_id, owner_id)?;
+    Some(((*media).clone(), context))
+}
+
+fn find_target_media_context(
+    blocks: &[Value],
+    target_video_id: &str,
+    owner_id: &str,
+) -> Option<Value> {
+    let mut contexts = Vec::new();
+    for block in blocks {
+        collect_target_media_contexts(block, target_video_id, owner_id, &mut contexts);
+    }
+    if contexts.is_empty() {
+        return None;
+    }
+    let with_message: Vec<(&Value, String)> = contexts
+        .iter()
+        .filter_map(|context| {
+            direct_message_text(context)
+                .filter(|text| !text.is_empty())
+                .map(|text| (*context, text))
+        })
+        .collect();
+    if with_message.windows(2).any(|pair| pair[0].1 != pair[1].1) {
+        return None;
+    }
+    with_message
+        .first()
+        .map(|(context, _)| (*context).clone())
+        .or_else(|| {
+            contexts
+                .into_iter()
+                .next()
+                .map(|context| (*context).clone())
+        })
+}
+
+fn collect_target_media_contexts<'a>(
+    node: &'a Value,
+    target_video_id: &str,
+    owner_id: &str,
+    contexts: &mut Vec<&'a Value>,
+) {
+    match node {
+        Value::Object(map) => {
+            if has_target_media_context(node)
+                && has_target_attachment(node, target_video_id)
+                && node
+                    .get("actors")
+                    .and_then(Value::as_array)
+                    .and_then(|actors| actors.first())
+                    .and_then(owner_id_for_post)
+                    .is_some_and(|id| id == owner_id)
+            {
+                contexts.push(node);
+            }
+            for child in map.values() {
+                collect_target_media_contexts(child, target_video_id, owner_id, contexts);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_target_media_contexts(child, target_video_id, owner_id, contexts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn has_target_attachment(node: &Value, target_video_id: &str) -> bool {
+    node.get("attachments")
+        .and_then(Value::as_array)
+        .is_some_and(|attachments| {
+            attachments.iter().any(|attachment| {
+                attachment
+                    .get("media")
+                    .and_then(|media| media.get("id"))
+                    .is_some_and(|id| value_matches_id(id, target_video_id))
+            })
+        })
 }
 
 fn find_delivery_fallback_candidate(node: &Value, target_video_id: &str) -> Option<(Value, Value)> {
@@ -638,7 +761,7 @@ mod tests {
         owner_has_name, owner_id_for_post, reel_id_from_path, select_content_node,
     };
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node, val_str_at};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn owner_lookup_prefers_matched_content_node() {
@@ -1081,6 +1204,274 @@ mod tests {
                 .and_then(|value| value.get("text")),
             Some(&json!("TARGET CAPTION"))
         );
+    }
+
+    #[test]
+    fn content_node_binds_creation_story_media_to_target_context() {
+        let blocks = vec![
+            json!({
+                "video": {
+                    "creation_story": {
+                        "id": "UzpfSTEwMDA2NDgwMDc4Mzk=",
+                        "attachments": [{
+                            "media": {
+                                "id": "1013234327723021",
+                                "owner": {"id": "target-owner"},
+                                "videoDeliveryResponseFragment": {}
+                            }
+                        }]
+                    }
+                }
+            }),
+            json!({
+                "id": "UzpfSTEwMDA2NDgwMDc4Mzk=",
+                "post_id": "context-post",
+                "message": {"text": "TARGET CAPTION"},
+                "actors": [{"id": "target-owner", "name": "Target Owner"}],
+                "attachments": [{"media": {"id": "1013234327723021"}}]
+            }),
+        ];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("creation-story target media");
+
+        assert_eq!(
+            selected.media.get("id").and_then(Value::as_str),
+            Some("1013234327723021")
+        );
+        assert_eq!(
+            selected
+                .context
+                .get("message")
+                .and_then(|value| value.get("text")),
+            Some(&json!("TARGET CAPTION"))
+        );
+    }
+
+    fn creation_story_fixture_context(message: Value, owner_id: &str) -> Value {
+        json!({
+            "id": "UzpfSTEwMDA2NDgwMDc4Mzk=",
+            "post_id": "context-post",
+            "message": message,
+            "actors": [{"id": owner_id, "name": "Target Owner"}],
+            "attachments": [{"media": {"id": "1013234327723021"}}]
+        })
+    }
+
+    #[test]
+    fn creation_story_context_matches_media_owner_and_rejects_decoy_owner() {
+        let blocks = vec![
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "target-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            creation_story_fixture_context(json!({"text": "DECOY CAPTION"}), "decoy-owner"),
+            creation_story_fixture_context(json!({"text": "TARGET CAPTION"}), "target-owner"),
+        ];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("owner-matched creation-story context");
+        assert_eq!(
+            selected
+                .context
+                .get("message")
+                .and_then(|message| message.get("text")),
+            Some(&json!("TARGET CAPTION"))
+        );
+        let owner = find_owner_with_name(&blocks, &selected.context, &selected.video_id)
+            .expect("target owner");
+        assert_eq!(owner_id_for_post(&owner).as_deref(), Some("target-owner"));
+    }
+
+    #[test]
+    fn creation_story_context_rejects_conflicting_nonempty_duplicate_messages() {
+        let blocks = vec![
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "target-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            creation_story_fixture_context(json!({"text": "FIRST CAPTION"}), "target-owner"),
+            json!({
+                "id": "another-context",
+                "post_id": "another-post",
+                "message": {"text": "SECOND CAPTION"},
+                "actors": [{"id": "target-owner", "name": "Target Owner"}],
+                "attachments": [{"media": {"id": "1013234327723021"}}]
+            }),
+        ];
+
+        assert!(select_content_node(&blocks, Some("1013234327723021")).is_none());
+    }
+
+    #[test]
+    fn creation_story_media_skips_unbound_candidate_before_valid_candidate() {
+        let blocks = vec![
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "target-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            json!({
+                "id": "context-id",
+                "post_id": "context-post",
+                "message": {"text": "TARGET CAPTION"},
+                "actors": [{"id": "target-owner", "name": "Target Owner"}],
+                "attachments": [{"media": {"id": "1013234327723021"}}]
+            }),
+        ];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("later owner-bound creation-story media");
+        assert_eq!(
+            selected
+                .media
+                .get("owner")
+                .and_then(|owner| owner.get("id"))
+                .and_then(Value::as_str),
+            Some("target-owner")
+        );
+    }
+
+    #[test]
+    fn creation_story_media_rejects_distinct_owner_candidates() {
+        let blocks = vec![
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "decoy-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "genuine-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            json!({
+                "id": "decoy-context",
+                "post_id": "decoy-post",
+                "message": {"text": "DECOY CAPTION"},
+                "actors": [{"id": "decoy-owner", "name": "Decoy Owner"}],
+                "attachments": [{"media": {"id": "1013234327723021"}}]
+            }),
+            json!({
+                "id": "genuine-context",
+                "post_id": "genuine-post",
+                "message": {"text": "GENUINE CAPTION"},
+                "actors": [{"id": "genuine-owner", "name": "Genuine Owner"}],
+                "attachments": [{"media": {"id": "1013234327723021"}}]
+            }),
+        ];
+
+        assert!(select_content_node(&blocks, Some("1013234327723021")).is_none());
+    }
+
+    #[test]
+    fn creation_story_media_allows_same_owner_duplicates() {
+        let blocks = vec![
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "target-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "target-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            creation_story_fixture_context(json!({"text": "TARGET CAPTION"}), "target-owner"),
+        ];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("same-owner duplicate creation-story media");
+        assert_eq!(
+            selected
+                .context
+                .get("message")
+                .and_then(|message| message.get("text")),
+            Some(&json!("TARGET CAPTION"))
+        );
+    }
+
+    #[test]
+    fn creation_story_context_prefers_nonempty_message_over_null_duplicate() {
+        let blocks = vec![
+            json!({"creation_story": {
+                "attachments": [{"media": {
+                    "id": "1013234327723021",
+                    "owner": {"id": "target-owner"},
+                    "videoDeliveryResponseFragment": {}
+                }}]
+            }}),
+            creation_story_fixture_context(Value::Null, "target-owner"),
+            creation_story_fixture_context(json!({"text": "TARGET CAPTION"}), "target-owner"),
+        ];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("nonempty duplicate context");
+        assert_eq!(
+            selected
+                .context
+                .get("message")
+                .and_then(|message| message.get("text")),
+            Some(&json!("TARGET CAPTION"))
+        );
+    }
+
+    #[test]
+    fn creation_story_media_rejects_missing_target_context() {
+        let blocks = vec![json!({"creation_story": {
+            "owner": {"id": "story-owner", "name": "Story Owner"},
+            "message": {"text": "STORY DECOY"},
+            "attachments": [{"media": {
+                "id": "1013234327723021",
+                "owner": {"id": "target-owner"},
+                "videoDeliveryResponseFragment": {}
+            }}]
+        }})];
+
+        assert!(select_content_node(&blocks, Some("1013234327723021")).is_none());
+    }
+
+    #[test]
+    fn renderer_candidate_precedes_creation_story_association() {
+        let blocks = vec![json!({
+            "creation_story": {"attachments": [{"media": {
+                "id": "1013234327723021",
+                "owner": {"id": "target-owner"},
+                "videoDeliveryResponseFragment": {}
+            }}]},
+            "renderer": {
+                "id": "1013234327723021",
+                "videoDeliveryResponseFragment": {},
+                "comment_rendering_instance": {}
+            }
+        })];
+
+        let selected =
+            select_content_node(&blocks, Some("1013234327723021")).expect("renderer candidate");
+        assert!(selected.media.get("comment_rendering_instance").is_some());
+        assert_eq!(selected.context, selected.media);
     }
 
     #[test]
