@@ -10,6 +10,12 @@ use serde_json::Value;
 
 pub struct ReelsParser;
 
+struct SelectedContentNode {
+    media: Value,
+    context: Value,
+    video_id: String,
+}
+
 #[async_trait::async_trait]
 impl Parser for ReelsParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
@@ -18,7 +24,7 @@ impl Parser for ReelsParser {
         let blocks = get_json_blocks(html, true);
 
         let target_video_id = reel_id_from_path(post_path);
-        let content_node = find_content_node(&blocks, target_video_id).ok_or_else(|| {
+        let selected = select_content_node(&blocks, target_video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid reels link (cn)",
                 page.html.clone(),
@@ -26,8 +32,8 @@ impl Parser for ReelsParser {
             )
         })?;
 
-        let video_id = val_str_at(&content_node, "id").unwrap_or("").to_owned();
-        let video_link = find_video_link(&blocks, &content_node, &video_id).ok_or_else(|| {
+        let video_id = selected.video_id.as_str();
+        let video_link = find_video_link(&blocks, &selected.media, video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid reels link (vn)",
                 page.html.clone(),
@@ -35,13 +41,14 @@ impl Parser for ReelsParser {
             )
         })?;
 
-        let owner = find_owner_with_name(&blocks, &content_node, &video_id).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Invalid reels link (own)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
+        let owner =
+            find_owner_with_name(&blocks, &selected.context, video_id).ok_or_else(|| {
+                FacebedError::parse_with(
+                    "Invalid reels link (own)",
+                    page.html.clone(),
+                    page.url.clone(),
+                )
+            })?;
         let typename = val_str_at(&owner, "__typename").unwrap_or("");
         let is_ig = typename.starts_with("InstagramUser");
         let op_name = if is_ig {
@@ -52,15 +59,21 @@ impl Parser for ReelsParser {
         } else {
             val_str_at(&owner, "name").unwrap_or("").to_owned()
         };
-        let owner_id = val_str_at(&owner, "id").unwrap_or("").to_owned();
+        let owner_id = owner_id_for_post(&owner).ok_or_else(|| {
+            FacebedError::parse_with(
+                "Invalid reels link (own)",
+                page.html.clone(),
+                page.url.clone(),
+            )
+        })?;
 
         let post_url = find_shareable_url(&blocks)
             .unwrap_or_else(|| crate::url_clean::ensure_absolute(post_path));
 
         let date = find_creation_time(&blocks).unwrap_or(0);
-        let post_text = find_message_text(&blocks, &content_node, &video_id);
+        let post_text = find_message_text(&blocks, &selected.context, video_id);
 
-        let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, &video_id).unwrap_or((
+        let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, video_id).unwrap_or((
             "null".into(),
             "null".into(),
             "null".into(),
@@ -71,11 +84,11 @@ impl Parser for ReelsParser {
         }
 
         let thumbnail =
-            thumbnail_in_node(&content_node).or_else(|| blocks.iter().find_map(thumbnail_in_node));
+            thumbnail_in_node(&selected.media).or_else(|| thumbnail_in_node(&selected.context));
 
         Ok(ParsedPost {
             author_name: op_name,
-            author_id: author_id_in_node(&owner),
+            author_id: Some(owner_id),
             author_handle: author_handle_in_node(&owner),
             author_avatar_url: author_avatar_in_node(&owner),
             context: None,
@@ -96,7 +109,10 @@ impl Parser for ReelsParser {
 /// Bug-1 fix: relax the selector. Old Python code required `browser_native_sd_url + creation_story`
 /// in the same block, but `browser_native_sd_url` no longer exists. Match on `creation_story`
 /// that has either modern (`videoDeliveryResponseFragment`) or context (`short_form_video_context`).
-fn find_content_node(blocks: &[Value], target_video_id: Option<&str>) -> Option<Value> {
+fn select_content_node(
+    blocks: &[Value],
+    target_video_id: Option<&str>,
+) -> Option<SelectedContentNode> {
     if let Some(target_video_id) = target_video_id {
         for bloc in blocks {
             for cs in jq::all(bloc, "creation_story") {
@@ -105,7 +121,11 @@ fn find_content_node(blocks: &[Value], target_video_id: Option<&str>) -> Option<
                         .get("id")
                         .is_some_and(|id| value_matches_id(id, target_video_id))
                 {
-                    return Some(cs.clone());
+                    return Some(selected_content(
+                        cs.clone(),
+                        cs.clone(),
+                        Some(target_video_id),
+                    ));
                 }
             }
         }
@@ -113,19 +133,36 @@ fn find_content_node(blocks: &[Value], target_video_id: Option<&str>) -> Option<
         for bloc in blocks {
             for cs in jq::all(bloc, "creation_story") {
                 if is_strict_content_story(cs) {
-                    return Some(cs.clone());
+                    return Some(selected_content(cs.clone(), cs.clone(), None));
                 }
             }
         }
     }
     if let Some(target_video_id) = target_video_id {
         for bloc in blocks {
-            if let Some(candidate) = find_delivery_fallback_candidate(bloc, target_video_id) {
-                return Some(candidate);
+            if let Some((media, context)) = find_delivery_fallback_candidate(bloc, target_video_id)
+            {
+                return Some(selected_content(media, context, Some(target_video_id)));
             }
         }
     }
     None
+}
+
+fn selected_content(
+    media: Value,
+    context: Value,
+    target_video_id: Option<&str>,
+) -> SelectedContentNode {
+    let video_id = target_video_id
+        .map(ToOwned::to_owned)
+        .or_else(|| val_str_at(&media, "id").map(ToOwned::to_owned))
+        .unwrap_or_default();
+    SelectedContentNode {
+        media,
+        context,
+        video_id,
+    }
 }
 
 fn is_strict_content_story(candidate: &Value) -> bool {
@@ -135,11 +172,29 @@ fn is_strict_content_story(candidate: &Value) -> bool {
         || jq::first(candidate, "playable_url").is_some()
 }
 
-fn find_delivery_fallback_candidate(node: &Value, target_video_id: &str) -> Option<Value> {
+fn find_delivery_fallback_candidate(node: &Value, target_video_id: &str) -> Option<(Value, Value)> {
     match node {
         Value::Object(map) => {
-            if is_delivery_fallback_candidate(node, target_video_id) {
-                return Some(node.clone());
+            if matches_target_delivery(node, target_video_id) && has_comment_renderer(node) {
+                return Some((node.clone(), node.clone()));
+            }
+            if has_target_media_context(node) {
+                if let Some(attachments) = node.get("attachments").and_then(Value::as_array) {
+                    for attachment in attachments {
+                        let Some(media) = attachment.get("media") else {
+                            continue;
+                        };
+                        if !media.is_object() || !matches_target_delivery(media, target_video_id) {
+                            continue;
+                        }
+                        let context = if has_comment_renderer(media) {
+                            media.clone()
+                        } else {
+                            node.clone()
+                        };
+                        return Some((media.clone(), context));
+                    }
+                }
             }
             map.values()
                 .find_map(|child| find_delivery_fallback_candidate(child, target_video_id))
@@ -151,16 +206,28 @@ fn find_delivery_fallback_candidate(node: &Value, target_video_id: &str) -> Opti
     }
 }
 
-fn is_delivery_fallback_candidate(candidate: &Value, target_video_id: &str) -> bool {
+fn has_target_media_context(node: &Value) -> bool {
+    node.get("message").is_some()
+        && node
+            .get("actors")
+            .and_then(Value::as_array)
+            .and_then(|actors| actors.first())
+            .is_some_and(owner_has_name)
+}
+
+fn matches_target_delivery(candidate: &Value, target_video_id: &str) -> bool {
     candidate
         .get("id")
         .is_some_and(|id| value_matches_id(id, target_video_id))
         && candidate.get("videoDeliveryResponseFragment").is_some()
-        && (candidate.get("comment_rendering_instance").is_some()
-            || candidate
-                .get("feedback")
-                .and_then(|feedback| feedback.get("comment_rendering_instance"))
-                .is_some())
+}
+
+fn has_comment_renderer(candidate: &Value) -> bool {
+    candidate.get("comment_rendering_instance").is_some()
+        || candidate
+            .get("feedback")
+            .and_then(|feedback| feedback.get("comment_rendering_instance"))
+            .is_some()
 }
 
 fn reel_id_from_path(post_path: &str) -> Option<&str> {
@@ -267,23 +334,48 @@ fn find_owner_with_name(blocks: &[Value], content_node: &Value, video_id: &str) 
     }
     if !video_id.is_empty() {
         for bloc in blocks {
-            if block_mentions_id(bloc, video_id) {
-                if let Some(owner) = owner_from_node(bloc) {
-                    return Some(owner);
-                }
+            if let Some(owner) = owner_linked_to_id(bloc, video_id) {
+                return Some(owner);
             }
-        }
-    }
-    for bloc in blocks {
-        if let Some(owner) = owner_from_node(bloc) {
-            return Some(owner);
         }
     }
     None
 }
 
+fn owner_linked_to_id(node: &Value, video_id: &str) -> Option<Value> {
+    match node {
+        Value::Object(map) => {
+            if node
+                .get("id")
+                .is_some_and(|id| value_matches_id(id, video_id))
+            {
+                if let Some(owner) = owner_from_node(node) {
+                    return Some(owner);
+                }
+            }
+            map.values()
+                .find_map(|child| owner_linked_to_id(child, video_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| owner_linked_to_id(child, video_id)),
+        _ => None,
+    }
+}
+
 fn owner_from_node(node: &Value) -> Option<Value> {
-    if let Some(owner) = node.pointer_path_first(&["short_form_video_context", "video_owner"]) {
+    let bound_context = has_target_media_context(node);
+    if bound_context {
+        return node
+            .get("actors")
+            .and_then(Value::as_array)
+            .and_then(|actors| actors.first())
+            .cloned();
+    }
+    if let Some(owner) = node
+        .get("short_form_video_context")
+        .and_then(|context| context.get("video_owner"))
+    {
         if owner_has_name(owner) {
             return Some(owner.clone());
         }
@@ -293,6 +385,11 @@ fn owner_from_node(node: &Value) -> Option<Value> {
             if owner_has_name(owner) {
                 return Some(owner.clone());
             }
+        }
+    }
+    if let Some(owner) = node.pointer_path_first(&["short_form_video_context", "video_owner"]) {
+        if owner_has_name(owner) {
+            return Some(owner.clone());
         }
     }
     for key in ["video_owner", "owner"] {
@@ -311,12 +408,11 @@ fn owner_has_name(owner: &Value) -> bool {
         .and_then(|v| v.as_str())
         .map(|s| !s.is_empty())
         .unwrap_or(false)
+        && author_id_in_node(owner).is_some_and(|id| !id.is_empty())
 }
 
-fn block_mentions_id(block: &Value, needle: &str) -> bool {
-    jq::all(block, "id")
-        .into_iter()
-        .any(|value| value_matches_id(value, needle))
+fn owner_id_for_post(owner: &Value) -> Option<String> {
+    author_id_in_node(owner).filter(|id| !id.is_empty())
 }
 
 fn value_matches_id(value: &Value, needle: &str) -> bool {
@@ -355,6 +451,9 @@ fn find_creation_time(blocks: &[Value]) -> Option<i64> {
 }
 
 fn find_message_text(blocks: &[Value], content_node: &Value, video_id: &str) -> String {
+    if has_target_media_context(content_node) {
+        return direct_message_text(content_node).unwrap_or_default();
+    }
     if let Some(text) = first_message_text(content_node) {
         return text;
     }
@@ -375,6 +474,15 @@ fn find_message_text(blocks: &[Value], content_node: &Value, video_id: &str) -> 
 }
 
 fn first_message_text(node: &Value) -> Option<String> {
+    if let Some(text) = direct_message_text(node) {
+        return Some(text);
+    }
+    jq::all(node, "message")
+        .into_iter()
+        .find_map(|message| message_text(message).filter(|text| !text.is_empty()))
+}
+
+fn direct_message_text(node: &Value) -> Option<String> {
     for key in ["message", "message_preferred_body"] {
         if let Some(text) = node
             .get(key)
@@ -384,9 +492,7 @@ fn first_message_text(node: &Value) -> Option<String> {
             return Some(text);
         }
     }
-    jq::all(node, "message")
-        .into_iter()
-        .find_map(|message| message_text(message).filter(|text| !text.is_empty()))
+    None
 }
 
 fn message_text(message: &Value) -> Option<String> {
@@ -528,10 +634,10 @@ impl ValueExt for Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_content_node, find_message_text, find_owner_with_name, find_video_link,
-        get_reaction_counts, reel_id_from_path,
+        find_message_text, find_owner_with_name, find_video_link, get_reaction_counts,
+        owner_has_name, owner_id_for_post, reel_id_from_path, select_content_node,
     };
-    use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
+    use crate::parsers::util::{author_avatar_in_node, author_id_in_node, val_str_at};
     use serde_json::json;
 
     #[test]
@@ -787,8 +893,9 @@ mod tests {
             }
         })];
 
-        let content =
-            find_content_node(&blocks, Some("1376968477584004")).expect("fallback candidate");
+        let content = select_content_node(&blocks, Some("1376968477584004"))
+            .expect("fallback candidate")
+            .media;
 
         assert_eq!(
             content.get("id").and_then(|v| v.as_str()),
@@ -804,8 +911,9 @@ mod tests {
             "videoDeliveryResponseFragment": {}
         })];
 
-        let content = find_content_node(&blocks, Some("1013234327723021"))
-            .expect("nested fallback candidate");
+        let content = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("nested fallback candidate")
+            .media;
 
         assert_eq!(
             content.get("id").and_then(|v| v.as_str()),
@@ -830,8 +938,9 @@ mod tests {
             }
         })];
 
-        let content = find_content_node(&blocks, Some("1013234327723021"))
-            .expect("target strict story must be selected");
+        let content = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("target strict story must be selected")
+            .media;
 
         assert_eq!(
             content.get("id").and_then(|v| v.as_str()),
@@ -852,8 +961,9 @@ mod tests {
             "videoDeliveryResponseFragment": {}
         })];
 
-        let content = find_content_node(&blocks, Some("1013234327723021"))
-            .expect("target fallback must be selected");
+        let content = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("target fallback must be selected")
+            .media;
 
         assert_eq!(
             content.get("id").and_then(|v| v.as_str()),
@@ -878,8 +988,9 @@ mod tests {
             }
         })];
 
-        let content =
-            find_content_node(&blocks, None).expect("legacy strict story must be selected");
+        let content = select_content_node(&blocks, None)
+            .expect("legacy strict story must be selected")
+            .media;
 
         assert_eq!(
             content.get("id").and_then(|v| v.as_str()),
@@ -902,8 +1013,9 @@ mod tests {
             }),
         ];
 
-        let content = find_content_node(&blocks, Some("1013234327723021"))
-            .expect("target fallback candidate");
+        let content = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("target fallback candidate")
+            .media;
 
         assert_eq!(
             content.get("id").and_then(|v| v.as_str()),
@@ -919,13 +1031,13 @@ mod tests {
             "videoDeliveryResponseFragment": {}
         })];
 
-        assert!(find_content_node(&blocks, Some("1013234327723021")).is_none());
+        assert!(select_content_node(&blocks, Some("1013234327723021")).is_none());
     }
 
     #[test]
-    fn content_node_rejects_delivery_fragment_without_comment_renderer() {
+    fn content_node_rejects_unanchored_delivery_wrapper_without_comment_renderer() {
         let blocks = vec![json!({
-            "id": "sidebar-video",
+            "id": "9999999999999999",
             "videoDeliveryResponseFragment": {
                 "videoDeliveryResponseResult": {
                     "progressive_urls": [
@@ -935,7 +1047,262 @@ mod tests {
             }
         })];
 
-        assert!(find_content_node(&blocks, Some("sidebar-video")).is_none());
+        assert!(select_content_node(&blocks, Some("9999999999999999")).is_none());
+    }
+
+    #[test]
+    fn content_node_accepts_target_media_node_without_comment_renderer() {
+        let blocks = vec![json!({
+            "creation_story": {"id": "UzpfSTEwMDA2NDgwMDc4Mzk="},
+            "message": {"text": "TARGET CAPTION"},
+            "actors": [{"id": "target-owner", "name": "Target Owner"}],
+            "attachments": [{
+                "media": {
+                    "id": "1013234327723021",
+                    "videoDeliveryResponseFragment": {
+                        "videoDeliveryResponseResult": {
+                            "progressive_urls": [
+                                {"progressive_url": "https://video.example/reel.mp4"}
+                            ]
+                        }
+                    },
+                    "videoDeliveryLegacyFields": {}
+                }
+            }]
+        })];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("target media node must be selected without comment renderer");
+
+        assert_eq!(
+            selected
+                .context
+                .get("message")
+                .and_then(|value| value.get("text")),
+            Some(&json!("TARGET CAPTION"))
+        );
+    }
+
+    #[test]
+    fn target_media_provenance_binds_caption_and_owner_away_from_decoy_story() {
+        let blocks = vec![json!({
+            "creation_story": {
+                "owner": {"id": "decoy-owner", "name": "Decoy Owner"},
+                "message": {"text": "DECOY CAPTION"}
+            },
+            "message": {
+                "message": {"text": "TARGET CAPTION"},
+                "owner": {"id": "decoy-direct-owner", "name": "Decoy Direct Owner"},
+                "actors": [{"id": "target-owner", "name": "Target Owner"}],
+                "feedback": {"id": "feedback-target"},
+                "attachments": [{
+                    "media": {
+                        "id": "1013234327723021",
+                        "videoDeliveryResponseFragment": {
+                            "videoDeliveryResponseResult": {
+                                "progressive_urls": [
+                                    {"progressive_url": "https://video.example/reel.mp4"}
+                                ]
+                            }
+                        },
+                        "videoDeliveryLegacyFields": {}
+                    }
+                }]
+            }
+        })];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("target media provenance must select enclosing message");
+        let owner = find_owner_with_name(&blocks, &selected.context, &selected.video_id)
+            .expect("target actor owner");
+
+        assert_eq!(selected.video_id, "1013234327723021");
+        assert_eq!(
+            find_video_link(&blocks, &selected.media, &selected.video_id),
+            Some("https://video.example/reel.mp4".to_owned())
+        );
+        assert_eq!(
+            find_message_text(&blocks, &selected.context, &selected.video_id),
+            "TARGET CAPTION"
+        );
+        assert_eq!(
+            owner.get("id").and_then(|value| value.as_str()),
+            Some("target-owner")
+        );
+        assert_ne!(
+            owner.get("id").and_then(|value| value.as_str()),
+            Some("decoy-owner")
+        );
+    }
+
+    #[test]
+    fn owner_lookup_fails_closed_without_target_link() {
+        let blocks = vec![json!({
+            "owner": {"id": "decoy-owner", "name": "Decoy Owner"},
+            "related": {"id": "1013234327723021"}
+        })];
+
+        assert!(find_owner_with_name(
+            &blocks,
+            &json!({"id": "1013234327723021"}),
+            "1013234327723021"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bound_context_prefers_direct_actor_and_message_over_nested_decoys() {
+        let content = json!({
+            "aaa_decoy": {
+                "actors": [{"id": "decoy-owner", "name": "Decoy Owner"}],
+                "message": {"text": "DECOY CAPTION"}
+            },
+            "owner": {"id": "decoy-direct-owner", "name": "Decoy Direct Owner"},
+            "message": {"text": "TARGET CAPTION"},
+            "actors": [
+                {"id": "target-owner", "name": "Target Owner"},
+                {"id": "decoy-second-owner", "name": "Decoy Second Owner"}
+            ]
+        });
+
+        let owner =
+            find_owner_with_name(&[], &content, "1013234327723021").expect("direct target actor");
+
+        assert_eq!(
+            find_message_text(&[], &content, "1013234327723021"),
+            "TARGET CAPTION"
+        );
+        assert_eq!(
+            owner.get("id").and_then(|value| value.as_str()),
+            Some("target-owner")
+        );
+    }
+
+    #[test]
+    fn fallback_requires_attachments_array_media_provenance() {
+        let blocks = vec![json!({
+            "message": {
+                "actors": [{"id": "target-owner", "name": "Target Owner"}],
+                "attachments": {
+                    "media": {
+                        "id": "1013234327723021",
+                        "videoDeliveryResponseFragment": {}
+                    }
+                }
+            }
+        })];
+
+        assert!(select_content_node(&blocks, Some("1013234327723021")).is_none());
+    }
+
+    #[test]
+    fn bound_context_rejects_invalid_first_actor_even_when_second_is_valid() {
+        let content = json!({
+            "message": {"text": "TARGET CAPTION"},
+            "actors": [
+                {"name": "Missing ID Actor"},
+                {"id": "target-owner", "name": "Target Owner"}
+            ]
+        });
+
+        assert!(find_owner_with_name(&[], &content, "1013234327723021").is_none());
+    }
+
+    #[test]
+    fn numeric_actor_id_is_normalized_for_owner_ban_lookup() {
+        let owner = json!({"id": 12345, "name": "Numeric Owner"});
+
+        assert_eq!(owner_id_for_post(&owner).as_deref(), Some("12345"));
+        assert!(owner_has_name(&owner));
+    }
+
+    #[test]
+    fn renderer_candidate_keeps_own_context_inside_unrelated_bound_message() {
+        let blocks = vec![json!({
+            "message": {
+                "message": {"text": "DECOY CAPTION"},
+                "actors": [{"id": "decoy-owner", "name": "Decoy Owner"}],
+                "attachments": [{
+                    "media": {
+                        "id": "1013234327723021",
+                        "videoDeliveryResponseFragment": {},
+                        "comment_rendering_instance": {}
+                    }
+                }]
+            }
+        })];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("renderer-qualified candidate");
+
+        assert_eq!(selected.context, selected.media);
+        assert!(selected.context.get("actors").is_none());
+    }
+
+    #[test]
+    fn nested_or_array_media_provenance_is_rejected() {
+        let nested_attachments = vec![json!({
+            "message": {"text": "DECOY CAPTION"},
+            "actors": [{"id": "decoy-owner", "name": "Decoy Owner"}],
+            "foo": {
+                "attachments": [{
+                    "media": {
+                        "id": "1013234327723021",
+                        "videoDeliveryResponseFragment": {}
+                    }
+                }]
+            }
+        })];
+        let array_media = vec![json!({
+            "message": {"text": "DECOY CAPTION"},
+            "actors": [{"id": "decoy-owner", "name": "Decoy Owner"}],
+            "attachments": [{
+                "media": [{
+                    "id": "1013234327723021",
+                    "videoDeliveryResponseFragment": {}
+                }]
+            }]
+        })];
+
+        assert!(select_content_node(&nested_attachments, Some("1013234327723021")).is_none());
+        assert!(select_content_node(&array_media, Some("1013234327723021")).is_none());
+    }
+
+    #[test]
+    fn process_chain_uses_route_target_id_for_video_link() {
+        let blocks = vec![json!({
+            "message": {
+                "id": "UzpfSTEwMDA2NDgwMDc4Mzk=",
+                "message": {"text": "TARGET CAPTION"},
+                "actors": [{"id": "target-owner", "name": "Target Owner"}],
+                "attachments": [{
+                    "media": {
+                        "id": "1013234327723021",
+                        "videoDeliveryResponseFragment": {}
+                    }
+                }]
+            },
+            "target_delivery": {
+                "id": "1013234327723021",
+                "playable_url": "https://video.example/reel.mp4"
+            }
+        })];
+
+        let selected = select_content_node(&blocks, Some("1013234327723021"))
+            .expect("target media provenance");
+        let old_context_video_id = val_str_at(&selected.context, "id").unwrap_or("");
+
+        assert_eq!(old_context_video_id, "UzpfSTEwMDA2NDgwMDc4Mzk=");
+        assert_eq!(
+            find_video_link(&blocks, &selected.media, old_context_video_id),
+            None,
+            "old context-derived ID reproduces Invalid reels link (vn)"
+        );
+        assert_eq!(selected.video_id, "1013234327723021");
+        assert_eq!(
+            find_video_link(&blocks, &selected.media, &selected.video_id),
+            Some("https://video.example/reel.mp4".to_owned())
+        );
     }
 
     #[test]
