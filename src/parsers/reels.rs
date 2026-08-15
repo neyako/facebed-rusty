@@ -3,7 +3,7 @@ use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::util::{
     author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
-    thumbnail_in_node, val_str_at, video_link_in_node,
+    thumbnail_in_node, val_str_at,
 };
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
@@ -17,7 +17,8 @@ impl Parser for ReelsParser {
         let html = page.document();
         let blocks = get_json_blocks(html, true);
 
-        let content_node = find_content_node(&blocks).ok_or_else(|| {
+        let target_video_id = reel_id_from_path(post_path);
+        let content_node = find_content_node(&blocks, target_video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid reels link (cn)",
                 page.html.clone(),
@@ -25,15 +26,14 @@ impl Parser for ReelsParser {
             )
         })?;
 
-        let video_link = find_video_link(&blocks, &content_node).ok_or_else(|| {
+        let video_id = val_str_at(&content_node, "id").unwrap_or("").to_owned();
+        let video_link = find_video_link(&blocks, &content_node, &video_id).ok_or_else(|| {
             FacebedError::parse_with(
                 "Invalid reels link (vn)",
                 page.html.clone(),
                 page.url.clone(),
             )
         })?;
-
-        let video_id = val_str_at(&content_node, "id").unwrap_or("").to_owned();
 
         let owner = find_owner_with_name(&blocks, &content_node, &video_id).ok_or_else(|| {
             FacebedError::parse_with(
@@ -96,28 +96,164 @@ impl Parser for ReelsParser {
 /// Bug-1 fix: relax the selector. Old Python code required `browser_native_sd_url + creation_story`
 /// in the same block, but `browser_native_sd_url` no longer exists. Match on `creation_story`
 /// that has either modern (`videoDeliveryResponseFragment`) or context (`short_form_video_context`).
-fn find_content_node(blocks: &[Value]) -> Option<Value> {
-    for bloc in blocks {
-        for cs in jq::all(bloc, "creation_story") {
-            if jq::has(cs, &["short_form_video_context"])
-                || jq::first(cs, "videoDeliveryResponseFragment").is_some()
-                || jq::first(cs, "videoDeliveryLegacyFields").is_some()
-                || jq::first(cs, "playable_url").is_some()
-            {
-                return Some(cs.clone());
+fn find_content_node(blocks: &[Value], target_video_id: Option<&str>) -> Option<Value> {
+    if let Some(target_video_id) = target_video_id {
+        for bloc in blocks {
+            for cs in jq::all(bloc, "creation_story") {
+                if is_strict_content_story(cs)
+                    && cs
+                        .get("id")
+                        .is_some_and(|id| value_matches_id(id, target_video_id))
+                {
+                    return Some(cs.clone());
+                }
+            }
+        }
+    } else {
+        for bloc in blocks {
+            for cs in jq::all(bloc, "creation_story") {
+                if is_strict_content_story(cs) {
+                    return Some(cs.clone());
+                }
+            }
+        }
+    }
+    if let Some(target_video_id) = target_video_id {
+        for bloc in blocks {
+            if let Some(candidate) = find_delivery_fallback_candidate(bloc, target_video_id) {
+                return Some(candidate);
             }
         }
     }
     None
 }
 
-fn find_video_link(blocks: &[Value], content_node: &Value) -> Option<String> {
-    if let Some(link) = video_link_in_node(content_node) {
+fn is_strict_content_story(candidate: &Value) -> bool {
+    jq::has(candidate, &["short_form_video_context"])
+        || jq::first(candidate, "videoDeliveryResponseFragment").is_some()
+        || jq::first(candidate, "videoDeliveryLegacyFields").is_some()
+        || jq::first(candidate, "playable_url").is_some()
+}
+
+fn find_delivery_fallback_candidate(node: &Value, target_video_id: &str) -> Option<Value> {
+    match node {
+        Value::Object(map) => {
+            if is_delivery_fallback_candidate(node, target_video_id) {
+                return Some(node.clone());
+            }
+            map.values()
+                .find_map(|child| find_delivery_fallback_candidate(child, target_video_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_delivery_fallback_candidate(child, target_video_id)),
+        _ => None,
+    }
+}
+
+fn is_delivery_fallback_candidate(candidate: &Value, target_video_id: &str) -> bool {
+    candidate
+        .get("id")
+        .is_some_and(|id| value_matches_id(id, target_video_id))
+        && candidate.get("videoDeliveryResponseFragment").is_some()
+        && (candidate.get("comment_rendering_instance").is_some()
+            || candidate
+                .get("feedback")
+                .and_then(|feedback| feedback.get("comment_rendering_instance"))
+                .is_some())
+}
+
+fn reel_id_from_path(post_path: &str) -> Option<&str> {
+    let path = post_path
+        .split_once('?')
+        .map_or(post_path, |(path, _)| path)
+        .trim_start_matches('/');
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    if segments.next()? != "reel" {
+        return None;
+    }
+    let id = segments.next()?;
+    if segments.next().is_some() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(id)
+}
+
+fn find_video_link(
+    blocks: &[Value],
+    content_node: &Value,
+    target_video_id: &str,
+) -> Option<String> {
+    if let Some(link) = direct_video_link(content_node) {
         return Some(link);
     }
+    if target_video_id.is_empty() {
+        return None;
+    }
     for bloc in blocks {
-        if let Some(link) = video_link_in_node(bloc) {
+        if let Some(link) = find_target_video_link(bloc, target_video_id) {
             return Some(link);
+        }
+    }
+    None
+}
+
+fn find_target_video_link(node: &Value, target_video_id: &str) -> Option<String> {
+    match node {
+        Value::Object(map) => {
+            if node
+                .get("id")
+                .is_some_and(|id| value_matches_id(id, target_video_id))
+            {
+                if let Some(link) = direct_video_link(node) {
+                    return Some(link);
+                }
+            }
+            map.values()
+                .find_map(|child| find_target_video_link(child, target_video_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_target_video_link(child, target_video_id)),
+        _ => None,
+    }
+}
+
+fn direct_video_link(node: &Value) -> Option<String> {
+    if let Some(progressive_urls) = node
+        .get("videoDeliveryResponseFragment")
+        .and_then(|fragment| fragment.get("videoDeliveryResponseResult"))
+        .and_then(|result| result.get("progressive_urls"))
+        .and_then(Value::as_array)
+    {
+        for entry in progressive_urls {
+            if let Some(url) = entry
+                .get("progressive_url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(url.to_owned());
+            }
+        }
+    }
+    if let Some(legacy) = node.get("videoDeliveryLegacyFields") {
+        for key in ["browser_native_hd_url", "browser_native_sd_url"] {
+            if let Some(url) = legacy
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(url.to_owned());
+            }
+        }
+    }
+    for key in ["playable_url_quality_hd", "playable_url"] {
+        if let Some(url) = node
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(url.to_owned());
         }
     }
     None
@@ -391,7 +527,10 @@ impl ValueExt for Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_message_text, find_owner_with_name, get_reaction_counts};
+    use super::{
+        find_content_node, find_message_text, find_owner_with_name, find_video_link,
+        get_reaction_counts, reel_id_from_path,
+    };
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
@@ -497,6 +636,131 @@ mod tests {
     }
 
     #[test]
+    fn video_link_prefers_target_associated_url_over_decoy() {
+        let content = json!({"id": "target-video"});
+        let blocks = vec![
+            json!({"id": "decoy-video", "playable_url": "https://video.example/decoy.mp4"}),
+            json!({"id": "target-video", "playable_url": "https://video.example/target.mp4"}),
+        ];
+
+        assert_eq!(
+            find_video_link(&blocks, &content, "target-video"),
+            Some("https://video.example/target.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn video_link_fails_closed_when_only_decoy_exists() {
+        let content = json!({"id": "target-video"});
+        let blocks = vec![json!({
+            "id": "decoy-video",
+            "playable_url": "https://video.example/decoy.mp4"
+        })];
+
+        assert_eq!(find_video_link(&blocks, &content, "target-video"), None);
+    }
+
+    #[test]
+    fn video_link_prefers_selected_content_node_local_url() {
+        let content = json!({
+            "id": "target-video",
+            "playable_url": "https://video.example/local.mp4"
+        });
+        let blocks = vec![json!({
+            "id": "decoy-video",
+            "playable_url": "https://video.example/decoy.mp4"
+        })];
+
+        assert_eq!(
+            find_video_link(&blocks, &content, "target-video"),
+            Some("https://video.example/local.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn video_link_rejects_nested_decoy_below_target_wrapper() {
+        let content = json!({
+            "id": "target-video",
+            "related": {"id": "decoy-video", "playable_url": "https://video.example/decoy.mp4"}
+        });
+
+        assert_eq!(find_video_link(&[], &content, "target-video"), None);
+    }
+
+    #[test]
+    fn video_link_prefers_direct_target_delivery_over_nested_decoy() {
+        let content = json!({
+            "id": "target-video",
+            "playable_url": "https://video.example/target.mp4",
+            "related": {"id": "decoy-video", "playable_url": "https://video.example/decoy.mp4"}
+        });
+
+        assert_eq!(
+            find_video_link(&[], &content, "target-video"),
+            Some("https://video.example/target.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn video_link_finds_target_child_inside_unrelated_outer_block() {
+        let blocks = vec![json!({
+            "unrelated": {"playable_url": "https://video.example/decoy.mp4"},
+            "target": {"id": "target-video", "playable_url": "https://video.example/target.mp4"}
+        })];
+
+        assert_eq!(
+            find_video_link(&blocks, &json!({}), "target-video"),
+            Some("https://video.example/target.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn video_link_rejects_nested_progressive_url_inside_target_fragment() {
+        let content = json!({
+            "id": "target-video",
+            "videoDeliveryResponseFragment": {
+                "sidebar": {"progressive_url": "https://video.example/decoy.mp4"}
+            }
+        });
+
+        assert_eq!(find_video_link(&[], &content, "target-video"), None);
+    }
+
+    #[test]
+    fn video_link_reads_exact_progressive_urls_and_ignores_fragment_siblings() {
+        let content = json!({
+            "id": "target-video",
+            "videoDeliveryResponseFragment": {
+                "sidebar": {"progressive_url": "https://video.example/decoy.mp4"},
+                "videoDeliveryResponseResult": {
+                    "progressive_urls": [
+                        {"progressive_url": "https://video.example/target.mp4"}
+                    ],
+                    "related": {"progressive_url": "https://video.example/decoy-2.mp4"}
+                }
+            }
+        });
+
+        assert_eq!(
+            find_video_link(&[], &content, "target-video"),
+            Some("https://video.example/target.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn video_link_reads_direct_legacy_hd_url() {
+        let content = json!({
+            "id": "target-video",
+            "videoDeliveryLegacyFields": {"browser_native_hd_url": "https://video.example/hd.mp4"}
+        });
+
+        assert_eq!(
+            find_video_link(&[], &content, "target-video"),
+            Some("https://video.example/hd.mp4".to_string())
+        );
+    }
+
+    #[test]
     fn caption_lookup_does_not_fallback_to_decoy_when_focal_message_is_missing() {
         let blocks = vec![json!({
             "id": "sidebar-video",
@@ -507,5 +771,186 @@ mod tests {
             find_message_text(&blocks, &json!({"id": "focal-video"}), "focal-video"),
             ""
         );
+    }
+
+    #[test]
+    fn content_node_accepts_same_candidate_comment_and_delivery_fields() {
+        let blocks = vec![json!({
+            "id": "1376968477584004",
+            "comment_rendering_instance": {},
+            "videoDeliveryResponseFragment": {
+                "videoDeliveryResponseResult": {
+                    "progressive_urls": [
+                        {"progressive_url": "https://video.example/reel.mp4"}
+                    ]
+                }
+            }
+        })];
+
+        let content =
+            find_content_node(&blocks, Some("1376968477584004")).expect("fallback candidate");
+
+        assert_eq!(
+            content.get("id").and_then(|v| v.as_str()),
+            Some("1376968477584004")
+        );
+    }
+
+    #[test]
+    fn content_node_accepts_nested_feedback_comment_renderer() {
+        let blocks = vec![json!({
+            "id": "1013234327723021",
+            "feedback": {"comment_rendering_instance": {}},
+            "videoDeliveryResponseFragment": {}
+        })];
+
+        let content = find_content_node(&blocks, Some("1013234327723021"))
+            .expect("nested fallback candidate");
+
+        assert_eq!(
+            content.get("id").and_then(|v| v.as_str()),
+            Some("1013234327723021")
+        );
+    }
+
+    #[test]
+    fn content_node_prefers_target_strict_story_over_qualified_decoy() {
+        let blocks = vec![json!({
+            "creation_story": {
+                "id": "9999999999999999",
+                "short_form_video_context": {},
+                "videoDeliveryResponseFragment": {}
+            },
+            "other": {
+                "creation_story": {
+                    "id": "1013234327723021",
+                    "short_form_video_context": {},
+                    "videoDeliveryResponseFragment": {}
+                }
+            }
+        })];
+
+        let content = find_content_node(&blocks, Some("1013234327723021"))
+            .expect("target strict story must be selected");
+
+        assert_eq!(
+            content.get("id").and_then(|v| v.as_str()),
+            Some("1013234327723021")
+        );
+    }
+
+    #[test]
+    fn content_node_uses_target_fallback_when_strict_story_is_decoy() {
+        let blocks = vec![json!({
+            "creation_story": {
+                "id": "9999999999999999",
+                "short_form_video_context": {},
+                "videoDeliveryResponseFragment": {}
+            },
+            "id": "1013234327723021",
+            "feedback": {"comment_rendering_instance": {}},
+            "videoDeliveryResponseFragment": {}
+        })];
+
+        let content = find_content_node(&blocks, Some("1013234327723021"))
+            .expect("target fallback must be selected");
+
+        assert_eq!(
+            content.get("id").and_then(|v| v.as_str()),
+            Some("1013234327723021")
+        );
+    }
+
+    #[test]
+    fn content_node_keeps_first_strict_story_without_target_id() {
+        let blocks = vec![json!({
+            "creation_story": {
+                "id": "9999999999999999",
+                "short_form_video_context": {},
+                "videoDeliveryResponseFragment": {}
+            },
+            "other": {
+                "creation_story": {
+                    "id": "1013234327723021",
+                    "short_form_video_context": {},
+                    "videoDeliveryResponseFragment": {}
+                }
+            }
+        })];
+
+        let content =
+            find_content_node(&blocks, None).expect("legacy strict story must be selected");
+
+        assert_eq!(
+            content.get("id").and_then(|v| v.as_str()),
+            Some("9999999999999999")
+        );
+    }
+
+    #[test]
+    fn content_node_prefers_requested_target_over_qualified_decoy() {
+        let blocks = vec![
+            json!({
+                "id": "9999999999999999",
+                "comment_rendering_instance": {},
+                "videoDeliveryResponseFragment": {}
+            }),
+            json!({
+                "id": "1013234327723021",
+                "comment_rendering_instance": {},
+                "videoDeliveryResponseFragment": {}
+            }),
+        ];
+
+        let content = find_content_node(&blocks, Some("1013234327723021"))
+            .expect("target fallback candidate");
+
+        assert_eq!(
+            content.get("id").and_then(|v| v.as_str()),
+            Some("1013234327723021")
+        );
+    }
+
+    #[test]
+    fn content_node_rejects_qualified_candidate_when_requested_target_is_absent() {
+        let blocks = vec![json!({
+            "id": "9999999999999999",
+            "comment_rendering_instance": {},
+            "videoDeliveryResponseFragment": {}
+        })];
+
+        assert!(find_content_node(&blocks, Some("1013234327723021")).is_none());
+    }
+
+    #[test]
+    fn content_node_rejects_delivery_fragment_without_comment_renderer() {
+        let blocks = vec![json!({
+            "id": "sidebar-video",
+            "videoDeliveryResponseFragment": {
+                "videoDeliveryResponseResult": {
+                    "progressive_urls": [
+                        {"progressive_url": "https://video.example/sidebar.mp4"}
+                    ]
+                }
+            }
+        })];
+
+        assert!(find_content_node(&blocks, Some("sidebar-video")).is_none());
+    }
+
+    #[test]
+    fn reel_id_from_path_uses_final_numeric_segment() {
+        assert_eq!(
+            reel_id_from_path("reel/1013234327723021?mibextid=abc"),
+            Some("1013234327723021")
+        );
+        assert_eq!(
+            reel_id_from_path("reel/1013234327723021/"),
+            Some("1013234327723021")
+        );
+        assert_eq!(reel_id_from_path("reel/1/2"), None);
+        assert_eq!(reel_id_from_path("reel/1/2/3"), None);
+        assert_eq!(reel_id_from_path("prefix/reel/1"), None);
+        assert_eq!(reel_id_from_path("reel/not-a-number"), None);
     }
 }

@@ -338,7 +338,9 @@ fn no_store_html_response(body: String) -> Response {
     (StatusCode::OK, headers, body).into_response()
 }
 
-static RE_REEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?reel/[0-9]+").unwrap());
+static RE_REEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?reel/[0-9]+/?(?:\?.*)?$").unwrap());
+static RE_REEL_TWO_SEGMENTS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/?reel/[0-9]+/[0-9]+/?$").unwrap());
 // Only match bare `videos/<id>` (no Page prefix). Page-scoped video posts like
 // `<page>/videos/<slug>/<id>` are real video viewer pages — not reels — and
 // FB serves them with a watch-style JSON shape that the JsonPost root walker
@@ -498,6 +500,9 @@ async fn catch_all(
     if let Some(rewritten) = rewrite_videos_path(&working) {
         working = rewritten;
     }
+    if let Some(normalized) = normalize_reel_path(&working) {
+        working = normalized;
+    }
 
     // dispatch — comment permalinks first, then path-shape routing
     let kind = if crate::parsers::comment::comment_id_in(&working).is_some() {
@@ -573,6 +578,22 @@ fn rewrite_videos_path(working: &str) -> Option<String> {
     Some(out)
 }
 
+fn normalize_reel_path(working: &str) -> Option<String> {
+    let (path, query) = working
+        .split_once('?')
+        .map_or((working, None), |(path, query)| (path, Some(query)));
+    if !RE_REEL_TWO_SEGMENTS.is_match(path) {
+        return None;
+    }
+    let id = path.rsplit('/').find(|segment| !segment.is_empty())?;
+    let mut out = format!("reel/{id}");
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        out.push('?');
+        out.push_str(query);
+    }
+    Some(out)
+}
+
 fn select_kind(working: &str) -> Option<ParserKind> {
     if RE_STORIES.is_match(working) {
         Some(ParserKind::Stories)
@@ -603,6 +624,9 @@ fn activity_path(id: &str) -> Result<(String, ParserKind), StatusCode> {
     }
     if let Some(rewritten) = rewrite_videos_path(&path) {
         path = rewritten;
+    }
+    if let Some(normalized) = normalize_reel_path(&path) {
+        path = normalized;
     }
 
     let is_photocom = Url::parse(&url_clean::ensure_absolute(&path))
@@ -1133,8 +1157,8 @@ mod tests {
     use super::{
         activity_eligible, activity_error_response, activity_path, build_healthz_json,
         build_oembed_json, group_multi_permalink_path, is_facebook_url, media_target_allowed,
-        request_origin, rewrite_videos_path, router, scope_key, select_kind, strip_comment_id,
-        AppState, Metrics, ParserKind,
+        normalize_reel_path, request_origin, rewrite_videos_path, router, scope_key, select_kind,
+        strip_comment_id, AppState, Metrics, ParserKind,
     };
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
@@ -1493,6 +1517,52 @@ mod tests {
             Some("reel/123".to_string())
         );
         assert_eq!(rewrite_videos_path("reel/123"), None);
+    }
+
+    #[test]
+    fn two_segment_reel_paths_normalize_to_final_id_before_dispatch() {
+        assert_eq!(
+            normalize_reel_path("reel/1376968477584004/1013234327723021?mibextid=abc"),
+            Some("reel/1013234327723021?mibextid=abc".to_string())
+        );
+        assert_eq!(normalize_reel_path("reel/1013234327723021"), None);
+    }
+
+    #[test]
+    fn reel_dispatch_accepts_only_one_numeric_id_segment() {
+        assert!(matches!(select_kind("reel/123"), Some(ParserKind::Reels)));
+        assert!(matches!(select_kind("reel/123/"), Some(ParserKind::Reels)));
+        assert!(matches!(
+            select_kind("reel/123?x=1"),
+            Some(ParserKind::Reels)
+        ));
+        assert!(select_kind("reel/1/2/3").is_none());
+    }
+
+    #[test]
+    fn activity_path_keeps_query_when_normalizing_two_segment_reel() {
+        let id = crate::activity::status_id(
+            "https://www.facebook.com/reel/1376968477584004/1013234327723021?x=1",
+        )
+        .expect("activity id");
+
+        assert!(matches!(
+            activity_path(&id),
+            Ok((path, ParserKind::Reels)) if path == "reel/1013234327723021?x=1"
+        ));
+    }
+
+    #[test]
+    fn activity_path_normalizes_two_segment_reel_before_dispatch() {
+        let id = crate::activity::status_id(
+            "https://www.facebook.com/reel/1376968477584004/1013234327723021",
+        )
+        .expect("activity id");
+
+        assert!(matches!(
+            activity_path(&id),
+            Ok((path, ParserKind::Reels)) if path == "reel/1013234327723021"
+        ));
     }
 
     #[test]
