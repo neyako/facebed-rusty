@@ -415,6 +415,6 @@ mod tests {
 
         let counts = get_reaction_counts(&blocks, false, "video-story");
 
-        assert_eq!(counts, Some(("26.452K".into(), "172".into(), "325".into())));
+        assert_eq!(counts, Some(("26.452".into(), "172".into(), "325".into())));
     }
 }

@@ -5,11 +5,15 @@ use crate::parsers::PostContext;
 use serde_json::Value;
 use url::Url;
 
-/// Python `Utils.human_format`. Integer → `1.23K`/`4.5M` style, non-int → unchanged.
+/// Formats thousand-range counts exactly and larger counts with compact suffixes.
 pub fn human_format(num: &Value) -> String {
     let n_opt = match num {
-        Value::Number(n) => n.as_i64(),
-        Value::String(s) => s.parse::<i64>().ok(),
+        Value::Number(n) => n.as_i64().map(|n| n as f64),
+        Value::String(s) => s
+            .parse::<i64>()
+            .ok()
+            .map(|n| n as f64)
+            .or_else(|| compact_count(s)),
         _ => None,
     };
     let Some(n) = n_opt else {
@@ -19,9 +23,18 @@ pub fn human_format(num: &Value) -> String {
         };
     };
 
-    let mut f = n as f64;
+    if n.abs() < 1_000_000.0 {
+        return format_exact_count(n);
+    }
+
+    let mut f = n;
     let mut magnitude = 0;
     while f.abs() >= 1000.0 {
+        magnitude += 1;
+        f /= 1000.0;
+    }
+    let rounded = (f * 1000.0).round() / 1000.0;
+    if rounded.abs() >= 1000.0 && magnitude < 4 {
         magnitude += 1;
         f /= 1000.0;
     }
@@ -37,6 +50,36 @@ pub fn human_format(num: &Value) -> String {
         s.pop();
     }
     format!("{}{}", s, suffix)
+}
+
+fn format_exact_count(value: f64) -> String {
+    let rounded = value.round() as i64;
+    let raw = rounded.unsigned_abs().to_string();
+    let mut formatted = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, digit) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index) % 3 == 0 {
+            formatted.push('.');
+        }
+        formatted.push(digit);
+    }
+    if rounded < 0 {
+        formatted.insert(0, '-');
+    }
+    formatted
+}
+
+fn compact_count(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let (digits, multiplier) = match value.chars().last()?.to_ascii_uppercase() {
+        'K' => (&value[..value.len() - 1], 1_000.0),
+        'M' => (&value[..value.len() - 1], 1_000_000.0),
+        'B' => (&value[..value.len() - 1], 1_000_000_000.0),
+        'T' => (&value[..value.len() - 1], 1_000_000_000_000.0),
+        _ => return None,
+    };
+    let number = digits.parse::<f64>().ok()?;
+    let count = number * multiplier;
+    count.is_finite().then_some(count)
 }
 
 pub fn val_str(v: &Value) -> String {
@@ -431,7 +474,7 @@ pub fn interaction_counts(
         .or_else(|| {
             fb.get("i18n_reaction_count")
                 .filter(|count| !count.is_null())
-                .map(val_str)
+                .map(human_format)
         })
         .unwrap_or_else(|| "0".into());
     let shares = adaptive
@@ -441,7 +484,7 @@ pub fn interaction_counts(
             })
         })
         .map(human_format)
-        .or_else(|| fb.get("i18n_share_count").map(val_str))
+        .or_else(|| fb.get("i18n_share_count").map(human_format))
         .unwrap_or_else(|| "0".into());
     let comments = adaptive
         .and_then(|items| {
@@ -456,7 +499,7 @@ pub fn interaction_counts(
             fb.get("comment_rendering_instance")
                 .and_then(|comments| comments.get("comments"))
                 .and_then(|comments| comments.get("total_count"))
-                .map(val_str)
+                .map(human_format)
         })
         .unwrap_or_else(|| "0".into());
     Ok((reactions, comments, shares))
@@ -465,10 +508,42 @@ pub fn interaction_counts(
 #[cfg(test)]
 mod tests {
     use super::{
-        author_avatar_in_node, author_handle_in_node, author_id_in_node, images_from_post,
-        interaction_counts, Story,
+        author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
+        images_from_post, interaction_counts, Story,
     };
     use serde_json::json;
+
+    #[test]
+    fn human_format_expands_thousands_without_a_suffix() {
+        // Given / When / Then
+        assert_eq!(human_format(&json!(1_000)), "1.000");
+        assert_eq!(human_format(&json!(1_294)), "1.294");
+        assert_eq!(human_format(&json!("1.294K")), "1.294");
+        assert_eq!(human_format(&json!(1_000_000)), "1M");
+    }
+
+    #[test]
+    fn interaction_counts_normalizes_localized_reaction_boundary() {
+        // Given
+        let post = json!({
+            "comet_ufi_summary_and_actions_renderer": {
+                "feedback": {
+                    "subscription_target_id": "123",
+                    "i18n_reaction_count": "1.294K",
+                    "i18n_share_count": "0",
+                    "comment_rendering_instance": {
+                        "comments": {"total_count": 0}
+                    }
+                }
+            }
+        });
+
+        // When
+        let counts = interaction_counts(&post, Some("123")).unwrap();
+
+        // Then
+        assert_eq!(counts.0, "1.294");
+    }
 
     #[test]
     fn selected_author_identity_uses_profile_fields() {

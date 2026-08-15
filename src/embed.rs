@@ -713,6 +713,19 @@ mod tests {
     }
 
     #[test]
+    fn full_embed_renders_thousand_counter_without_k_suffix() {
+        let mut post = sample_post();
+        post.likes = "1.294".into();
+        post.comments = "236".into();
+        post.shares = "0".into();
+
+        let html = format_full_post_embed(&post, 0, None);
+
+        assert!(html.contains("❤️ 1.294 • 💬 236 • 🔁 0"));
+        assert!(!html.contains("1.294K"));
+    }
+
+    #[test]
     fn non_activity_full_embed_keeps_detailed_timestamp() {
         // Given
         let mut post = sample_post();
