@@ -53,7 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/media", get(media))
         .route("/api/v1/statuses/:id", get(activity_status))
-        .route("/users/facebed/statuses/:id", get(activity_status))
+        .route("/users/:username/statuses/:id", get(user_activity_status))
         .route("/*path", get(catch_all))
         .with_state(state)
 }
@@ -156,6 +156,17 @@ async fn activity_status(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    activity_status_for_id(state, id).await
+}
+
+async fn user_activity_status(
+    State(state): State<AppState>,
+    axum::extract::Path((_username, id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    activity_status_for_id(state, id).await
+}
+
+async fn activity_status_for_id(state: AppState, id: String) -> Response {
     let (path, kind) = match activity_path(&id) {
         Ok(activity) => activity,
         Err(status) => return activity_error_response(status),
@@ -1172,7 +1183,7 @@ mod tests {
             .expect("activity cache")
             .insert_activity(&id, post, Instant::now());
         let request = Request::builder()
-            .uri(format!("/users/facebed/statuses/{id}"))
+            .uri(format!("/users/example.author/statuses/{id}"))
             .body(Body::empty())
             .expect("activity request");
 
@@ -1211,7 +1222,7 @@ mod tests {
             .expect("activity cache")
             .insert_activity(&id, post, Instant::now());
         let request = Request::builder()
-            .uri(format!("/users/facebed/statuses/{id}"))
+            .uri(format!("/users/example.author/statuses/{id}"))
             .body(Body::empty())
             .expect("activity request");
 
@@ -1358,7 +1369,7 @@ mod tests {
         crate::parsers::ParsedPost {
             author_name: "Author".into(),
             author_id: None,
-            author_handle: None,
+            author_handle: Some("example.author".into()),
             author_avatar_url: None,
             context: None,
             text: "Post".into(),

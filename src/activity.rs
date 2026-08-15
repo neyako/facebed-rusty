@@ -42,19 +42,34 @@ pub fn decode_status_path(id: &str) -> Option<String> {
     Some(url_clean::clean_path(&post_url))
 }
 
-pub fn alternate_link(post_url: &str, public_origin: &str) -> String {
+pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) -> String {
     let Ok(origin) = Url::parse(public_origin) else {
         return String::new();
     };
     if !matches!(origin.scheme(), "http" | "https") || origin.host_str().is_none() {
         return String::new();
     }
-    let origin = origin.origin().ascii_serialization();
-    status_id(post_url).map_or_else(String::new, |id| {
-        format!(
-            r#"<link href="{origin}/users/facebed/statuses/{id}" rel="alternate" type="application/activity+json"/>"#
-        )
-    })
+    let Some(id) = status_id(&post.url) else {
+        return String::new();
+    };
+    let username = post
+        .author_handle
+        .as_deref()
+        .or(post.author_id.as_deref())
+        .unwrap_or("facebed");
+    let Ok(mut status_url) = Url::parse(&origin.origin().ascii_serialization()) else {
+        return String::new();
+    };
+    let Ok(mut segments) = status_url.path_segments_mut() else {
+        return String::new();
+    };
+    segments
+        .push("users")
+        .push(username)
+        .push("statuses")
+        .push(&id);
+    drop(segments);
+    format!(r#"<link href="{status_url}" rel="alternate" type="application/activity+json"/>"#)
 }
 
 pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
@@ -63,7 +78,6 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         .as_deref()
         .or(post.author_id.as_deref())
         .unwrap_or("facebed");
-    let acct = format!("{username}@fb.com");
     let account_id = post.author_id.as_deref().unwrap_or(username);
     let profile_avatar = post
         .author_handle
@@ -110,7 +124,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         "replies_count": 0, "reblogs_count": 0, "favourites_count": 0,
         "application": { "name": "Facebed", "website": null },
         "account": {
-            "id": account_id, "username": username, "acct": acct,
+            "id": account_id, "username": username, "acct": username,
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
             "note": "", "url": post.url,

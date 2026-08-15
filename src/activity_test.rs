@@ -24,7 +24,7 @@ fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
 }
 
 #[test]
-fn status_json_uses_short_facebook_account_domain() {
+fn status_json_uses_bare_real_handle_without_platform_domain() {
     // Given
     let post = post("qualified account".to_owned(), vec![]);
 
@@ -35,7 +35,7 @@ fn status_json_uses_short_facebook_account_domain() {
     assert_eq!(json["account"]["display_name"], "Example Author");
     assert_eq!(json["account"]["id"], "100012345");
     assert_eq!(json["account"]["username"], "example.author");
-    assert_eq!(json["account"]["acct"], "example.author@fb.com");
+    assert_eq!(json["account"]["acct"], "example.author");
     assert_eq!(
         json["account"]["url"],
         "https://www.facebook.com/groups/example/posts/123"
@@ -77,19 +77,20 @@ fn status_id_rejects_invalid_inputs() {
 
 #[test]
 fn alternate_link_uses_absolute_origin_for_facebook_posts() {
-    let post_url = "https://www.facebook.com/posts/123";
-    let id = status_id(post_url).unwrap();
+    // Given
+    let post = post("matched author path".to_owned(), vec![]);
+    let id = status_id(&post.url).unwrap();
 
+    // When / Then
     assert_eq!(
-        alternate_link(post_url, "https://facebed.example"),
+        alternate_link(&post, "https://facebed.example"),
         format!(
-            r#"<link href="https://facebed.example/users/facebed/statuses/{id}" rel="alternate" type="application/activity+json"/>"#
+            r#"<link href="https://facebed.example/users/example.author/statuses/{id}" rel="alternate" type="application/activity+json"/>"#
         )
     );
-    assert_eq!(
-        alternate_link("https://example.com/x", "https://facebed.example"),
-        ""
-    );
+    let mut invalid = post;
+    invalid.url = "https://example.com/x".to_owned();
+    assert_eq!(alternate_link(&invalid, "https://facebed.example"), "");
 }
 
 #[test]

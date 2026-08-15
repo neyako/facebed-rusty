@@ -2,6 +2,7 @@ use crate::parsers::ParsedPost;
 use chrono::{FixedOffset, TimeZone};
 use html_escape::encode_quoted_attribute;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use std::borrow::Cow;
 
 const CREDIT: &str = "facebed on Rust";
 
@@ -33,6 +34,13 @@ fn escape_attr(s: &str) -> String {
 
 fn enc_query(s: &str) -> String {
     utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+fn author_label(post: &ParsedPost) -> Cow<'_, str> {
+    post.author_handle.as_deref().map_or_else(
+        || Cow::Borrowed(post.author_name.as_str()),
+        |handle| Cow::Owned(format!("{} (@{handle})", post.author_name)),
+    )
 }
 
 /// Relative oEmbed link the embed advertises to Discord. Discord resolves this
@@ -296,9 +304,10 @@ pub fn format_full_post_embed(
     } else {
         "video"
     };
-    let oembed = oembed_link_tag(&post.author_name, &post.url, kind);
+    let author = author_label(post);
+    let oembed = oembed_link_tag(&author, &post.url, kind);
     let activity = activity_origin.map_or_else(String::new, |origin| {
-        crate::activity::alternate_link(&post.url, origin)
+        crate::activity::alternate_link(post, origin)
     });
     let description = format_post_description(post);
 
@@ -323,7 +332,7 @@ pub fn format_full_post_embed(
 </html>"##,
         credit = CREDIT,
         site_name = site_name,
-        title = escape_attr(&post.author_name),
+        title = escape_attr(&author),
         desc = escape_attr(truncate_chars(&description, 4096)),
         extra = extra,
         url_q = url_q,
@@ -359,9 +368,10 @@ pub fn format_reel_post_embed(
     };
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
-    let oembed = oembed_link_tag(&post.author_name, &post.url, "video");
+    let author = author_label(post);
+    let oembed = oembed_link_tag(&author, &post.url, "video");
     let activity = activity_origin.map_or_else(String::new, |origin| {
-        crate::activity::alternate_link(&post.url, origin)
+        crate::activity::alternate_link(post, origin)
     });
     let description = format_post_description(post);
 
@@ -391,7 +401,7 @@ pub fn format_reel_post_embed(
 </head>
 </html>"##,
         credit = CREDIT,
-        title = escape_attr(&post.author_name),
+        title = escape_attr(&author),
         desc = escape_attr(truncate_chars(&description, 4096)),
         post_date = post_date,
         reactions = reactions,
@@ -419,9 +429,10 @@ pub fn format_oversized_video_embed(
     };
     let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
     let url_q = quote(&post.url);
+    let author = author_label(post);
     let description = format_post_description(post);
     let activity = activity_origin.map_or_else(String::new, |origin| {
-        crate::activity::alternate_link(&post.url, origin)
+        crate::activity::alternate_link(post, origin)
     });
     let image_meta = if thumb.is_empty() {
         String::new()
@@ -453,7 +464,7 @@ pub fn format_oversized_video_embed(
 </head>
 </html>"##,
         credit = CREDIT,
-        title = escape_attr(&post.author_name),
+        title = escape_attr(&author),
         desc = escape_attr(truncate_chars(&description, 4096)),
         post_date = post_date,
         reactions = reactions,
@@ -647,6 +658,27 @@ mod tests {
         assert!(html.contains(&format!(r#"type="{mime}""#)));
         assert!(html.contains("/oembed.json?author="));
         assert!(html.contains("&amp;type=link"));
+    }
+
+    #[test]
+    fn embeds_advertise_bare_author_identity_in_og_and_oembed() {
+        // Given
+        let mut post = sample_post();
+        post.author_name = "Example Author".into();
+        post.author_handle = Some("example.author".into());
+        let full = format_full_post_embed(&post, 0, Some("https://facebed.example"));
+        post.image_links.clear();
+        post.video_links = vec!["https://video.example/post.mp4".into()];
+        let reel = format_reel_post_embed(&post, 0, Some("https://facebed.example"));
+
+        // When / Then
+        for html in [full, reel] {
+            assert!(html.contains(
+                r#"<meta property="og:title" content="Example Author (@example.author)"/>"#
+            ));
+            assert!(html.contains("author=Example%20Author%20%28%40example%2Eauthor%29"));
+            assert!(html.contains("/users/example.author/statuses/"));
+        }
     }
 
     #[test]
