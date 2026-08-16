@@ -3,7 +3,7 @@ use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::util::{
     author_avatar_in_node, author_handle_in_node, author_id_in_node,
-    interaction_counts_with_reactions, val_str_at,
+    interaction_counts_with_reaction_ids, val_str_at,
 };
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
@@ -42,9 +42,13 @@ impl Parser for SinglePhotoParser {
             .get("created_time")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        let interaction_id = focal_interaction_id(&content_node);
+        let interaction_ids = focal_interaction_ids(&content_node);
+        let interaction_refs = interaction_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let (likes, cmts, shares, top_reaction_ids) =
-            interaction_counts_with_reactions(&interaction, interaction_id.as_deref())?;
+            interaction_counts_with_reaction_ids(&interaction, &interaction_refs)?;
         let image = get_single_image(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "cannot find single image",
@@ -106,16 +110,27 @@ fn get_interactions_node(blocks: &[Value]) -> Option<Value> {
     None
 }
 
-fn focal_interaction_id(content_node: &Value) -> Option<String> {
-    ["id", "post_id", "photo_id", "story_fbid"]
-        .into_iter()
-        .find_map(|key| content_node.get(key).map(crate::parsers::util::val_str))
-        .filter(|id| !id.is_empty())
-        .or_else(|| {
-            content_node
-                .get("container_story")
-                .and_then(focal_interaction_id)
-        })
+fn focal_interaction_ids(content_node: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    for key in ["id", "post_id", "photo_id", "story_fbid"] {
+        if let Some(id) = content_node
+            .get(key)
+            .map(crate::parsers::util::val_str)
+            .filter(|id| !id.is_empty())
+        {
+            if !ids.iter().any(|candidate| candidate == &id) {
+                ids.push(id);
+            }
+        }
+    }
+    if let Some(story) = content_node.get("container_story") {
+        for id in focal_interaction_ids(story) {
+            if !ids.iter().any(|candidate| candidate == &id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 fn get_single_image(blocks: &[Value]) -> Option<String> {
@@ -130,7 +145,7 @@ fn get_single_image(blocks: &[Value]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{focal_interaction_id, get_content_node, get_single_image, longest_post_text};
+    use super::{focal_interaction_ids, get_content_node, get_single_image, longest_post_text};
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
@@ -180,12 +195,14 @@ mod tests {
                 ]}}}}
         });
 
-        let id = focal_interaction_id(&content).unwrap();
-        let (_, _, _, reactions) =
-            crate::parsers::util::interaction_counts_with_reactions(&interactions, Some(&id))
-                .unwrap();
+        let ids = focal_interaction_ids(&content);
+        let (_, _, _, reactions) = crate::parsers::util::interaction_counts_with_reaction_ids(
+            &interactions,
+            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .unwrap();
 
-        assert_eq!(id, "photo-target");
+        assert_eq!(ids, vec!["photo-target", "story-target"]);
         assert_eq!(reactions.len(), 2);
         assert_eq!(reactions[0], crate::parsers::ReactionKind::Like);
         assert_eq!(reactions[1], crate::parsers::ReactionKind::Love);

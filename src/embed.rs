@@ -45,10 +45,11 @@ fn author_label(post: &ParsedPost) -> Cow<'_, str> {
 
 /// Relative oEmbed link the embed advertises to Discord. Discord resolves this
 /// href against the page URL and reads `author_name`/`provider_name`.
-fn oembed_link_tag(author: &str, url: &str, kind: &str) -> String {
+fn oembed_link_tag(engagement: &str, title: &str, url: &str, kind: &str) -> String {
     format!(
-        r#"<link rel="alternate" type="application/json+oembed" href="/oembed.json?author={a}&amp;url={u}&amp;type={kind}"/>"#,
-        a = enc_query(author),
+        r#"<link rel="alternate" type="application/json+oembed" href="/oembed.json?author={a}&amp;title={t}&amp;url={u}&amp;type={kind}"/>"#,
+        a = enc_query(engagement),
+        t = enc_query(title),
         u = enc_query(url),
         kind = kind,
     )
@@ -225,6 +226,15 @@ fn truncate_chars(s: &str, max: usize) -> &str {
     }
 }
 
+fn truncate_with_suffix(s: &str, suffix: &str, max: usize) -> String {
+    let suffix_len = suffix.chars().count();
+    if suffix_len >= max {
+        return truncate_chars(suffix, max).to_owned();
+    }
+    let body = truncate_chars(s, max - suffix_len);
+    format!("{body}{suffix}")
+}
+
 fn format_timestamp(ts: i64, tz_offset: i32) -> String {
     if ts < 0 {
         return String::new();
@@ -322,7 +332,7 @@ pub fn format_full_post_embed(
         "video"
     };
     let author = author_label(post);
-    let oembed = oembed_link_tag(&reactions, &post.url, kind);
+    let oembed = oembed_link_tag(&reactions, &author, &post.url, kind);
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
@@ -391,9 +401,19 @@ pub fn format_reel_post_embed(
         &post.shares,
         &post.top_reaction_ids,
     );
+    let media_extra = if post.image_links.len() + post.video_links.len() > 4 {
+        "contains 4+ media"
+    } else {
+        ""
+    };
+    let site_name = [CREDIT, media_extra, &post_date]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     let url_q = quote(&post.url);
     let author = author_label(post);
-    let oembed = oembed_link_tag(&reactions, &post.url, "video");
+    let oembed = oembed_link_tag(&reactions, &author, &post.url, "video");
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
@@ -407,8 +427,7 @@ pub fn format_reel_post_embed(
     <meta charset="UTF-8"/>
     <meta property="og:title" content="{title}"/>
     <meta property="og:description" content="{desc}"/>
-    <meta property="og:site_name" content="{credit}
-{post_date}"/>
+    <meta property="og:site_name" content="{site_name}"/>
     <meta property="og:url" content="{url_q}"/>
     <meta property="og:video:type" content="video/mp4"/>
     <meta property="twitter:player:stream:content_type" content="video/mp4"/>
@@ -424,9 +443,9 @@ pub fn format_reel_post_embed(
 </head>
 </html>"##,
         credit = CREDIT,
+        site_name = site_name,
         title = escape_attr(&author),
         desc = escape_attr(truncate_chars(&description, 4096)),
-        post_date = post_date,
         url_q = url_q,
         video_meta = video_meta,
         oembed = oembed,
@@ -455,11 +474,24 @@ pub fn format_oversized_video_embed(
         &post.shares,
         &post.top_reaction_ids,
     );
+    let media_extra = if post.image_links.len() + post.video_links.len() > 4 {
+        "contains 4+ media"
+    } else {
+        ""
+    };
+    let site_name = [CREDIT, media_extra, &post_date]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     let url_q = quote(&post.url);
     let author = author_label(post);
-    let oembed = oembed_link_tag(&reactions, &post.url, "video");
-    let mut description = format_post_description(post);
-    description.push_str("\n\n🎥 video too big to embed — click to watch on Facebook");
+    let oembed = oembed_link_tag(&reactions, &author, &post.url, "video");
+    let description = truncate_with_suffix(
+        &format_post_description(post),
+        "\n\n🎥 video too big to embed — click to watch on Facebook",
+        4096,
+    );
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
@@ -479,8 +511,7 @@ pub fn format_oversized_video_embed(
     <meta charset="UTF-8"/>
     <meta property="og:title" content="{title}"/>
     <meta property="og:description" content="{desc}"/>
-    <meta property="og:site_name" content="{credit}
-{post_date}"/>
+    <meta property="og:site_name" content="{site_name}"/>
     <meta property="og:url" content="{url_q}"/>
     {image_meta}
     <link rel="canonical" href="{url_q}"/>
@@ -492,9 +523,9 @@ pub fn format_oversized_video_embed(
 </head>
 </html>"##,
         credit = CREDIT,
+        site_name = site_name,
         title = escape_attr(&author),
-        desc = escape_attr(truncate_chars(&description, 4096)),
-        post_date = post_date,
+        desc = escape_attr(&description),
         url_q = url_q,
         image_meta = image_meta,
         oembed = oembed,
@@ -736,6 +767,35 @@ mod tests {
     }
 
     #[test]
+    fn reel_and_oversized_footers_disclose_excess_media() {
+        let mut post = sample_post();
+        post.likes = "19".into();
+        post.image_links = (0..4)
+            .map(|n| format!("https://img.example/{n}.jpg"))
+            .collect();
+        post.video_links = vec!["https://video.example/v.mp4".into()];
+
+        for html in [
+            format_reel_post_embed(&post, 0, None),
+            format_oversized_video_embed(&post, 0, None),
+        ] {
+            let site_name = html.split("og:site_name\" content=\"").nth(1).unwrap();
+            assert!(site_name.contains("facebed on Rust\ncontains 4+ media"));
+            assert!(!site_name.contains("❤️ 19"));
+        }
+    }
+
+    #[test]
+    fn oversized_warning_survives_description_boundary() {
+        let mut post = sample_post();
+        post.text = "x".repeat(4096);
+        post.video_links = vec!["https://video.example/v.mp4".into()];
+
+        let html = format_oversized_video_embed(&post, 0, None);
+        assert!(html.contains("🎥 video too big to embed — click to watch on Facebook"));
+    }
+
+    #[test]
     fn embeds_keep_author_identity_in_og_title() {
         // Given
         let mut post = sample_post();
@@ -752,6 +812,7 @@ mod tests {
                 r#"<meta property="og:title" content="Example Author (@example.author)"/>"#
             ));
             assert!(html.contains("author="));
+            assert!(html.contains("title=Example%20Author%20%28%40example%2Eauthor%29"));
             assert!(html.contains("/users/example.author/statuses/"));
         }
     }

@@ -143,13 +143,15 @@ struct OEmbedParams {
     #[serde(default)]
     author: String,
     #[serde(default)]
+    title: String,
+    #[serde(default)]
     url: String,
     #[serde(default, rename = "type")]
     kind: String,
 }
 
 async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> Response {
-    json_response(build_oembed_json(&p.author, &p.url, &p.kind))
+    json_response(build_oembed_json(&p.author, &p.title, &p.url, &p.kind))
 }
 
 async fn activity_status(
@@ -283,7 +285,7 @@ async fn healthz(State(state): State<AppState>) -> Response {
 
 /// Build the oEmbed 1.0 document Discord reads to render the author/provider
 /// line. Kept pure (no extractors) so it is unit-testable.
-fn build_oembed_json(author: &str, url: &str, kind: &str) -> String {
+fn build_oembed_json(engagement: &str, title: &str, url: &str, kind: &str) -> String {
     let kind = match kind {
         "video" | "photo" | "rich" => kind,
         _ => "link",
@@ -293,9 +295,9 @@ fn build_oembed_json(author: &str, url: &str, kind: &str) -> String {
         "type": kind,
         "provider_name": crate::embed::credit(),
         "provider_url": url,
-        "author_name": author,
+        "author_name": engagement,
         "author_url": url,
-        "title": author,
+        "title": title,
     })
     .to_string()
 }
@@ -1714,15 +1716,17 @@ mod tests {
 
     #[test]
     fn oembed_json_has_author_and_provider() {
-        let json = build_oembed_json("Jane Doe", "https://www.facebook.com/x", "video");
-        assert!(json.contains(r#""author_name":"Jane Doe""#));
-        assert!(json.contains(r#""provider_name":"facebed on Rust""#));
-        assert!(json.contains(r#""type":"video""#));
+        let json = build_oembed_json("❤️ 19", "Jane Doe", "https://www.facebook.com/x", "video");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["author_name"], "❤️ 19");
+        assert_eq!(value["title"], "Jane Doe");
+        assert_eq!(value["provider_name"], "facebed on Rust");
+        assert_eq!(value["type"], "video");
     }
 
     #[test]
     fn oembed_json_defaults_unknown_type_to_link() {
-        let json = build_oembed_json("A", "https://x", "garbage");
+        let json = build_oembed_json("❤️ 1", "A", "https://x", "garbage");
         assert!(json.contains(r#""type":"link""#));
     }
 }

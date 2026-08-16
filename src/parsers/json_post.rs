@@ -1,7 +1,7 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::{get_json_block_texts, FetchedPage, JsonBlockText};
 use crate::jq;
-use crate::parsers::util::{interaction_counts_with_reactions, Story};
+use crate::parsers::util::{interaction_counts_with_reaction_ids, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::{self, ensure_absolute};
 use once_cell::sync::Lazy;
@@ -84,7 +84,17 @@ fn parse_page(
     let root = get_root_node(&post_json).ok_or_else(|| {
         FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
     })?;
-    let (likes, cmts, shares, top_reaction_ids) = interaction_counts_with_reactions(root, post_id)?;
+    let story_json = root.pointer("/content/story").ok_or_else(|| {
+        FacebedError::parse_with("missing content.story", page.html.clone(), page.url.clone())
+    })?;
+    let interaction_ids =
+        interaction_identity_candidates(post_id, canonical_post_id.as_deref(), story_json);
+    let interaction_refs = interaction_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let (likes, cmts, shares, top_reaction_ids) =
+        interaction_counts_with_reaction_ids(root, &interaction_refs)?;
 
     let post_date = root
         .pointer("/context_layout/story/comet_sections/metadata")
@@ -95,9 +105,6 @@ fn parse_page(
         })
         .unwrap_or(0);
 
-    let story_json = root.pointer("/content/story").ok_or_else(|| {
-        FacebedError::parse_with("missing content.story", page.html.clone(), page.url.clone())
-    })?;
     let story = Story::from_json(story_json)?;
 
     let post_url = if story.url.is_empty() {
@@ -145,6 +152,33 @@ fn parse_page(
         },
         unresolved_author_id,
     })
+}
+
+fn interaction_identity_candidates(
+    post_id: Option<&str>,
+    canonical_post_id: Option<&str>,
+    story_json: &Value,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [post_id, canonical_post_id]
+        .into_iter()
+        .flatten()
+        .filter(|id| !id.is_empty())
+    {
+        if !ids.iter().any(|candidate| candidate == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    if let Some(id) = story_json
+        .get("post_id")
+        .map(crate::parsers::util::val_str)
+        .filter(|id| !id.is_empty())
+    {
+        if !ids.iter().any(|candidate| candidate == &id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 /// Select the requested story using its URL ID or Facebook's page-canonical post ID.
@@ -463,8 +497,8 @@ fn get_root_node(post_json: &Value) -> Option<&Value> {
 mod tests {
     use super::{
         canonical_page_post_id, extract_post_id, get_post_json, get_post_json_for_page,
-        get_root_node, group_handle_from_post_path, is_group_post_path, should_try_partial_fetch,
-        PostBlockScanner,
+        get_root_node, group_handle_from_post_path, interaction_identity_candidates,
+        is_group_post_path, should_try_partial_fetch, PostBlockScanner,
     };
     use crate::fetch::JsonBlockText;
     use scraper::Html;
@@ -617,6 +651,18 @@ mod tests {
             selected.is_some(),
             "exact story identity should not require an i18n reaction label"
         );
+    }
+
+    #[test]
+    fn canonical_rewrite_carries_all_focal_feedback_ids() {
+        let story = json!({"post_id": "28131981629721302"});
+        let ids = interaction_identity_candidates(
+            Some("pfbidREQUESTED"),
+            Some("28131981629721302"),
+            &story,
+        );
+
+        assert_eq!(ids, vec!["pfbidREQUESTED", "28131981629721302"]);
     }
 
     #[test]

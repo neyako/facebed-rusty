@@ -455,16 +455,36 @@ pub fn interaction_counts_with_reactions(
     post_json: &Value,
     post_id: Option<&str>,
 ) -> Result<(String, String, String, Vec<ReactionKind>), FacebedError> {
+    let ids = post_id.into_iter().collect::<Vec<_>>();
+    interaction_counts_with_reaction_ids(post_json, &ids)
+}
+
+pub fn interaction_counts_with_reaction_ids(
+    post_json: &Value,
+    post_ids: &[&str],
+) -> Result<(String, String, String, Vec<ReactionKind>), FacebedError> {
     let renderers = jq::all(post_json, "comet_ufi_summary_and_actions_renderer");
-    let matched = post_id.and_then(|id| {
+    let matched = (!post_ids.is_empty()).then(|| {
         renderers.iter().copied().find(|renderer| {
             renderer
                 .pointer("/feedback/subscription_target_id")
-                .is_some_and(|value| val_str(value) == id)
+                .is_some_and(|value| post_ids.iter().any(|id| val_str(value) == *id))
         })
     });
-    let pf = matched
-        .or_else(|| renderers.first().copied())
+    let Some(matched) = matched.flatten() else {
+        if !post_ids.is_empty() {
+            return Err(FacebedError::parse("missing focal feedback renderer"));
+        }
+        return interaction_counts_from_renderer(renderers.first().copied(), false);
+    };
+    interaction_counts_from_renderer(Some(matched), true)
+}
+
+fn interaction_counts_from_renderer(
+    renderer: Option<&Value>,
+    matched: bool,
+) -> Result<(String, String, String, Vec<ReactionKind>), FacebedError> {
+    let pf = renderer
         .ok_or_else(|| FacebedError::parse("missing comet_ufi_summary_and_actions_renderer"))?;
     let fb = pf
         .get("feedback")
@@ -516,8 +536,18 @@ pub fn interaction_counts_with_reactions(
                 .and_then(|comments| comments.get("total_count"))
                 .map(human_format)
         })
+        .or_else(|| {
+            jq::first(pf, "comments_count_summary_renderer")
+                .and_then(|summary| jq::first(summary, "feedback"))
+                .and_then(|summary_feedback| {
+                    jq::first(summary_feedback, "comment_rendering_instance")
+                })
+                .and_then(|comments| comments.get("comments"))
+                .and_then(|comments| comments.get("total_count"))
+                .map(human_format)
+        })
         .unwrap_or_else(|| "0".into());
-    let top_reactions = if matched.is_some() {
+    let top_reactions = if matched {
         top_reactions_from_feedback(fb)
     } else {
         Vec::new()
@@ -662,6 +692,41 @@ mod tests {
             ("42".into(), "2".into(), "3".into())
         );
         assert_eq!(reactions, vec![ReactionKind::Love, ReactionKind::Wow]);
+    }
+
+    #[test]
+    fn interaction_counts_fails_closed_when_supplied_id_is_not_a_renderer() {
+        let post = json!({
+            "comet_ufi_summary_and_actions_renderer": {
+                "feedback": {
+                    "subscription_target_id": "decoy",
+                    "reaction_count": {"count": 999}
+                }
+            }
+        });
+
+        assert!(interaction_counts_with_reactions(&post, Some("focal")).is_err());
+    }
+
+    #[test]
+    fn interaction_counts_reads_nested_comment_summary_fallback() {
+        let post = json!({
+            "comet_ufi_summary_and_actions_renderer": {
+                "feedback": {
+                    "subscription_target_id": "123",
+                    "comments_count_summary_renderer": {
+                        "feedback": {
+                            "comment_rendering_instance": {
+                                "comments": {"total_count": 17}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let (_, comments, _, _) = interaction_counts_with_reactions(&post, Some("123")).unwrap();
+        assert_eq!(comments, "17");
     }
 
     #[test]
