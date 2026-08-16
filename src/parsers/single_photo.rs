@@ -42,8 +42,9 @@ impl Parser for SinglePhotoParser {
             .get("created_time")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        let interaction_id = focal_interaction_id(&content_node);
         let (likes, cmts, shares, top_reaction_ids) =
-            interaction_counts_with_reactions(&interaction, None)?;
+            interaction_counts_with_reactions(&interaction, interaction_id.as_deref())?;
         let image = get_single_image(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "cannot find single image",
@@ -105,6 +106,18 @@ fn get_interactions_node(blocks: &[Value]) -> Option<Value> {
     None
 }
 
+fn focal_interaction_id(content_node: &Value) -> Option<String> {
+    ["id", "post_id", "photo_id", "story_fbid"]
+        .into_iter()
+        .find_map(|key| content_node.get(key).map(crate::parsers::util::val_str))
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            content_node
+                .get("container_story")
+                .and_then(focal_interaction_id)
+        })
+}
+
 fn get_single_image(blocks: &[Value]) -> Option<String> {
     for bloc in blocks {
         if jq::has(bloc, &["prefetch_uris_v2"]) {
@@ -117,7 +130,7 @@ fn get_single_image(blocks: &[Value]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_content_node, get_single_image, longest_post_text};
+    use super::{focal_interaction_id, get_content_node, get_single_image, longest_post_text};
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node};
     use serde_json::json;
 
@@ -145,6 +158,37 @@ mod tests {
             get_single_image(&blocks).as_deref(),
             Some("https://img.example/single.jpg")
         );
+    }
+
+    #[test]
+    fn focal_photo_id_binds_reactions_away_from_decoy_renderer() {
+        let content = json!({
+            "id": "photo-target",
+            "owner": {"id": "owner-id"},
+            "container_story": {"id": "story-target"}
+        });
+        let interactions = json!({
+            "first": {"comet_ufi_summary_and_actions_renderer":
+                {"feedback": {"subscription_target_id": "photo-decoy", "top_reactions": {"edges": [
+                    {"node": {"id": "angry"}, "reaction_count": 999},
+                    {"node": {"id": "wow"}, "reaction_count": 998}
+                ]}}}},
+            "second": {"comet_ufi_summary_and_actions_renderer":
+                {"feedback": {"subscription_target_id": "photo-target", "top_reactions": {"edges": [
+                    {"node": {"id": "like"}, "reaction_count": 4},
+                    {"node": {"id": "love"}, "reaction_count": 3}
+                ]}}}}
+        });
+
+        let id = focal_interaction_id(&content).unwrap();
+        let (_, _, _, reactions) =
+            crate::parsers::util::interaction_counts_with_reactions(&interactions, Some(&id))
+                .unwrap();
+
+        assert_eq!(id, "photo-target");
+        assert_eq!(reactions.len(), 2);
+        assert_eq!(reactions[0], crate::parsers::ReactionKind::Like);
+        assert_eq!(reactions[1], crate::parsers::ReactionKind::Love);
     }
 
     #[test]

@@ -456,14 +456,14 @@ pub fn interaction_counts_with_reactions(
     post_id: Option<&str>,
 ) -> Result<(String, String, String, Vec<ReactionKind>), FacebedError> {
     let renderers = jq::all(post_json, "comet_ufi_summary_and_actions_renderer");
-    let pf = post_id
-        .and_then(|id| {
-            renderers.iter().copied().find(|renderer| {
-                renderer
-                    .pointer("/feedback/subscription_target_id")
-                    .is_some_and(|value| val_str(value) == id)
-            })
+    let matched = post_id.and_then(|id| {
+        renderers.iter().copied().find(|renderer| {
+            renderer
+                .pointer("/feedback/subscription_target_id")
+                .is_some_and(|value| val_str(value) == id)
         })
+    });
+    let pf = matched
         .or_else(|| renderers.first().copied())
         .ok_or_else(|| FacebedError::parse("missing comet_ufi_summary_and_actions_renderer"))?;
     let fb = pf
@@ -517,7 +517,11 @@ pub fn interaction_counts_with_reactions(
                 .map(human_format)
         })
         .unwrap_or_else(|| "0".into());
-    let top_reactions = top_reactions_from_feedback(fb);
+    let top_reactions = if matched.is_some() {
+        top_reactions_from_feedback(fb)
+    } else {
+        Vec::new()
+    };
     Ok((reactions, comments, shares, top_reactions))
 }
 
