@@ -109,10 +109,113 @@ fn status_json_preserves_long_escaped_text_without_media() {
         .unwrap()
         .contains("&lt;unsafe&gt;&amp;"));
     assert!(json["content"].as_str().unwrap().contains("<br>"));
-    assert!(!json["content"].as_str().unwrap().contains("❤️ 7"));
+    assert!(json["content"].as_str().unwrap().ends_with("❤️ 7 • 🔁 2"));
     assert!(!json["content"].as_str().unwrap().contains("💬"));
-    assert!(!json["content"].as_str().unwrap().contains("🔁 2"));
     assert_eq!(json["media_attachments"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn status_json_appends_full_engagement_for_image_text_content() {
+    // Given
+    let mut post = post(
+        "image text".to_owned(),
+        vec!["https://img.example/post.jpg"],
+    );
+    post.likes = "19".to_owned();
+    post.comments = "2".to_owned();
+    post.shares = "3".to_owned();
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert!(json["content"]
+        .as_str()
+        .unwrap()
+        .ends_with("❤️ 19 • 💬 2 • 🔁 3"));
+}
+
+#[test]
+fn status_json_appends_engagement_for_mixed_image_video_content() {
+    // Given
+    let mut post = post(
+        "mixed media".to_owned(),
+        vec!["https://img.example/post.jpg"],
+    );
+    post.likes = "8".to_owned();
+    post.comments = "1".to_owned();
+    post.shares = "4".to_owned();
+    post.video_links = vec!["https://video.example/post.mp4".to_owned()];
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert!(json["content"]
+        .as_str()
+        .unwrap()
+        .ends_with("❤️ 8 • 💬 1 • 🔁 4"));
+}
+
+#[test]
+fn status_json_omits_engagement_for_video_only_content() {
+    // Given
+    let mut post = post("video only".to_owned(), vec![]);
+    post.likes = "8".to_owned();
+    post.comments = "1".to_owned();
+    post.shares = "4".to_owned();
+    post.video_links = vec!["https://video.example/post.mp4".to_owned()];
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert!(!json["content"]
+        .as_str()
+        .unwrap()
+        .contains("❤️ 8 • 💬 1 • 🔁 4"));
+}
+
+#[test]
+fn status_json_keeps_engagement_after_quoted_content() {
+    // Given
+    let mut post = post(
+        "focal text".to_owned(),
+        vec!["https://img.example/post.jpg"],
+    );
+    post.likes = "19".to_owned();
+    post.comments = "2".to_owned();
+    post.shares = "3".to_owned();
+    post.context = Some(PostContext {
+        author_name: "Original Author".to_owned(),
+        text: "quoted text".to_owned(),
+        url: "https://www.facebook.com/original/posts/456".to_owned(),
+    });
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let content = json["content"].as_str().unwrap();
+
+    // Then
+    assert!(content.ends_with("❤️ 19 • 💬 2 • 🔁 3"));
+    assert!(content.find("quoted text").unwrap() < content.find("❤️ 19").unwrap());
+}
+
+#[test]
+fn status_json_escapes_activity_engagement() {
+    // Given
+    let mut post = post("text".to_owned(), vec!["https://img.example/post.jpg"]);
+    post.likes = "<unsafe>".to_owned();
+    post.shares = "null".to_owned();
+
+    // When
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    // Then
+    assert!(json["content"]
+        .as_str()
+        .unwrap()
+        .ends_with("❤️ &lt;unsafe&gt;"));
 }
 
 #[test]
@@ -168,7 +271,7 @@ fn status_json_links_quoted_post_heading_with_fixupx_spacing() {
     // Then
     assert_eq!(
         content,
-        r#"focal text<br><br><blockquote><a href="https://www.facebook.com/original/posts/456"><strong>Quoting Original Author</strong></a><br><br>original &lt;unsafe&gt;&amp; text</blockquote>"#
+        r#"focal text<br><br><blockquote><a href="https://www.facebook.com/original/posts/456"><strong>Quoting Original Author</strong></a><br><br>original &lt;unsafe&gt;&amp; text</blockquote><br><br>❤️ 7 • 🔁 2"#
     );
 }
 

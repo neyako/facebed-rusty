@@ -180,6 +180,15 @@ fn status_content(post: &crate::parsers::ParsedPost) -> String {
         }
         content.push_str("</blockquote>");
     }
+    if post.video_links.is_empty() || !post.image_links.is_empty() {
+        let engagement = crate::embed::format_engagement(post);
+        if !engagement.is_empty() {
+            if !content.is_empty() {
+                content.push_str("<br><br>");
+            }
+            content.push_str(&encode_text(&engagement));
+        }
+    }
     content
 }
 

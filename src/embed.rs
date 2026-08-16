@@ -293,6 +293,15 @@ fn format_reactions(
     parts.join(" • ").replace(',', ".")
 }
 
+pub(crate) fn format_engagement(post: &ParsedPost) -> String {
+    format_reactions(
+        &post.likes,
+        &post.comments,
+        &post.shares,
+        &post.top_reaction_ids,
+    )
+}
+
 pub fn format_full_post_embed(
     post: &ParsedPost,
     tz_offset: i32,
