@@ -20,6 +20,44 @@ pub struct PostContext {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionKind {
+    Like,
+    Love,
+    Care,
+    Haha,
+    Wow,
+    Sad,
+    Angry,
+}
+
+impl ReactionKind {
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Self::Like => "👍",
+            Self::Love => "❤️",
+            Self::Care => "🤗",
+            Self::Haha => "😂",
+            Self::Wow => "😮",
+            Self::Sad => "😢",
+            Self::Angry => "😡",
+        }
+    }
+
+    pub fn from_id_or_name(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "1635855486666999" | "like" => Some(Self::Like),
+            "1678524932434102" | "love" => Some(Self::Love),
+            "613557422527858" | "care" => Some(Self::Care),
+            "115940658764963" | "haha" => Some(Self::Haha),
+            "478547315650144" | "wow" => Some(Self::Wow),
+            "908563459236466" | "sad" => Some(Self::Sad),
+            "444813342392137" | "angry" => Some(Self::Angry),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedPost {
     pub author_name: String,
@@ -34,6 +72,7 @@ pub struct ParsedPost {
     pub url: String,
     pub date: i64,
     pub likes: String,
+    pub top_reaction_ids: Vec<ReactionKind>,
     pub comments: String,
     pub shares: String,
     pub video_links: Vec<String>,
@@ -80,6 +119,7 @@ pub fn banned_post(url: &str) -> ParsedPost {
         url: url.to_owned(),
         date: -1,
         likes: "null".into(),
+        top_reaction_ids: Vec::new(),
         comments: "null".into(),
         shares: "null".into(),
         video_links: Vec::new(),
@@ -102,8 +142,10 @@ mod tests {
 
         assert!(!swap.load().banned_users.iter().any(|b| b == "100012345"));
 
-        let mut cfg = Config::default();
-        cfg.banned_users = vec!["100012345".to_string()];
+        let cfg = Config {
+            banned_users: vec!["100012345".to_string()],
+            ..Config::default()
+        };
         swap.store(Arc::new(cfg));
 
         assert!(

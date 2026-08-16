@@ -87,6 +87,7 @@ impl Parser for StoriesParser {
             url: permalink,
             date,
             likes: "null".into(),
+            top_reaction_ids: Vec::new(),
             comments: "null".into(),
             shares: "null".into(),
             video_links,

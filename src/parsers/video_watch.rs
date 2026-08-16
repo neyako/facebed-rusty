@@ -3,7 +3,7 @@ use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::util::{
     author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
-    thumbnail_in_node, val_str_at, video_link_in_node,
+    thumbnail_in_node, top_reactions_from_feedback, val_str_at, video_link_in_node,
 };
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
@@ -66,6 +66,8 @@ impl Parser for VideoWatchParser {
             .pointer("/feedback/total_comment_count")
             .cloned()
             .unwrap_or(Value::Null);
+        let top_reaction_ids =
+            top_reactions_from_feedback(content_node.get("feedback").unwrap_or(&Value::Null));
         let date = find_creation_time(&blocks).ok_or_else(|| {
             FacebedError::parse_with("cannot find date", page.html.clone(), page.url.clone())
         })?;
@@ -86,6 +88,7 @@ impl Parser for VideoWatchParser {
             url: post_url,
             date,
             likes: human_format(&likes),
+            top_reaction_ids,
             comments: human_format(&cmts),
             shares: "null".into(),
             video_links: vec![video_link],

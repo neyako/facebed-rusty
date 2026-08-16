@@ -1,7 +1,7 @@
 use crate::error::FacebedError;
 use crate::fetch::profile_handle_from_url;
 use crate::jq;
-use crate::parsers::PostContext;
+use crate::parsers::{PostContext, ReactionKind};
 use serde_json::Value;
 use url::Url;
 
@@ -442,10 +442,19 @@ pub fn extract_link_card(story_json: &Value) -> Option<(String, String)> {
     None
 }
 
+#[allow(dead_code)]
 pub fn interaction_counts(
     post_json: &Value,
     post_id: Option<&str>,
 ) -> Result<(String, String, String), FacebedError> {
+    let (reactions, comments, shares, _) = interaction_counts_with_reactions(post_json, post_id)?;
+    Ok((reactions, comments, shares))
+}
+
+pub fn interaction_counts_with_reactions(
+    post_json: &Value,
+    post_id: Option<&str>,
+) -> Result<(String, String, String, Vec<ReactionKind>), FacebedError> {
     let renderers = jq::all(post_json, "comet_ufi_summary_and_actions_renderer");
     let pf = post_id
         .and_then(|id| {
@@ -484,6 +493,11 @@ pub fn interaction_counts(
             })
         })
         .map(human_format)
+        .or_else(|| {
+            fb.get("share_count")
+                .and_then(|count| count.get("count").or(Some(count)))
+                .map(human_format)
+        })
         .or_else(|| fb.get("i18n_share_count").map(human_format))
         .unwrap_or_else(|| "0".into());
     let comments = adaptive
@@ -495,6 +509,7 @@ pub fn interaction_counts(
             })
         })
         .map(human_format)
+        .or_else(|| fb.get("total_comment_count").map(human_format))
         .or_else(|| {
             fb.get("comment_rendering_instance")
                 .and_then(|comments| comments.get("comments"))
@@ -502,15 +517,84 @@ pub fn interaction_counts(
                 .map(human_format)
         })
         .unwrap_or_else(|| "0".into());
-    Ok((reactions, comments, shares))
+    let top_reactions = top_reactions_from_feedback(fb);
+    Ok((reactions, comments, shares, top_reactions))
+}
+
+pub(crate) fn top_reactions_from_feedback(feedback: &Value) -> Vec<ReactionKind> {
+    let Some(edges) = feedback
+        .get("top_reactions")
+        .and_then(|value| value.get("edges"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut ranked = Vec::new();
+    for (position, edge) in edges.iter().enumerate() {
+        let Some(node) = edge.get("node") else {
+            continue;
+        };
+        let kind = ["id", "localized_name", "name"]
+            .into_iter()
+            .filter_map(|key| node.get(key).map(val_str))
+            .find_map(|value| ReactionKind::from_id_or_name(&value));
+        let Some(kind) = kind else {
+            continue;
+        };
+        if ranked.iter().any(|(_, _, seen)| *seen == kind) {
+            continue;
+        }
+        let count = edge
+            .get("reaction_count")
+            .or_else(|| edge.get("i18n_reaction_count"))
+            .and_then(reaction_number)
+            .filter(|count| *count > 0.0);
+        let Some(count) = count else {
+            continue;
+        };
+        ranked.push((-count, position, kind));
+    }
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    if ranked.len() < 2 {
+        Vec::new()
+    } else {
+        ranked
+            .into_iter()
+            .take(2)
+            .map(|(_, _, kind)| kind)
+            .collect()
+    }
+}
+
+fn reaction_number(value: &Value) -> Option<f64> {
+    let value = value
+        .get("count")
+        .unwrap_or(value)
+        .as_f64()
+        .or_else(|| value.as_str().and_then(parse_reaction_number))?;
+    value.is_finite().then_some(value)
+}
+
+fn parse_reaction_number(value: &str) -> Option<f64> {
+    let text = value.trim().to_ascii_uppercase().replace(',', "");
+    let (digits, multiplier) = match text.chars().last()? {
+        'K' => (&text[..text.len() - 1], 1_000.0),
+        'M' => (&text[..text.len() - 1], 1_000_000.0),
+        'B' => (&text[..text.len() - 1], 1_000_000_000.0),
+        _ => (text.as_str(), 1.0),
+    };
+    digits.parse::<f64>().ok().map(|number| number * multiplier)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
-        images_from_post, interaction_counts, Story,
+        images_from_post, interaction_counts, interaction_counts_with_reactions,
+        top_reactions_from_feedback, Story,
     };
+    use crate::parsers::ReactionKind;
     use serde_json::json;
 
     #[test]
@@ -543,6 +627,48 @@ mod tests {
 
         // Then
         assert_eq!(counts.0, "1.294");
+    }
+
+    #[test]
+    fn interaction_counts_uses_selected_feedback_and_ranks_two_reactions() {
+        let post = json!({
+            "comet_ufi_summary_and_actions_renderer": {
+                "feedback": {
+                    "subscription_target_id": "123",
+                    "reaction_count": {"count": 42},
+                    "top_reactions": {"edges": [
+                        {"node": {"id": "like"}, "reaction_count": 7},
+                        {"node": {"localized_name": "Love"}, "reaction_count": 9},
+                        {"node": {"id": "wow"}, "reaction_count": 9}
+                    ]},
+                    "total_comment_count": 2,
+                    "share_count": {"count": 3}
+                }
+            },
+            "decoy": {"top_reactions": {"edges": [
+                {"node": {"id": "angry"}, "reaction_count": 100}
+            ]}}
+        });
+
+        let (likes, comments, shares, reactions) =
+            interaction_counts_with_reactions(&post, Some("123")).unwrap();
+
+        assert_eq!(
+            (likes, comments, shares),
+            ("42".into(), "2".into(), "3".into())
+        );
+        assert_eq!(reactions, vec![ReactionKind::Love, ReactionKind::Wow]);
+    }
+
+    #[test]
+    fn top_reactions_falls_back_when_unknown_or_single_reaction() {
+        let feedback = json!({"top_reactions": {"edges": [
+            {"node": {"id": "unknown"}, "reaction_count": 99},
+            {"node": {"id": "like"}, "reaction_count": 1}
+        ]}});
+
+        assert!(top_reactions_from_feedback(&feedback).is_empty());
+        assert!(top_reactions_from_feedback(&json!({})).is_empty());
     }
 
     #[test]

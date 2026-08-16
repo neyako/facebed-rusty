@@ -1,4 +1,4 @@
-use crate::parsers::ParsedPost;
+use crate::parsers::{ParsedPost, ReactionKind};
 use chrono::{FixedOffset, TimeZone};
 use html_escape::encode_quoted_attribute;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -247,10 +247,24 @@ fn format_timestamp(ts: i64, tz_offset: i32) -> String {
     )
 }
 
-fn format_reactions(likes: &str, cmts: &str, shares: &str) -> String {
+fn format_reactions(
+    likes: &str,
+    cmts: &str,
+    shares: &str,
+    top_reactions: &[ReactionKind],
+) -> String {
     let mut parts = Vec::new();
     if likes != "null" {
-        parts.push(format!("❤️ {}", likes));
+        let prefix = if top_reactions.len() == 2 {
+            top_reactions
+                .iter()
+                .map(|reaction| reaction.emoji())
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            "❤️".to_owned()
+        };
+        parts.push(format!("{prefix} {likes}"));
     }
     if cmts != "null" {
         parts.push(format!("💬 {}", cmts));
@@ -267,13 +281,11 @@ pub fn format_full_post_embed(
     activity_origin: Option<&str>,
 ) -> String {
     let mut images = post.image_links.clone();
-    let mut extra = String::new();
-    if images.len() > 4 {
-        extra.push_str("\ncontains 4+ images");
-    }
-    if !post.video_links.is_empty() {
-        extra.push_str("\n🎥 also contains video");
-    }
+    let extra = if images.len() + post.video_links.len() > 4 {
+        "contains 4+ media"
+    } else {
+        ""
+    };
     images.truncate(4);
     let image_meta = images
         .iter()
@@ -290,8 +302,13 @@ pub fn format_full_post_embed(
     } else {
         format_timestamp(post.date, tz_offset)
     };
-    let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
-    let site_name = [CREDIT, &post_date, &reactions]
+    let reactions = format_reactions(
+        &post.likes,
+        &post.comments,
+        &post.shares,
+        &post.top_reaction_ids,
+    );
+    let site_name = [CREDIT, extra, &post_date]
         .into_iter()
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
@@ -305,11 +322,14 @@ pub fn format_full_post_embed(
         "video"
     };
     let author = author_label(post);
-    let oembed = oembed_link_tag(&author, &post.url, kind);
+    let oembed = oembed_link_tag(&reactions, &post.url, kind);
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
-    let description = format_post_description(post);
+    let mut description = format_post_description(post);
+    if !post.video_links.is_empty() {
+        description.push_str("\n\n🎥 also contains video");
+    }
 
     format!(
         r##"<!DOCTYPE html>
@@ -319,7 +339,7 @@ pub fn format_full_post_embed(
     <meta charset="UTF-8"/>
     <meta property="og:title" content="{title}"/>
     <meta property="og:description" content="{desc}"/>
-    <meta property="og:site_name" content="{site_name}{extra}"/>
+        <meta property="og:site_name" content="{site_name}"/>
     <meta property="og:url" content="{url_q}"/>
     {image_meta}
     <link rel="canonical" href="{url_q}"/>
@@ -334,7 +354,6 @@ pub fn format_full_post_embed(
         site_name = site_name,
         title = escape_attr(&author),
         desc = escape_attr(truncate_chars(&description, 4096)),
-        extra = extra,
         url_q = url_q,
         image_meta = image_meta,
         oembed = oembed,
@@ -366,10 +385,15 @@ pub fn format_reel_post_embed(
     } else {
         format_timestamp(post.date, tz_offset)
     };
-    let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
+    let reactions = format_reactions(
+        &post.likes,
+        &post.comments,
+        &post.shares,
+        &post.top_reaction_ids,
+    );
     let url_q = quote(&post.url);
     let author = author_label(post);
-    let oembed = oembed_link_tag(&author, &post.url, "video");
+    let oembed = oembed_link_tag(&reactions, &post.url, "video");
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
@@ -384,8 +408,7 @@ pub fn format_reel_post_embed(
     <meta property="og:title" content="{title}"/>
     <meta property="og:description" content="{desc}"/>
     <meta property="og:site_name" content="{credit}
-{post_date}
-{reactions}"/>
+{post_date}"/>
     <meta property="og:url" content="{url_q}"/>
     <meta property="og:video:type" content="video/mp4"/>
     <meta property="twitter:player:stream:content_type" content="video/mp4"/>
@@ -404,7 +427,6 @@ pub fn format_reel_post_embed(
         title = escape_attr(&author),
         desc = escape_attr(truncate_chars(&description, 4096)),
         post_date = post_date,
-        reactions = reactions,
         url_q = url_q,
         video_meta = video_meta,
         oembed = oembed,
@@ -427,10 +449,17 @@ pub fn format_oversized_video_embed(
     } else {
         format_timestamp(post.date, tz_offset)
     };
-    let reactions = format_reactions(&post.likes, &post.comments, &post.shares);
+    let reactions = format_reactions(
+        &post.likes,
+        &post.comments,
+        &post.shares,
+        &post.top_reaction_ids,
+    );
     let url_q = quote(&post.url);
     let author = author_label(post);
-    let description = format_post_description(post);
+    let oembed = oembed_link_tag(&reactions, &post.url, "video");
+    let mut description = format_post_description(post);
+    description.push_str("\n\n🎥 video too big to embed — click to watch on Facebook");
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
@@ -451,12 +480,11 @@ pub fn format_oversized_video_embed(
     <meta property="og:title" content="{title}"/>
     <meta property="og:description" content="{desc}"/>
     <meta property="og:site_name" content="{credit}
-{post_date}
-{reactions}
-🎥 video too big to embed — click to watch on Facebook"/>
+{post_date}"/>
     <meta property="og:url" content="{url_q}"/>
     {image_meta}
     <link rel="canonical" href="{url_q}"/>
+    {oembed}
     {activity}
     <meta http-equiv="refresh" content="0;url={url_q}"/>
     <meta name="twitter:card" content="summary_large_image"/>
@@ -467,9 +495,9 @@ pub fn format_oversized_video_embed(
         title = escape_attr(&author),
         desc = escape_attr(truncate_chars(&description, 4096)),
         post_date = post_date,
-        reactions = reactions,
         url_q = url_q,
         image_meta = image_meta,
+        oembed = oembed,
         activity = activity,
     )
 }
@@ -551,7 +579,7 @@ mod tests {
         format_description_text, format_full_post_embed, format_oversized_video_embed,
         format_reel_post_embed,
     };
-    use crate::parsers::{ParsedPost, PostContext};
+    use crate::parsers::{ParsedPost, PostContext, ReactionKind};
 
     fn sample_post() -> ParsedPost {
         ParsedPost {
@@ -566,6 +594,7 @@ mod tests {
             url: "https://www.facebook.com/x".into(),
             date: -1,
             likes: "null".into(),
+            top_reaction_ids: Vec::new(),
             comments: "null".into(),
             shares: "null".into(),
             video_links: Vec::new(),
@@ -661,7 +690,53 @@ mod tests {
     }
 
     #[test]
-    fn embeds_advertise_bare_author_identity_in_og_and_oembed() {
+    fn engagement_renders_in_oembed_author_not_footer() {
+        let mut post = sample_post();
+        post.likes = "19".into();
+        post.comments = "2".into();
+        post.shares = "3".into();
+
+        let html = format_full_post_embed(&post, 0, None);
+
+        assert!(html.contains("author=%E2%9D%A4%EF%B8%8F%2019%20%E2%80%A2%20%F0%9F%92%AC%202%20%E2%80%A2%20%F0%9F%94%81%203"));
+        assert!(!html.contains("<meta property=\"og:site_name\" content=\"facebed on Rust\n⌚"));
+    }
+
+    #[test]
+    fn footer_orders_credit_media_and_date_without_engagement() {
+        let mut post = sample_post();
+        post.date = 1_704_067_200;
+        post.likes = "19".into();
+        post.image_links = (0..5)
+            .map(|n| format!("https://img.example/{n}.jpg"))
+            .collect();
+
+        let html = format_full_post_embed(&post, 7, None);
+        let site_name = html.split("og:site_name\" content=\"").nth(1).unwrap();
+        assert!(
+            site_name.find("facebed on Rust").unwrap()
+                < site_name.find("contains 4+ media").unwrap()
+        );
+        assert!(site_name.find("contains 4+ media").unwrap() < site_name.find("⌚").unwrap());
+        assert!(!site_name.contains("❤️ 19"));
+        assert!(!site_name.contains("contains 4+ images"));
+    }
+
+    #[test]
+    fn two_positive_reactions_use_count_order_and_single_falls_back_to_heart() {
+        let mut post = sample_post();
+        post.likes = "10".into();
+        post.top_reaction_ids = vec![ReactionKind::Like, ReactionKind::Love];
+        let html = format_full_post_embed(&post, 0, None);
+        assert!(html.contains("author=%F0%9F%91%8D%20%E2%9D%A4%EF%B8%8F%2010"));
+
+        post.top_reaction_ids = vec![ReactionKind::Love];
+        let html = format_full_post_embed(&post, 0, None);
+        assert!(html.contains("author=%E2%9D%A4%EF%B8%8F%2010"));
+    }
+
+    #[test]
+    fn embeds_keep_author_identity_in_og_title() {
         // Given
         let mut post = sample_post();
         post.author_name = "Example Author".into();
@@ -676,7 +751,7 @@ mod tests {
             assert!(html.contains(
                 r#"<meta property="og:title" content="Example Author (@example.author)"/>"#
             ));
-            assert!(html.contains("author=Example%20Author%20%28%40example%2Eauthor%29"));
+            assert!(html.contains("author="));
             assert!(html.contains("/users/example.author/statuses/"));
         }
     }
@@ -709,7 +784,8 @@ mod tests {
 
         // Then
         assert!(!html.contains("⌚ 2024/01/01 07:00:00 UTC+7"));
-        assert!(html.contains("❤️ 19 • 💬 77 • 🔁 0"));
+        assert!(html.contains("author=%E2%9D%A4%EF%B8%8F%2019%20%E2%80%A2%20%F0%9F%92%AC%2077%20%E2%80%A2%20%F0%9F%94%81%200"));
+        assert!(!html.contains("❤️ 19 • 💬 77 • 🔁 0"));
     }
 
     #[test]
@@ -721,7 +797,7 @@ mod tests {
 
         let html = format_full_post_embed(&post, 0, None);
 
-        assert!(html.contains("❤️ 1.294 • 💬 236 • 🔁 0"));
+        assert!(html.contains("author=%E2%9D%A4%EF%B8%8F%201%2E294%20%E2%80%A2%20%F0%9F%92%AC%20236%20%E2%80%A2%20%F0%9F%94%81%200"));
         assert!(!html.contains("1.294K"));
     }
 
@@ -803,7 +879,8 @@ mod tests {
 
         for html in [reel, oversized] {
             assert!(!html.contains("⌚ 2024/01/01 07:00:00 UTC+7"));
-            assert!(html.contains("❤️ 19 • 💬 77 • 🔁 3"));
+            assert!(html.contains("author=%E2%9D%A4%EF%B8%8F%2019%20%E2%80%A2%20%F0%9F%92%AC%2077%20%E2%80%A2%20%F0%9F%94%81%203"));
+            assert!(!html.contains("❤️ 19 • 💬 77 • 🔁 3"));
         }
     }
 
@@ -818,5 +895,9 @@ mod tests {
 
         assert!(html.contains(r#"type="application/activity+json""#));
         assert!(html.contains("https://facebed.example/users/facebed/statuses/"));
+        assert!(html.contains("/oembed.json?author="));
+        assert!(html.contains("video too big to embed"));
+        let site_name = html.split("og:site_name\" content=\"").nth(1).unwrap();
+        assert!(!site_name.contains("video too big to embed"));
     }
 }

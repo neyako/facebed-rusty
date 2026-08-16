@@ -16,6 +16,7 @@ fn post(text: String, image_links: Vec<&str>) -> ParsedPost {
         url: "https://www.facebook.com/groups/example/posts/123".to_owned(),
         date: 1_704_067_200,
         likes: "7".to_owned(),
+        top_reaction_ids: Vec::new(),
         comments: "null".to_owned(),
         shares: "2".to_owned(),
         video_links: Vec::new(),

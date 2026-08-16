@@ -99,6 +99,7 @@ impl Parser for ReelsParser {
             url: post_url,
             date,
             likes,
+            top_reaction_ids: Vec::new(),
             comments: cmts,
             shares,
             video_links: vec![video_link],

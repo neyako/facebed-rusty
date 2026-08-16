@@ -2,7 +2,8 @@ use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::util::{
-    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format, val_str_at,
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
+    top_reactions_from_feedback, val_str_at,
 };
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
@@ -59,6 +60,9 @@ impl Parser for PhotocomParser {
                 page.url.clone(),
             )
         })?;
+        let top_reaction_ids = get_reaction_feedback(&blocks)
+            .map(top_reactions_from_feedback)
+            .unwrap_or_default();
 
         Ok(ParsedPost {
             author_name: format!("{} (💬)", owner_name),
@@ -72,6 +76,7 @@ impl Parser for PhotocomParser {
             url,
             date,
             likes: human_format(&reactions_count.into()),
+            top_reaction_ids,
             comments: "null".into(),
             shares: "null".into(),
             video_links: Vec::new(),
@@ -96,6 +101,17 @@ fn get_reaction_count(blocks: &[Value]) -> Option<i64> {
         }
     }
     None
+}
+
+fn get_reaction_feedback(blocks: &[Value]) -> Option<&Value> {
+    blocks.iter().find_map(|bloc| {
+        if !jq::has(bloc, &["attached_comment", "unified_reactors"]) {
+            return None;
+        }
+        jq::first(bloc, "currMedia")
+            .and_then(|media| media.get("attached_comment"))
+            .and_then(|comment| comment.get("feedback"))
+    })
 }
 
 fn get_attached_image_and_url(blocks: &[Value]) -> Option<(String, String)> {

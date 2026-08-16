@@ -27,9 +27,7 @@ impl EmbedCache {
     /// Return a cached body for `key` if present and not expired. Expired
     /// entries are removed on access.
     pub fn get(&mut self, key: &str, now: Instant) -> Option<String> {
-        let Some(entry) = self.entries.get(key) else {
-            return None;
-        };
+        let entry = self.entries.get(key)?;
         if now.duration_since(entry.stored_at) <= EMBED_CACHE_TTL {
             return Some(entry.body.clone());
         }
@@ -106,6 +104,7 @@ mod tests {
             url: "https://www.facebook.com/groups/example/posts/123".into(),
             date: 0,
             likes: "null".into(),
+            top_reaction_ids: Vec::new(),
             comments: "null".into(),
             shares: "null".into(),
             video_links: Vec::new(),

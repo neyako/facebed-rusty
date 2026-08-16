@@ -1,7 +1,7 @@
 use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::{get_json_block_texts, FetchedPage, JsonBlockText};
 use crate::jq;
-use crate::parsers::util::{interaction_counts, Story};
+use crate::parsers::util::{interaction_counts_with_reactions, Story};
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::{self, ensure_absolute};
 use once_cell::sync::Lazy;
@@ -84,7 +84,7 @@ fn parse_page(
     let root = get_root_node(&post_json).ok_or_else(|| {
         FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
     })?;
-    let (likes, cmts, shares) = interaction_counts(root, post_id)?;
+    let (likes, cmts, shares, top_reaction_ids) = interaction_counts_with_reactions(root, post_id)?;
 
     let post_date = root
         .pointer("/context_layout/story/comet_sections/metadata")
@@ -137,6 +137,7 @@ fn parse_page(
             url: post_url,
             date: post_date,
             likes,
+            top_reaction_ids,
             comments: cmts,
             shares,
             video_links: story.video_links,

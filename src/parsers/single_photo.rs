@@ -2,7 +2,8 @@ use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::util::{
-    author_avatar_in_node, author_handle_in_node, author_id_in_node, interaction_counts, val_str_at,
+    author_avatar_in_node, author_handle_in_node, author_id_in_node,
+    interaction_counts_with_reactions, val_str_at,
 };
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
@@ -41,7 +42,8 @@ impl Parser for SinglePhotoParser {
             .get("created_time")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        let (likes, cmts, shares) = interaction_counts(&interaction, None)?;
+        let (likes, cmts, shares, top_reaction_ids) =
+            interaction_counts_with_reactions(&interaction, None)?;
         let image = get_single_image(&blocks).ok_or_else(|| {
             FacebedError::parse_with(
                 "cannot find single image",
@@ -62,6 +64,7 @@ impl Parser for SinglePhotoParser {
             url: ensure_absolute(post_path),
             date,
             likes,
+            top_reaction_ids,
             comments: cmts,
             shares,
             video_links: Vec::new(),

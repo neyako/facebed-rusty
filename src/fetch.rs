@@ -109,9 +109,7 @@ struct CachedContentLength {
 
 impl MediaSizeCache {
     fn get(&mut self, url: &str, now: Instant) -> Option<Option<u64>> {
-        let Some(entry) = self.entries.get(url).copied() else {
-            return None;
-        };
+        let entry = self.entries.get(url).copied()?;
         if now.duration_since(entry.checked_at) <= VIDEO_HEAD_CACHE_TTL {
             return Some(entry.value);
         }

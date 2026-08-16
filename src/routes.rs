@@ -1402,6 +1402,7 @@ mod tests {
             url: "https://www.facebook.com/groups/example/posts/123".into(),
             date: 0,
             likes: "null".into(),
+            top_reaction_ids: Vec::new(),
             comments: "null".into(),
             shares: "null".into(),
             video_links: Vec::new(),

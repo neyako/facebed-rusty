@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let config = match &args.config {
-        Some(p) => Config::load(&p)?,
+        Some(p) => Config::load(p)?,
         None => {
             warn!("no config provided; using defaults");
             Config::default()
