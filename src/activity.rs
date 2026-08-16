@@ -186,7 +186,9 @@ fn status_content(post: &crate::parsers::ParsedPost) -> String {
             if !content.is_empty() {
                 content.push_str("<br><br>");
             }
+            content.push_str("<strong>");
             content.push_str(&encode_text(&engagement));
+            content.push_str("</strong>");
         }
     }
     content

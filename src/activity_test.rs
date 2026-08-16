@@ -1,5 +1,5 @@
 use super::{alternate_link, decode_status_path, status_id, status_json};
-use crate::parsers::{ParsedPost, PostContext};
+use crate::parsers::{ParsedPost, PostContext, ReactionKind};
 use serde_json::{json, Value};
 use url::Url;
 
@@ -109,7 +109,10 @@ fn status_json_preserves_long_escaped_text_without_media() {
         .unwrap()
         .contains("&lt;unsafe&gt;&amp;"));
     assert!(json["content"].as_str().unwrap().contains("<br>"));
-    assert!(json["content"].as_str().unwrap().ends_with("❤️ 7 • 🔁 2"));
+    assert!(json["content"]
+        .as_str()
+        .unwrap()
+        .ends_with("<strong>❤️ 7 • 🔁 2</strong>"));
     assert!(!json["content"].as_str().unwrap().contains("💬"));
     assert_eq!(json["media_attachments"].as_array().unwrap().len(), 0);
 }
@@ -121,9 +124,10 @@ fn status_json_appends_full_engagement_for_image_text_content() {
         "image text".to_owned(),
         vec!["https://img.example/post.jpg"],
     );
-    post.likes = "19".to_owned();
-    post.comments = "2".to_owned();
-    post.shares = "3".to_owned();
+    post.likes = "83".to_owned();
+    post.comments = "109".to_owned();
+    post.shares = "0".to_owned();
+    post.top_reaction_ids = vec![ReactionKind::Haha, ReactionKind::Like];
 
     // When
     let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
@@ -132,7 +136,7 @@ fn status_json_appends_full_engagement_for_image_text_content() {
     assert!(json["content"]
         .as_str()
         .unwrap()
-        .ends_with("❤️ 19 • 💬 2 • 🔁 3"));
+        .ends_with("<strong>😂 👍 83 • 💬 109 • 🔁 0</strong>"));
 }
 
 #[test]
@@ -154,7 +158,7 @@ fn status_json_appends_engagement_for_mixed_image_video_content() {
     assert!(json["content"]
         .as_str()
         .unwrap()
-        .ends_with("❤️ 8 • 💬 1 • 🔁 4"));
+        .ends_with("<strong>❤️ 8 • 💬 1 • 🔁 4</strong>"));
 }
 
 #[test]
@@ -197,8 +201,10 @@ fn status_json_keeps_engagement_after_quoted_content() {
     let content = json["content"].as_str().unwrap();
 
     // Then
-    assert!(content.ends_with("❤️ 19 • 💬 2 • 🔁 3"));
-    assert!(content.find("quoted text").unwrap() < content.find("❤️ 19").unwrap());
+    assert_eq!(
+        content,
+        r#"focal text<br><br><blockquote><a href="https://www.facebook.com/original/posts/456"><strong>Quoting Original Author</strong></a><br><br>quoted text</blockquote><br><br><strong>❤️ 19 • 💬 2 • 🔁 3</strong>"#
+    );
 }
 
 #[test]
@@ -215,7 +221,7 @@ fn status_json_escapes_activity_engagement() {
     assert!(json["content"]
         .as_str()
         .unwrap()
-        .ends_with("❤️ &lt;unsafe&gt;"));
+        .ends_with("<strong>❤️ &lt;unsafe&gt;</strong>"));
 }
 
 #[test]
@@ -251,7 +257,7 @@ fn status_json_keeps_non_group_markdown_literal() {
     // Then
     assert!(content.contains("&gt; quote<br># **Heading**"));
     assert!(!content.contains("<blockquote>"));
-    assert!(!content.contains("<strong>"));
+    assert!(!content.contains("<strong>Heading</strong>"));
 }
 
 #[test]
@@ -271,7 +277,7 @@ fn status_json_links_quoted_post_heading_with_fixupx_spacing() {
     // Then
     assert_eq!(
         content,
-        r#"focal text<br><br><blockquote><a href="https://www.facebook.com/original/posts/456"><strong>Quoting Original Author</strong></a><br><br>original &lt;unsafe&gt;&amp; text</blockquote><br><br>❤️ 7 • 🔁 2"#
+        r#"focal text<br><br><blockquote><a href="https://www.facebook.com/original/posts/456"><strong>Quoting Original Author</strong></a><br><br>original &lt;unsafe&gt;&amp; text</blockquote><br><br><strong>❤️ 7 • 🔁 2</strong>"#
     );
 }
 
