@@ -43,11 +43,19 @@ fn author_label(post: &ParsedPost) -> Cow<'_, str> {
     )
 }
 
-/// Relative oEmbed link the embed advertises to Discord. Discord resolves this
-/// href against the page URL and reads `author_name`/`provider_name`.
-fn oembed_link_tag(engagement: &str, title: &str, url: &str, kind: &str) -> String {
+/// oEmbed link the embed advertises to Discord. Discord reads
+/// `author_name`/`provider_name` from the linked document.
+fn oembed_link_tag(
+    engagement: &str,
+    title: &str,
+    url: &str,
+    kind: &str,
+    origin: Option<&str>,
+) -> String {
+    let base = origin.unwrap_or_default();
     format!(
-        r#"<link rel="alternate" type="application/json+oembed" href="/oembed.json?author={a}&amp;title={t}&amp;url={u}&amp;type={kind}"/>"#,
+        r#"<link rel="alternate" type="application/json+oembed" href="{base}/oembed.json?author={a}&amp;title={t}&amp;url={u}&amp;type={kind}"/>"#,
+        base = base,
         a = enc_query(engagement),
         t = enc_query(title),
         u = enc_query(url),
@@ -332,7 +340,7 @@ pub fn format_full_post_embed(
         "video"
     };
     let author = author_label(post);
-    let oembed = oembed_link_tag(&reactions, &author, &post.url, kind);
+    let oembed = oembed_link_tag(&reactions, &author, &post.url, kind, activity_origin);
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
@@ -413,7 +421,7 @@ pub fn format_reel_post_embed(
         .join("\n");
     let url_q = quote(&post.url);
     let author = author_label(post);
-    let oembed = oembed_link_tag(&reactions, &author, &post.url, "video");
+    let oembed = oembed_link_tag(&reactions, &author, &post.url, "video", activity_origin);
     let activity = activity_origin.map_or_else(String::new, |origin| {
         crate::activity::alternate_link(post, origin)
     });
@@ -486,7 +494,7 @@ pub fn format_oversized_video_embed(
         .join("\n");
     let url_q = quote(&post.url);
     let author = author_label(post);
-    let oembed = oembed_link_tag(&reactions, &author, &post.url, "video");
+    let oembed = oembed_link_tag(&reactions, &author, &post.url, "video", activity_origin);
     let description = truncate_with_suffix(
         &format_post_description(post),
         "\n\n🎥 video too big to embed — click to watch on Facebook",
@@ -718,6 +726,46 @@ mod tests {
         assert!(html.contains(&format!(r#"type="{mime}""#)));
         assert!(html.contains("/oembed.json?author="));
         assert!(html.contains("&amp;type=link"));
+    }
+
+    #[test]
+    fn activity_embeds_advertise_absolute_oembed_discovery() {
+        let mut post = sample_post();
+        post.likes = "19".into();
+        post.comments = "2".into();
+        post.shares = "3".into();
+        post.video_links = vec!["https://video.example/v.mp4".into()];
+        post.thumbnail = Some("https://img.example/video.jpg".into());
+
+        let full = format_full_post_embed(&post, 0, Some("https://facebed.example"));
+        let reel = format_reel_post_embed(&post, 0, Some("https://facebed.example"));
+        let oversized = format_oversized_video_embed(&post, 0, Some("https://facebed.example"));
+        let expected_author =
+            "author=%E2%9D%A4%EF%B8%8F%2019%20%E2%80%A2%20%F0%9F%92%AC%202%20%E2%80%A2%20%F0%9F%94%81%203";
+        let expected_title = "title=Title%20%22quote%22";
+
+        for html in [full, reel, oversized] {
+            let href = html
+                .split(r#"type="application/json+oembed" href=""#)
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            assert!(href.starts_with("https://facebed.example/oembed.json?"));
+            assert!(href.contains(expected_author));
+            assert!(href.contains(expected_title));
+        }
+
+        let fallback = format_full_post_embed(&post, 0, None);
+        let href = fallback
+            .split(r#"type="application/json+oembed" href=""#)
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(href.starts_with("/oembed.json?"));
     }
 
     #[test]
