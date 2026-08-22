@@ -44,7 +44,8 @@ fn author_label(post: &ParsedPost) -> Cow<'_, str> {
 }
 
 /// oEmbed link the embed advertises to Discord. Discord reads
-/// `author_name`/`provider_name` from the linked document.
+/// `author_name`/`provider_name` from the linked document. Its presence does
+/// not stop Discord from selecting the Activity renderer.
 fn oembed_link_tag(
     engagement: &str,
     title: &str,
@@ -961,7 +962,8 @@ mod tests {
     fn full_embed_omits_activity_status_when_disabled() {
         let html = format_full_post_embed(&sample_post(), 0, None);
 
-        assert!(!html.contains("/users/facebed/statuses/"));
+        assert!(!html.contains("/users/"));
+        assert!(!html.contains("application/activity+json"));
         assert!(!html.contains(r#"type="application/activity+json""#));
     }
 

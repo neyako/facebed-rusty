@@ -52,17 +52,20 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
     let Some(id) = status_id(&post.url) else {
         return String::new();
     };
-    let username = post
-        .author_handle
-        .as_deref()
-        .or(post.author_id.as_deref())
-        .unwrap_or("facebed");
     let Ok(mut status_url) = Url::parse(&origin.origin().ascii_serialization()) else {
         return String::new();
     };
     let Ok(mut segments) = status_url.path_segments_mut() else {
         return String::new();
     };
+    // Discord selects its Activity renderer only for the canonical Mastodon
+    // status shape /users/<acct>/statuses/<id>; the REST shape
+    // /api/v1/statuses/<id> is fetched but never selected.
+    let username = post
+        .author_handle
+        .as_deref()
+        .or(post.author_id.as_deref())
+        .unwrap_or("facebed");
     segments
         .push("users")
         .push(username)
@@ -229,12 +232,24 @@ fn render_activity_markdown_line(output: &mut String, line: &str) {
         return;
     }
 
+    // Facebook renders `* item` lines in group posts as bullet points.
+    // A leading `* ` is a bullet, not a bold marker (`**` is handled inline).
+    if rest == "*" || rest.starts_with("* ") {
+        output.push_str("• ");
+        render_activity_inline(output, rest.strip_prefix("* ").unwrap_or(""));
+        return;
+    }
+
     render_activity_inline(output, rest);
 }
 
 fn render_activity_inline(output: &mut String, text: &str) {
+    // Facebook text-delighter markers: `**bold**` and `` `code` ``. Markers of
+    // each kind pair up first-with-second, third-with-fourth; unmatched
+    // trailing markers and escaped ones stay literal.
     let characters = text.chars().collect::<Vec<_>>();
-    let mut markers = Vec::new();
+    let mut bold_markers = Vec::new();
+    let mut code_markers = Vec::new();
     let mut index = 0;
     while index < characters.len() {
         if characters[index] == '\\' {
@@ -246,27 +261,21 @@ fn render_activity_inline(output: &mut String, text: &str) {
                 .get(index + 1)
                 .is_some_and(|character| *character == '*')
         {
-            markers.push(index);
+            bold_markers.push(index);
             index += 2;
+            continue;
+        }
+        if characters[index] == '`' {
+            code_markers.push(index);
+            index += 1;
             continue;
         }
         index += 1;
     }
 
-    let paired_markers = markers.len() - (markers.len() % 2);
-    let opens = markers
-        .iter()
-        .take(paired_markers)
-        .step_by(2)
-        .copied()
-        .collect::<Vec<_>>();
-    let closes = markers
-        .iter()
-        .take(paired_markers)
-        .skip(1)
-        .step_by(2)
-        .copied()
-        .collect::<Vec<_>>();
+    let (bold_opens, bold_closes) = pair_activity_markers(&bold_markers);
+    let (code_opens, code_closes) = pair_activity_markers(&code_markers);
+
     let mut plain = String::new();
     let mut index = 0;
     while index < characters.len() {
@@ -280,22 +289,52 @@ fn render_activity_inline(output: &mut String, text: &str) {
             }
             continue;
         }
-        if opens.binary_search(&index).is_ok() {
+        if bold_opens.binary_search(&index).is_ok() {
             flush_activity_text(output, &mut plain);
             output.push_str("<strong>");
             index += 2;
             continue;
         }
-        if closes.binary_search(&index).is_ok() {
+        if bold_closes.binary_search(&index).is_ok() {
             flush_activity_text(output, &mut plain);
             output.push_str("</strong>");
             index += 2;
+            continue;
+        }
+        if code_opens.binary_search(&index).is_ok() {
+            flush_activity_text(output, &mut plain);
+            output.push_str("<code>");
+            index += 1;
+            continue;
+        }
+        if code_closes.binary_search(&index).is_ok() {
+            flush_activity_text(output, &mut plain);
+            output.push_str("</code>");
+            index += 1;
             continue;
         }
         plain.push(characters[index]);
         index += 1;
     }
     flush_activity_text(output, &mut plain);
+}
+
+fn pair_activity_markers(markers: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let paired = markers.len() - (markers.len() % 2);
+    let opens = markers
+        .iter()
+        .take(paired)
+        .step_by(2)
+        .copied()
+        .collect::<Vec<_>>();
+    let closes = markers
+        .iter()
+        .take(paired)
+        .skip(1)
+        .step_by(2)
+        .copied()
+        .collect::<Vec<_>>();
+    (opens, closes)
 }
 
 fn flush_activity_text(output: &mut String, plain: &mut String) {
