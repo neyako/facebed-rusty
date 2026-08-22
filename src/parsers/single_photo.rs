@@ -2,7 +2,7 @@ use crate::error::{FacebedError, FacebedResult};
 use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::util::{
-    author_avatar_in_node, author_handle_in_node, author_id_in_node,
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, b64_decode_ascii,
     interaction_counts_with_reaction_ids, val_str_at,
 };
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
@@ -130,7 +130,19 @@ fn focal_interaction_ids(content_node: &Value) -> Vec<String> {
             }
         }
     }
+    if let Some(id) = creation_story_post_id(content_node) {
+        if !ids.iter().any(|candidate| candidate == &id) {
+            ids.push(id);
+        }
+    }
     ids
+}
+
+fn creation_story_post_id(content_node: &Value) -> Option<String> {
+    let encoded = content_node.pointer("/creation_story/id")?.as_str()?;
+    let decoded = b64_decode_ascii(encoded)?;
+    let id = decoded.strip_prefix("S:_I")?.rsplit(':').next()?;
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_digit())).then(|| id.to_owned())
 }
 
 fn get_single_image(blocks: &[Value]) -> Option<String> {
@@ -206,6 +218,38 @@ mod tests {
         assert_eq!(reactions.len(), 2);
         assert_eq!(reactions[0], crate::parsers::ReactionKind::Like);
         assert_eq!(reactions[1], crate::parsers::ReactionKind::Love);
+    }
+
+    #[test]
+    fn creation_story_id_binds_parent_post_reactions() {
+        let content = json!({
+            "id": "photo-target",
+            "creation_story": {"id": "UzpfSTEyMzQ6NTY3ODo1Njc4"}
+        });
+        let interactions = json!({
+            "comet_ufi_summary_and_actions_renderer": {
+                "feedback": {
+                    "subscription_target_id": "5678",
+                    "reaction_count": {"count": 8},
+                    "comments_count_summary_renderer": {"feedback": {"comment_rendering_instance": {
+                        "comments": {"total_count": 3}
+                    }}},
+                    "share_count": {"count": 2}
+                }
+            }
+        });
+
+        let ids = focal_interaction_ids(&content);
+        let (likes, comments, shares, _) =
+            crate::parsers::util::interaction_counts_with_reaction_ids(
+                &interactions,
+                &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .expect("creation story parent must bind the focal renderer");
+
+        assert_eq!(likes, "8");
+        assert_eq!(comments, "3");
+        assert_eq!(shares, "2");
     }
 
     #[test]

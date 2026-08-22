@@ -352,6 +352,8 @@ static RE_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?videos/(?:[^/]+/)?(
 // as /watch?v=<id>, so route to VideoWatchParser.
 static RE_PAGE_VIDEO: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/videos/(?:[^/]+/)?\d+").unwrap());
+static RE_SLUGGED_PHOTO: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/photos/[^/?]+/(\d+)/?(?:\?.*)?$").unwrap());
 static RE_PHOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
 static RE_WATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*watch").unwrap());
 static RE_SHARE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
@@ -497,6 +499,9 @@ async fn catch_all(
     if let Some(group_post) = group_multi_permalink_path(&working) {
         working = group_post;
     }
+    if let Some(rewritten) = rewrite_slugged_photo_path(&working) {
+        working = rewritten;
+    }
 
     // /videos/<id> → reel/<id>
     if let Some(rewritten) = rewrite_videos_path(&working) {
@@ -580,6 +585,18 @@ fn rewrite_videos_path(working: &str) -> Option<String> {
     Some(out)
 }
 
+fn rewrite_slugged_photo_path(working: &str) -> Option<String> {
+    let captures = RE_SLUGGED_PHOTO.captures(working)?;
+    let mut out = format!("photo.php?fbid={}", &captures[1]);
+    if let Some((_, query)) = working.split_once('?') {
+        if !query.is_empty() {
+            out.push('&');
+            out.push_str(query);
+        }
+    }
+    Some(out)
+}
+
 fn normalize_reel_path(working: &str) -> Option<String> {
     let (path, query) = working
         .split_once('?')
@@ -623,6 +640,9 @@ fn activity_path(id: &str) -> Result<(String, ParserKind), StatusCode> {
     let mut path = crate::activity::decode_status_path(id).ok_or(StatusCode::BAD_REQUEST)?;
     if let Some(group_post) = group_multi_permalink_path(&path) {
         path = group_post;
+    }
+    if let Some(rewritten) = rewrite_slugged_photo_path(&path) {
+        path = rewritten;
     }
     if let Some(rewritten) = rewrite_videos_path(&path) {
         path = rewritten;
@@ -1305,6 +1325,32 @@ mod tests {
             .await
             .expect("cached response body");
         assert_eq!(&body[..], b"origin-b cached HTML");
+    }
+
+    #[tokio::test]
+    async fn slugged_photo_request_uses_photo_php_cache_key() {
+        let state = test_state();
+        let normalized = "photo.php?fbid=29046668624922185&set=a.228654573816974&hpir=1";
+        state.embed_cache.lock().expect("embed cache").insert(
+            normalized,
+            "slugged photo cached HTML".into(),
+            Instant::now(),
+        );
+        let request = Request::builder()
+            .uri("/shinantori/photos/claude-code-output-style/29046668624922185/?set=a.228654573816974&hpir=1")
+            .header(header::USER_AGENT, "Discordbot/2.0")
+            .body(Body::empty())
+            .expect("slugged photo request");
+
+        let response = router(state)
+            .oneshot(request)
+            .await
+            .expect("route response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("cached response body");
+
+        assert_eq!(&body[..], b"slugged photo cached HTML");
     }
 
     #[test]

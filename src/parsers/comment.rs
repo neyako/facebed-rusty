@@ -3,8 +3,9 @@ use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::json_post::parse_fetched_post;
 use crate::parsers::util::{
-    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
-    images_from_post, thumbnail_in_node, val_str_at, video_link_in_node, videos_from_post,
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, b64_decode_ascii,
+    human_format, images_from_post, thumbnail_in_node, val_str_at, video_link_in_node,
+    videos_from_post,
 };
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx, PostContext};
 use crate::url_clean::ensure_absolute;
@@ -12,32 +13,6 @@ use serde_json::Value;
 use url::Url;
 
 pub struct CommentParser;
-
-/// Base64 (standard or URL-safe alphabet) → ASCII string. FB comment `id`
-/// fields are base64 of `comment:<post_fbid>_<comment_fbid>`.
-/// ponytail: hand-rolled to avoid a base64 crate for one call site.
-fn b64_decode_ascii(s: &str) -> Option<String> {
-    let mut bits: u32 = 0;
-    let mut n = 0u32;
-    let mut out = Vec::new();
-    for &c in s.trim_end_matches('=').as_bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        } as u32;
-        bits = (bits << 6) | v;
-        n += 6;
-        if n >= 8 {
-            n -= 8;
-            out.push((bits >> n) as u8);
-        }
-    }
-    String::from_utf8(out).ok()
-}
 
 /// The `comment_id` query value, if present and non-empty.
 pub(crate) fn comment_id_in(path: &str) -> Option<String> {

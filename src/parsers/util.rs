@@ -93,6 +93,29 @@ pub fn val_str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
+pub fn b64_decode_ascii(s: &str) -> Option<String> {
+    let mut bits: u32 = 0;
+    let mut n = 0u32;
+    let mut out = Vec::new();
+    for &c in s.trim_end_matches('=').as_bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32;
+        bits = (bits << 6) | v;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((bits >> n) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 pub fn author_id_in_node(node: &Value) -> Option<String> {
     let node = node.get("owner_as_page").unwrap_or(node);
     match node.get("id")? {
