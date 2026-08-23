@@ -144,13 +144,16 @@ impl Fetcher {
             .gzip(true)
             .brotli(true)
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(8))
+            // Generous on purpose: FB throttles some 3–6 MB pages to
+            // ~0.25 MB/s; timing out mid-body turns a classifiable page
+            // into an opaque decode error.
+            .timeout(Duration::from_secs(15))
             .build()?;
         let media_client = Client::builder()
             .gzip(true)
             .brotli(true)
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 let host = attempt.url().host_str().map(|h| h.to_owned());
                 if media_redirect_ok(host.as_deref(), attempt.previous().len()) {

@@ -25,13 +25,26 @@ impl Parser for ReelsParser {
         let blocks = get_json_blocks(html, true);
 
         let target_video_id = reel_id_from_path(post_path);
-        let selected = select_content_node(&blocks, target_video_id).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Invalid reels link (cn)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
+        let selected = match select_content_node(&blocks, target_video_id) {
+            Some(selected) => selected,
+            None => {
+                // Deep-dive shells SSR a feed aggregate around a different
+                // video and reference the requested reel only as a client-side
+                // seed — nothing for this id is in the page. No data, not a
+                // parser bug.
+                if is_deep_dive_shell(&blocks) {
+                    return Err(FacebedError::no_data(format!(
+                        "reel {} not server-rendered (deep-dive shell)",
+                        target_video_id.unwrap_or_default()
+                    )));
+                }
+                return Err(FacebedError::parse_with(
+                    "Invalid reels link (cn)",
+                    page.html.clone(),
+                    page.url.clone(),
+                ));
+            }
+        };
 
         let video_id = selected.video_id.as_str();
         let video_link = find_video_link(&blocks, &selected.media, video_id).ok_or_else(|| {
@@ -168,6 +181,14 @@ fn selected_content(
         context,
         video_id,
     }
+}
+
+/// Deep-dive shell detector: the page carries video delivery data (some
+/// video exists) but zero `creation_story` nodes (no reel story was SSR'd).
+/// Any embed built from such a page would be the wrong video.
+fn is_deep_dive_shell(blocks: &[Value]) -> bool {
+    blocks.iter().any(|b| jq::has(b, &["videoDeliveryResponseFragment"]))
+        && !blocks.iter().any(|b| jq::has(b, &["creation_story"]))
 }
 
 fn is_strict_content_story(candidate: &Value) -> bool {
@@ -759,10 +780,38 @@ impl ValueExt for Value {
 mod tests {
     use super::{
         find_message_text, find_owner_with_name, find_video_link, get_reaction_counts,
-        owner_has_name, owner_id_for_post, reel_id_from_path, select_content_node,
+        is_deep_dive_shell, owner_has_name, owner_id_for_post, reel_id_from_path,
+        select_content_node,
     };
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node, val_str_at};
     use serde_json::{json, Value};
+
+    #[test]
+    fn deep_dive_shell_detected_by_delivery_without_creation_story() {
+        let shell = vec![json!({
+            "data": {"node": {"attachments": [{
+                "media": {
+                    "id": "1032605845825527",
+                    "videoDeliveryResponseFragment": {
+                        "videoDeliveryResponseResult": {"progressive_urls": []}
+                    }
+                }
+            }]}}
+        })];
+        assert!(is_deep_dive_shell(&shell));
+
+        let real = vec![json!({
+            "creation_story": {
+                "id": "2037454640245405",
+                "short_form_video_context": {},
+                "videoDeliveryResponseFragment": {}
+            }
+        })];
+        assert!(!is_deep_dive_shell(&real));
+
+        let empty: Vec<Value> = vec![];
+        assert!(!is_deep_dive_shell(&empty));
+    }
 
     #[test]
     fn owner_lookup_prefers_matched_content_node() {

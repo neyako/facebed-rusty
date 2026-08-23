@@ -20,13 +20,19 @@ struct ParsedPostDraft {
 impl Parser for JsonPostParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let post_id = extract_post_id(post_path);
-        if should_try_partial_fetch(post_id.as_deref()) {
+        let partial_mode = post_id.as_deref().and_then(partial_fetch_mode);
+        if let Some(mode) = partial_mode {
             let pid = post_id.clone().unwrap_or_default();
             let mut scanner = PostBlockScanner::default();
             let (is_partial, parsed) = {
                 let page = ctx
                     .fetcher
-                    .fetch_until(post_path, true, |bytes| scanner.found_match(bytes, &pid))
+                    .fetch_until(post_path, true, |bytes| match &mode {
+                        PartialFetchMode::PostId => scanner.found_match(bytes, &pid),
+                        PartialFetchMode::PermalinkNode => {
+                            scanner.found_permalink_target(bytes)
+                        }
+                    })
                     .await?;
                 (
                     page.is_partial(),
@@ -77,10 +83,22 @@ fn parse_page(
     let html = page.document();
     let blocks = get_json_block_texts(html, true);
     let canonical_post_id = canonical_page_post_id(html);
-    let post_json = get_post_json_for_page(&blocks, post_id, canonical_post_id.as_deref())
-        .ok_or_else(|| {
-            FacebedError::parse_with("cannot find post json", page.html.clone(), page.url.clone())
-        })?;
+    let Some(post_json) = get_post_json_for_page(&blocks, post_id, canonical_post_id.as_deref())
+    else {
+        // Zero recognizable post roots anywhere → Facebook served an empty
+        // hydration shell (gated group, throttled variant). No data, not a
+        // parser bug — don't page the webhook with 5 MB of shell HTML.
+        if !page_has_post_root(&blocks) {
+            return Err(FacebedError::no_data(format!(
+                "facebook served an empty shell for {post_path}"
+            )));
+        }
+        return Err(FacebedError::parse_with(
+            "cannot find post json",
+            page.html.clone(),
+            page.url.clone(),
+        ));
+    };
     let root = get_root_node(&post_json).ok_or_else(|| {
         FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
     })?;
@@ -213,6 +231,27 @@ fn get_post_json_for_page(
                 return Some(bloc);
             }
         }
+
+        // Structural fallback: pfbid-style permalinks carry a URL-local pfbid
+        // token that differs from the one in the request, so no story block ever
+        // contains the request id verbatim (the token appears once, inside a
+        // route config). The permalink target always lives in `data.node_v2` —
+        // bind to it instead.
+        for block in blocks {
+            let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
+                continue;
+            };
+            let Some(data) = jq::first(&bloc, "data") else {
+                continue;
+            };
+            let is_permalink_target = data
+                .get("node_v2")
+                .and_then(|nv2| nv2.pointer("/comet_sections/content/story"))
+                .is_some();
+            if is_permalink_target {
+                return Some(bloc);
+            }
+        }
         return None;
     }
 
@@ -271,15 +310,34 @@ fn canonical_page_post_id(html: &scraper::Html) -> Option<String> {
 }
 
 fn should_try_partial_fetch(post_id: Option<&str>) -> bool {
-    let Some(pid) = post_id else {
-        return false;
-    };
-    pid.chars().all(|c| c.is_ascii_digit())
+    post_id.is_some_and(|pid| partial_fetch_mode(pid).is_some())
+}
+
+/// How the incremental scanner decides the downloaded prefix is sufficient.
+/// Numeric ids stop on the post's own engagement block; pfbid tokens never
+/// appear verbatim in the story block (URL-local token), so stop on the
+/// permalink target (`node_v2`) block instead.
+enum PartialFetchMode {
+    PostId,
+    PermalinkNode,
+}
+
+fn partial_fetch_mode(post_id: &str) -> Option<PartialFetchMode> {
+    if post_id.chars().all(|c| c.is_ascii_digit()) {
+        Some(PartialFetchMode::PostId)
+    } else if post_id.starts_with("pfbid") {
+        Some(PartialFetchMode::PermalinkNode)
+    } else {
+        None
+    }
 }
 
 /// Incremental, forward-only scanner for the partial-fetch stop condition.
 /// Returns `true` once a completed JSON script block has been seen whose body
-/// contains both `i18n_reaction_count` and the requested `post_id`.
+/// contains the requested `post_id` together with an engagement binder —
+/// `i18n_reaction_count` or `subscription_target_id`. Group permalink pages
+/// often carry numeric `reaction_count` instead of the i18n string, and the
+/// post's own feedback renderer binds via `subscription_target_id`.
 #[derive(Default)]
 struct PostBlockScanner {
     /// Byte offset to resume the search for the next `<script` open tag.
@@ -299,6 +357,22 @@ struct OpenScript {
 
 impl PostBlockScanner {
     fn found_match(&mut self, html: &[u8], post_id: &str) -> bool {
+        self.scan_completed_blocks(html, |block| {
+            contains_bytes(block, post_id.as_bytes())
+                && (contains_bytes(block, b"i18n_reaction_count")
+                    || contains_bytes(block, b"subscription_target_id"))
+        })
+    }
+
+    /// Stop condition for pfbid permalinks: the permalink target block
+    /// (`data.node_v2` + `comet_sections`) has arrived.
+    fn found_permalink_target(&mut self, html: &[u8]) -> bool {
+        self.scan_completed_blocks(html, |block| {
+            contains_bytes(block, b"node_v2") && contains_bytes(block, b"comet_sections")
+        })
+    }
+
+    fn scan_completed_blocks(&mut self, html: &[u8], accept: impl Fn(&[u8]) -> bool) -> bool {
         const OPEN: &[u8] = b"<script";
         const CLOSE: &[u8] = b"</script>";
 
@@ -309,9 +383,7 @@ impl PostBlockScanner {
                         let close_start = open.close_search_from + rel;
                         if open.is_json_block {
                             let block = &html[open.body_start..close_start];
-                            if contains_bytes(block, b"i18n_reaction_count")
-                                && contains_bytes(block, post_id.as_bytes())
-                            {
+                            if accept(block) {
                                 return true;
                             }
                         }
@@ -470,6 +542,16 @@ fn group_handle_from_post_path(post_path: &str) -> Option<&str> {
     }
 }
 
+/// True when at least one JSON block carries a shape `get_root_node`
+/// recognizes. Used to tell "Facebook served an empty shell" (no data) apart
+/// from "Facebook served the post but we failed to match it" (parser bug).
+fn page_has_post_root(blocks: &[JsonBlockText]) -> bool {
+    blocks
+        .iter()
+        .filter_map(|block| serde_json::from_str::<Value>(&block.text).ok())
+        .any(|bloc| get_root_node(&bloc).is_some())
+}
+
 fn get_root_node(post_json: &Value) -> Option<&Value> {
     // normal: data has comet_ufi_summary..., node_v2 or node
     let data = jq::first(post_json, "data")?;
@@ -498,7 +580,7 @@ mod tests {
     use super::{
         canonical_page_post_id, extract_post_id, get_post_json, get_post_json_for_page,
         get_root_node, group_handle_from_post_path, interaction_identity_candidates,
-        is_group_post_path, should_try_partial_fetch, PostBlockScanner,
+        is_group_post_path, page_has_post_root, should_try_partial_fetch, PostBlockScanner,
     };
     use crate::fetch::JsonBlockText;
     use scraper::Html;
@@ -519,6 +601,79 @@ mod tests {
             })
             .to_string(),
         }
+    }
+
+    #[test]
+    fn pfbid_permalink_falls_back_to_node_v2_target() {
+        // The request pfbid appears only inside a route config (no story), and
+        // the permalink story block carries a different URL-local pfbid token
+        // plus a numeric post id — exactly what FB serves for 615… accounts.
+        let route = JsonBlockText {
+            text: json!({
+                "require": [
+                    {
+                        "__bbox": {
+                            "result": {
+                                "data": {
+                                    "url": "/permalink.php?story_fbid=pfbidREQUESTED&id=61577214045434"
+                                }
+                            }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        };
+        let target = JsonBlockText {
+            text: json!({
+                "require": [
+                    {
+                        "__bbox": {
+                            "result": {
+                                "data": {
+                                    "node_v2": {
+                                        "comet_sections": {
+                                            "content": {
+                                                "story": {
+                                                    "post_id": "122180490014907134",
+                                                    "wwwURL": "https://www.facebook.com/permalink.php?story_fbid=pfbidDIFFERENT&id=61577214045434",
+                                                    "message": {"text": "hello"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        };
+        let blocks = vec![route, target];
+
+        let got = get_post_json(&blocks, Some("pfbidREQUESTED"));
+        let story = got
+            .as_ref()
+            .and_then(|bloc| get_root_node(bloc))
+            .and_then(|root| root.pointer("/content/story"));
+        assert_eq!(
+            story.and_then(|s| s.get("post_id")).and_then(|v| v.as_str()),
+            Some("122180490014907134")
+        );
+    }
+
+    #[test]
+    fn hydration_shell_has_no_post_root() {
+        let shell = JsonBlockText {
+            text: json!({"require": [{"__bbox": {"result": {"data": {
+                "viewer": {"news_feed": {"edges": []}}
+            }}}}]}).to_string(),
+        };
+        assert!(!page_has_post_root(&[shell]));
+
+        let post = post_block("https://www.facebook.com/foo/posts/123", "x");
+        assert!(page_has_post_root(&[post]));
     }
 
     #[test]
@@ -856,9 +1011,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_fetch_only_for_numeric_posts() {
+    fn partial_fetch_for_numeric_and_pfbid_posts_only() {
         assert!(should_try_partial_fetch(Some("123")));
-        assert!(!should_try_partial_fetch(Some("pfbid02abc")));
+        // pfbid tokens now stop on the node_v2 permalink-target block.
+        assert!(should_try_partial_fetch(Some("pfbid02abc")));
+        assert!(!should_try_partial_fetch(Some("vanity123")));
         assert!(!should_try_partial_fetch(None));
     }
 
@@ -878,6 +1035,48 @@ mod tests {
 
         let mut scanner = PostBlockScanner::default();
         assert!(!scanner.found_match(format!("{open}{body}</script>").as_bytes(), "456"));
+    }
+
+    #[test]
+    fn scanner_matches_on_subscription_target_id_without_i18n() {
+        let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
+        let body = r#"{"feedback":{"subscription_target_id":"123","adaptive_ufi_action_renderers":[{"reaction_count":{"count":7}}]}}"#;
+
+        let mut scanner = PostBlockScanner::default();
+        assert!(scanner.found_match(
+            format!("{open}{body}</script>").as_bytes(),
+            "123"
+        ));
+
+        // subscription_target_id for a different post must not fire.
+        let mut scanner = PostBlockScanner::default();
+        assert!(!scanner.found_match(
+            format!("{open}{body}</script>").as_bytes(),
+            "456"
+        ));
+    }
+
+    #[test]
+    fn scanner_matches_permalink_target_block_for_pfbid_mode() {
+        let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
+        let route = r#"{"data":{"url":"/permalink.php?story_fbid=pfbidREQ&id=615"}}"#;
+        let target = r#"{"data":{"node_v2":{"comet_sections":{"content":{"story":{"post_id":"123"}}}}}}"#;
+
+        let mut scanner = PostBlockScanner::default();
+        assert!(!scanner.found_permalink_target(
+            format!("{open}{route}</script>").as_bytes()
+        ));
+
+        let mut scanner = PostBlockScanner::default();
+        assert!(scanner.found_permalink_target(
+            format!("{open}{route}</script>{open}{target}</script>").as_bytes()
+        ));
+
+        // incomplete block must not fire
+        let mut scanner = PostBlockScanner::default();
+        assert!(!scanner.found_permalink_target(
+            format!("{open}{target}").as_bytes()
+        ));
     }
 
     #[test]
