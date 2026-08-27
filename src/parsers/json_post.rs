@@ -32,9 +32,7 @@ impl Parser for JsonPostParser {
                     .fetcher
                     .fetch_until(post_path, true, |bytes| match &mode {
                         PartialFetchMode::PostId => scanner.found_match(bytes, &pid),
-                        PartialFetchMode::PermalinkNode => {
-                            scanner.found_permalink_target(bytes)
-                        }
+                        PartialFetchMode::PermalinkNode => scanner.found_permalink_target(bytes),
                     })
                     .await?;
                 match parse_page(ctx, post_path, post_id.as_deref(), &page) {
@@ -597,7 +595,9 @@ mod tests {
             .and_then(|bloc| get_root_node(bloc))
             .and_then(|root| root.pointer("/content/story"));
         assert_eq!(
-            story.and_then(|s| s.get("post_id")).and_then(|v| v.as_str()),
+            story
+                .and_then(|s| s.get("post_id"))
+                .and_then(|v| v.as_str()),
             Some("122180490014907134")
         );
     }
@@ -607,7 +607,8 @@ mod tests {
         let shell = JsonBlockText {
             text: json!({"require": [{"__bbox": {"result": {"data": {
                 "viewer": {"news_feed": {"edges": []}}
-            }}}}]}).to_string(),
+            }}}}]})
+            .to_string(),
         };
         assert!(!page_has_post_root(&[shell]));
 
@@ -982,29 +983,22 @@ mod tests {
         let body = r#"{"feedback":{"subscription_target_id":"123","adaptive_ufi_action_renderers":[{"reaction_count":{"count":7}}]}}"#;
 
         let mut scanner = PostBlockScanner::default();
-        assert!(scanner.found_match(
-            format!("{open}{body}</script>").as_bytes(),
-            "123"
-        ));
+        assert!(scanner.found_match(format!("{open}{body}</script>").as_bytes(), "123"));
 
         // subscription_target_id for a different post must not fire.
         let mut scanner = PostBlockScanner::default();
-        assert!(!scanner.found_match(
-            format!("{open}{body}</script>").as_bytes(),
-            "456"
-        ));
+        assert!(!scanner.found_match(format!("{open}{body}</script>").as_bytes(), "456"));
     }
 
     #[test]
     fn scanner_matches_permalink_target_block_for_pfbid_mode() {
         let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
         let route = r#"{"data":{"url":"/permalink.php?story_fbid=pfbidREQ&id=615"}}"#;
-        let target = r#"{"data":{"node_v2":{"comet_sections":{"content":{"story":{"post_id":"123"}}}}}}"#;
+        let target =
+            r#"{"data":{"node_v2":{"comet_sections":{"content":{"story":{"post_id":"123"}}}}}}"#;
 
         let mut scanner = PostBlockScanner::default();
-        assert!(!scanner.found_permalink_target(
-            format!("{open}{route}</script>").as_bytes()
-        ));
+        assert!(!scanner.found_permalink_target(format!("{open}{route}</script>").as_bytes()));
 
         let mut scanner = PostBlockScanner::default();
         assert!(scanner.found_permalink_target(
@@ -1013,9 +1007,7 @@ mod tests {
 
         // incomplete block must not fire
         let mut scanner = PostBlockScanner::default();
-        assert!(!scanner.found_permalink_target(
-            format!("{open}{target}").as_bytes()
-        ));
+        assert!(!scanner.found_permalink_target(format!("{open}{target}").as_bytes()));
     }
 
     #[test]

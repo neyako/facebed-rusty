@@ -1022,9 +1022,7 @@ fn is_retryable(e: &FacebedError) -> bool {
         | FacebedError::Parse { .. }
         | FacebedError::RateLimited { .. }
         | FacebedError::Checkpointed => true,
-        FacebedError::Http(err) => {
-            err.is_timeout() || err.is_connect() || err.is_decode()
-        }
+        FacebedError::Http(err) => err.is_timeout() || err.is_connect() || err.is_decode(),
         _ => false,
     }
 }
