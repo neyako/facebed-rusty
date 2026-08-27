@@ -25,7 +25,9 @@ src/
   crawler.rs              UA regex — bots get embeds, humans get 301
   embed.rs                OpenGraph HTML output (full / reel / error / redirect)
   error.rs                FacebedError + error codes C (no data), P (parse), U (unknown), X (other)
-  fetch.rs                Fetcher — HTTP, login-wall probe, JSON-blob extraction
+  fetch.rs                Fetcher — HTTP, login-wall probe, JSON-blob extraction;
+                          fetch_until caps streaming at PARTIAL_STREAM_DEADLINE (4.5s)
+                          and flags cut prefixes via FetchedPage::was_cut_by_deadline
   jq.rs                   recursive Value walker (first/all/has/last/enumerate)
   notifier.rs             Discord webhook — fire-and-forget tokio::spawn
   routes.rs               axum routes, URL dispatch (mirrors Python facebed.py:823 logic)
@@ -99,7 +101,7 @@ They call `ctx.fetcher.fetch(post_path, use_cookies)` to get a `FetchedPage`, th
 - **`JsonPostParser`** (`parsers/json_post.rs`) — default post. Tries `data.comet_ufi_summary_and_actions_renderer`, then `node_v2.comet_sections`, then `node.comet_sections`, then group hoisted feed. Builds a `Story` (`util::Story::from_json`) which recursively handles `attached_story` for shared posts.
 - **`SinglePhotoParser`** (`single_photo.rs`) — `/photo` URLs. Uses `prefetch_uris_v2` for the image.
 - **`PhotocomParser`** (`photocom.rs`) — `?type=3` image-in-comment. Adds `(💬)` suffix to author.
-- **`ReelsParser`** (`reels.rs`) — short-form video. **Bug 1 fix:** `find_content_node` matches `creation_story` with `short_form_video_context` OR `videoDeliveryResponseFragment` (modern field) OR `videoDeliveryLegacyFields` OR `playable_url`. Owner-with-name found by scanning every block (the rich owner lives in a different block from `creation_story`).
+- **`ReelsParser`** (`reels.rs`) — short-form video. **Bug 1 fix:** `find_content_node` matches `creation_story` with `short_form_video_context` OR `videoDeliveryResponseFragment` (modern field) OR `videoDeliveryLegacyFields` OR `playable_url`. Owner-with-name found by scanning every block (the rich owner lives in a different block from `creation_story`). Early-stops the page read once story-delivery + owner + engagement blocks have all completed (`ReelBlockScanner`, markers measured at 37–47% of the body); a scanner-stopped prefix that fails to parse retries the full fetch, a deadline-cut prefix returns NoData.
 - **`VideoWatchParser`** (`video_watch.rs`) — `/watch` URLs. Generic-watch-feed canonical link → `NoData`.
 - **`StoriesParser`** (`stories.rs`) — NEW. Searches blocks for `unified_stories_with_notes.edges[0].node`, pulls `playable_url` (video) or `image.uri` (photo) from `attachments[0].media`. Owner from `bucket.owner.name`. Expired or login-walled story → `NoData` (24h auto-expiry).
 - **`CommentParser`** (`comment.rs`) — `?comment_id=` permalinks. Finds the comment node by `legacy_fbid`, `comment_id=` inside url fields, or base64-decoding node `id` (`comment:<post>_<id>`). Author rendered as `Name (💬)`; media via the shared `images_from_post`/`video_link_in_node` probes. Comment not server-rendered → `NoData` `(ccn)` and routes re-dispatches the stripped path.
@@ -112,6 +114,14 @@ Multi-strategy probe, in order:
 3. **Direct:** `playable_url_quality_hd` then `playable_url` (used by Stories, sometimes Reels)
 
 Adding a new FB schema variant? Add a probe to this function — every parser uses it.
+
+### Video size probe (routes.rs::render_with_size_check)
+
+`head_content_length` HEADs the video URL (~0.6s) to catch >25 MB files Discord's
+media proxy refuses to inline. Skipped once the request is older than
+`VIDEO_PROBE_SKIP_AFTER` (6s) — past that the crawler budget matters more than
+the oversize fallback; skipping behaves like a missing Content-Length header
+(render inline, let Discord try).
 
 ### Jq helpers (`jq.rs`)
 

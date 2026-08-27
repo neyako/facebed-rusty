@@ -877,7 +877,8 @@ async fn process(state: &AppState, request: PostRequest<'_>) -> Response {
                     }
                 }
                 let render_started = Instant::now();
-                let body = render_with_size_check(state, &post, request).await;
+                let body =
+                    render_with_size_check(state, &post, request, process_started.elapsed()).await;
                 if let Ok(mut cache) = state.embed_cache.lock() {
                     if activity_eligible(&post) {
                         if let Some(id) = crate::activity::status_id(&post.url) {
@@ -939,6 +940,12 @@ async fn process(state: &AppState, request: PostRequest<'_>) -> Response {
 // time, 9.5-9.6s was flaky, >=9.7s never rendered). 8500ms keeps the whole
 // response inside the reliable zone with margin for edge/origin latency.
 const DISCORD_RESPONSE_BUDGET: Duration = Duration::from_millis(8500);
+
+/// Skip the video Content-Length probe once the request is this old. The
+/// probe is a serial ~0.6s HEAD whose only effect is downgrading >25 MB
+/// videos to a thumbnail embed; past this point the remaining crawler
+/// budget matters more than that fallback.
+const VIDEO_PROBE_SKIP_AFTER: Duration = Duration::from_millis(6000);
 
 async fn process_with_deadline(
     state: &AppState,
@@ -1052,12 +1059,23 @@ async fn render_with_size_check(
     state: &AppState,
     post: &ParsedPost,
     request: PostRequest<'_>,
+    elapsed: Duration,
 ) -> String {
     let tz = state.config.load().timezone;
     let Some(video_url) = post.video_links.first() else {
         return render(post, tz, request);
     };
-    let Some(size) = state.fetcher.head_content_length(video_url).await else {
+    let size = if elapsed < VIDEO_PROBE_SKIP_AFTER {
+        state.fetcher.head_content_length(video_url).await
+    } else {
+        info!(
+            url = %post.url,
+            elapsed_ms = elapsed.as_millis(),
+            "skipping video size probe; rendering inline video embed"
+        );
+        None
+    };
+    let Some(size) = size else {
         // Server didn't advertise Content-Length — assume it's fine and let
         // Discord try. Better to attempt the inline than silently downgrade
         // every video where FB omits the header.

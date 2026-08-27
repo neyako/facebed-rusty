@@ -1,9 +1,9 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::get_json_blocks;
+use crate::fetch::{get_json_blocks, FetchedPage};
 use crate::jq;
 use crate::parsers::util::{
-    author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
-    thumbnail_in_node, val_str_at,
+    author_avatar_in_node, author_handle_in_node, author_id_in_node, contains_bytes, human_format,
+    thumbnail_in_node, val_str_at, JsonBlockScanner,
 };
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
@@ -20,103 +20,173 @@ struct SelectedContentNode {
 #[async_trait::async_trait]
 impl Parser for ReelsParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.document();
-        let blocks = get_json_blocks(html, true);
-
-        let target_video_id = reel_id_from_path(post_path);
-        let selected = match select_content_node(&blocks, target_video_id) {
-            Some(selected) => selected,
-            None => {
-                // Deep-dive shells SSR a feed aggregate around a different
-                // video and reference the requested reel only as a client-side
-                // seed — nothing for this id is in the page. No data, not a
-                // parser bug.
-                if is_deep_dive_shell(&blocks) {
-                    return Err(FacebedError::no_data(format!(
-                        "reel {} not server-rendered (deep-dive shell)",
-                        target_video_id.unwrap_or_default()
-                    )));
+        // Reel pages are ~2.7 MB and FB drips them slowly; the data the parser
+        // needs (story delivery, owner, engagement) clusters in the first half
+        // of the stream (measured: markers at 37-47% of the body). Stop reading
+        // once those blocks have completed; if the markers never arrive this
+        // degrades to a full read, identical to the old behavior.
+        let (mut outcome, deadline_cut, partial) = {
+            let page = match reel_id_from_path(post_path) {
+                Some(video_id) => {
+                    let mut scanner = ReelBlockScanner::default();
+                    ctx.fetcher
+                        .fetch_until(post_path, true, |bytes| {
+                            scanner.found_reel_data(bytes, video_id)
+                        })
+                        .await
                 }
-                return Err(FacebedError::parse_with(
-                    "Invalid reels link (cn)",
-                    page.html.clone(),
-                    page.url.clone(),
-                ));
+                None => ctx.fetcher.fetch(post_path, true).await,
+            }?;
+            let outcome = parse_reel(ctx, post_path, &page);
+            (outcome, page.was_cut_by_deadline(), page.is_partial())
+        };
+        match outcome {
+            // The stop flags are a heuristic; if a stopped prefix still fails
+            // to parse, re-read the full page once before failing so the
+            // error (if any) matches a complete page.
+            Err(e) if partial && !deadline_cut => {
+                tracing::warn!(
+                    path = %post_path,
+                    error = %e,
+                    "early-stopped reel parse failed; retrying full fetch"
+                );
+                let page = ctx.fetcher.fetch(post_path, true).await?;
+                outcome = parse_reel(ctx, post_path, &page);
             }
-        };
-
-        let video_id = selected.video_id.as_str();
-        let video_link = find_video_link(&blocks, &selected.media, video_id).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Invalid reels link (vn)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-
-        let owner =
-            find_owner_with_name(&blocks, &selected.context, video_id).ok_or_else(|| {
-                FacebedError::parse_with(
-                    "Invalid reels link (own)",
-                    page.html.clone(),
-                    page.url.clone(),
-                )
-            })?;
-        let typename = val_str_at(&owner, "__typename").unwrap_or("");
-        let is_ig = typename.starts_with("InstagramUser");
-        let op_name = if is_ig {
-            val_str_at(&owner, "username")
-                .filter(|s| !s.is_empty())
-                .map(|username| format!("📷 @{username}"))
-                .unwrap_or_else(|| val_str_at(&owner, "name").unwrap_or("").to_owned())
-        } else {
-            val_str_at(&owner, "name").unwrap_or("").to_owned()
-        };
-        let owner_id = owner_id_for_post(&owner).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Invalid reels link (own)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-
-        let post_url = find_shareable_url(&blocks)
-            .unwrap_or_else(|| crate::url_clean::ensure_absolute(post_path));
-
-        let date = find_creation_time(&blocks).unwrap_or(0);
-        let post_text = find_message_text(&blocks, &selected.context, video_id);
-
-        let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, video_id).unwrap_or((
-            "null".into(),
-            "null".into(),
-            "null".into(),
-        ));
-
-        if ctx.is_banned(&owner_id) {
-            return Ok(banned_post(&post_url));
+            // Deadline-cut prefix: the rest of the page is arriving at a
+            // throttle drip, and a full re-read would burn the remaining
+            // Discord budget re-reading the same shell.
+            Err(_) if deadline_cut => {
+                outcome = Err(FacebedError::no_data(format!(
+                    "facebook served a throttled or partial reel page for {post_path} (cut)"
+                )));
+            }
+            _ => {}
         }
+        outcome
+    }
+}
 
-        let thumbnail =
-            thumbnail_in_node(&selected.media).or_else(|| thumbnail_in_node(&selected.context));
+fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedResult<ParsedPost> {
+    let html = page.document();
+    let blocks = get_json_blocks(html, true);
 
-        Ok(ParsedPost {
-            author_name: op_name,
-            author_id: Some(owner_id),
-            author_handle: author_handle_in_node(&owner),
-            author_avatar_url: author_avatar_in_node(&owner),
-            context: None,
-            text: post_text,
-            allow_discord_markdown: false,
-            image_links: Vec::new(),
-            url: post_url,
-            date,
-            likes,
-            top_reaction_ids: Vec::new(),
-            comments: cmts,
-            shares,
-            video_links: vec![video_link],
-            thumbnail,
+    let target_video_id = reel_id_from_path(post_path);
+    let selected = match select_content_node(&blocks, target_video_id) {
+        Some(selected) => selected,
+        None => {
+            // Deep-dive shells SSR a feed aggregate around a different
+            // video and reference the requested reel only as a client-side
+            // seed — nothing for this id is in the page. No data, not a
+            // parser bug.
+            if is_deep_dive_shell(&blocks) {
+                return Err(FacebedError::no_data(format!(
+                    "reel {} not server-rendered (deep-dive shell)",
+                    target_video_id.unwrap_or_default()
+                )));
+            }
+            return Err(FacebedError::parse_with(
+                "Invalid reels link (cn)",
+                page.html.clone(),
+                page.url.clone(),
+            ));
+        }
+    };
+
+    let video_id = selected.video_id.as_str();
+    let video_link = find_video_link(&blocks, &selected.media, video_id).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Invalid reels link (vn)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+
+    let owner = find_owner_with_name(&blocks, &selected.context, video_id).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Invalid reels link (own)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+    let typename = val_str_at(&owner, "__typename").unwrap_or("");
+    let is_ig = typename.starts_with("InstagramUser");
+    let op_name = if is_ig {
+        val_str_at(&owner, "username")
+            .filter(|s| !s.is_empty())
+            .map(|username| format!("📷 @{username}"))
+            .unwrap_or_else(|| val_str_at(&owner, "name").unwrap_or("").to_owned())
+    } else {
+        val_str_at(&owner, "name").unwrap_or("").to_owned()
+    };
+    let owner_id = owner_id_for_post(&owner).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Invalid reels link (own)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+
+    let post_url =
+        find_shareable_url(&blocks).unwrap_or_else(|| crate::url_clean::ensure_absolute(post_path));
+
+    let date = find_creation_time(&blocks).unwrap_or(0);
+    let post_text = find_message_text(&blocks, &selected.context, video_id);
+
+    let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, video_id).unwrap_or((
+        "null".into(),
+        "null".into(),
+        "null".into(),
+    ));
+
+    if ctx.is_banned(&owner_id) {
+        return Ok(banned_post(&post_url));
+    }
+
+    let thumbnail =
+        thumbnail_in_node(&selected.media).or_else(|| thumbnail_in_node(&selected.context));
+
+    Ok(ParsedPost {
+        author_name: op_name,
+        author_id: Some(owner_id),
+        author_handle: author_handle_in_node(&owner),
+        author_avatar_url: author_avatar_in_node(&owner),
+        context: None,
+        text: post_text,
+        allow_discord_markdown: false,
+        image_links: Vec::new(),
+        url: post_url,
+        date,
+        likes,
+        top_reaction_ids: Vec::new(),
+        comments: cmts,
+        shares,
+        video_links: vec![video_link],
+        thumbnail,
+    })
+}
+
+/// Reel early-stop condition for the partial read: story delivery for THIS
+/// video id, an owner block naming it, and the engagement renderer. Any
+/// marker missing -> keeps reading -> behaves like a full fetch.
+#[derive(Default)]
+struct ReelBlockScanner {
+    core: JsonBlockScanner,
+    seen_video: bool,
+    seen_owner: bool,
+    seen_engagement: bool,
+}
+
+impl ReelBlockScanner {
+    fn found_reel_data(&mut self, html: &[u8], video_id: &str) -> bool {
+        let vid = video_id.as_bytes();
+        self.core.scan_completed_blocks(html, |block| {
+            if contains_bytes(block, vid) {
+                self.seen_video |= contains_bytes(block, b"videoDeliveryResponseFragment");
+                self.seen_owner |= contains_bytes(block, b"\"name\"");
+            }
+            self.seen_engagement |= contains_bytes(block, b"unified_reactors");
+            self.seen_video && self.seen_owner && self.seen_engagement
         })
     }
 }
@@ -187,7 +257,9 @@ fn selected_content(
 /// video exists) but zero `creation_story` nodes (no reel story was SSR'd).
 /// Any embed built from such a page would be the wrong video.
 fn is_deep_dive_shell(blocks: &[Value]) -> bool {
-    blocks.iter().any(|b| jq::has(b, &["videoDeliveryResponseFragment"]))
+    blocks
+        .iter()
+        .any(|b| jq::has(b, &["videoDeliveryResponseFragment"]))
         && !blocks.iter().any(|b| jq::has(b, &["creation_story"]))
 }
 
@@ -781,10 +853,45 @@ mod tests {
     use super::{
         find_message_text, find_owner_with_name, find_video_link, get_reaction_counts,
         is_deep_dive_shell, owner_has_name, owner_id_for_post, reel_id_from_path,
-        select_content_node,
+        select_content_node, ReelBlockScanner,
     };
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node, val_str_at};
     use serde_json::{json, Value};
+
+    #[test]
+    fn reel_scanner_fires_only_after_video_owner_and_engagement_blocks() {
+        let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
+        let vid = "1986034565447205";
+        let mut scanner = ReelBlockScanner::default();
+
+        // Story delivery for the video alone: keep reading.
+        let mut prefix =
+            format!(r#"{open}{{"id":"{vid}","videoDeliveryResponseFragment":{{}}}}</script>"#);
+        assert!(!scanner.found_reel_data(prefix.as_bytes(), vid));
+
+        // Owner with a name: engagement still missing.
+        prefix.push_str(&format!(
+            r#"{open}{{"id":"{vid}","owner":{{"name":"Reeler"}}}}</script>"#
+        ));
+        assert!(!scanner.found_reel_data(prefix.as_bytes(), vid));
+
+        // Engagement renderer completes the set.
+        prefix.push_str(&format!(
+            r#"{open}{{"feedback":{{"unified_reactors":{{}}}}}}</script>"#
+        ));
+        assert!(scanner.found_reel_data(prefix.as_bytes(), vid));
+    }
+
+    #[test]
+    fn reel_scanner_ignores_blocks_for_other_videos() {
+        let open = r#"<script type="application/json" data-content-len="42" data-sjs>"#;
+        let mut scanner = ReelBlockScanner::default();
+
+        let decoy_block = format!(
+            r#"{open}{{"id":"999","videoDeliveryResponseFragment":{{}},"owner":{{"name":"X"}},"unified_reactors":{{}}}}</script>"#
+        );
+        assert!(!scanner.found_reel_data(decoy_block.as_bytes(), "1986034565447205"));
+    }
 
     #[test]
     fn deep_dive_shell_detected_by_delivery_without_creation_story() {

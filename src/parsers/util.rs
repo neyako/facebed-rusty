@@ -1016,3 +1016,100 @@ mod tests {
         assert_eq!(counts, ("863".into(), "248".into(), "19".into()));
     }
 }
+
+/// Generic forward-only scanner for Facebook's `<script type="application/json"
+/// data-content-len data-sjs>` blocks as they stream in during a partial
+/// response read. Tracks consumption state across calls so repeated invocations
+/// on growing byte prefixes only inspect new bytes. The stop predicate is
+/// per-parser; see `json_post::PostBlockScanner` and `reels::ReelBlockScanner`.
+#[derive(Default)]
+pub(crate) struct JsonBlockScanner {
+    /// Byte offset to resume the search for the next `<script` open tag.
+    search_from: usize,
+    /// Set while inside a script whose `</script>` has not arrived yet.
+    open: Option<OpenScript>,
+}
+
+struct OpenScript {
+    /// Index just past the `>` of the open tag.
+    body_start: usize,
+    /// Whether the open tag matched the Facebook JSON-block attributes.
+    is_json_block: bool,
+    /// Byte offset to resume the search for `</script>`.
+    close_search_from: usize,
+}
+
+impl JsonBlockScanner {
+    /// Feed the accumulated byte prefix; `accept` runs on each newly completed
+    /// JSON block and the scan stops as soon as it returns `true`.
+    pub(crate) fn scan_completed_blocks(
+        &mut self,
+        html: &[u8],
+        mut accept: impl FnMut(&[u8]) -> bool,
+    ) -> bool {
+        const OPEN: &[u8] = b"<script";
+        const CLOSE: &[u8] = b"</script>";
+
+        loop {
+            if let Some(open) = self.open.as_mut() {
+                match find_bytes(&html[open.close_search_from..], CLOSE) {
+                    Some(rel) => {
+                        let close_start = open.close_search_from + rel;
+                        if open.is_json_block {
+                            let block = &html[open.body_start..close_start];
+                            if accept(block) {
+                                return true;
+                            }
+                        }
+                        self.search_from = close_start + CLOSE.len();
+                        self.open = None;
+                    }
+                    None => {
+                        self.close_search_from_near_tail(html.len(), CLOSE.len());
+                        return false;
+                    }
+                }
+            } else {
+                let Some(rel) = find_bytes(&html[self.search_from..], OPEN) else {
+                    self.search_from = html.len().saturating_sub(OPEN.len() - 1);
+                    return false;
+                };
+                let tag_start = self.search_from + rel;
+                let Some(gt_rel) = find_bytes(&html[tag_start..], b">") else {
+                    self.search_from = tag_start;
+                    return false;
+                };
+                let body_start = tag_start + gt_rel + 1;
+                let open_tag = &html[tag_start..body_start];
+                let is_json_block = contains_bytes(open_tag, br#"type="application/json""#)
+                    && contains_bytes(open_tag, b"data-content-len")
+                    && contains_bytes(open_tag, b"data-sjs");
+                self.open = Some(OpenScript {
+                    body_start,
+                    is_json_block,
+                    close_search_from: body_start,
+                });
+            }
+        }
+    }
+
+    fn close_search_from_near_tail(&mut self, html_len: usize, close_len: usize) {
+        if let Some(open) = self.open.as_mut() {
+            open.close_search_from = html_len.saturating_sub(close_len - 1).max(open.body_start);
+        }
+    }
+}
+
+pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+pub(crate) fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    find_bytes(haystack, needle).is_some()
+}
