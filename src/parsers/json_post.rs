@@ -24,7 +24,8 @@ impl Parser for JsonPostParser {
         if let Some(mode) = partial_mode {
             let pid = post_id.clone().unwrap_or_default();
             let mut scanner = PostBlockScanner::default();
-            let (is_partial, parsed) = {
+            let mut partial_draft: Option<ParsedPostDraft> = None;
+            {
                 let page = ctx
                     .fetcher
                     .fetch_until(post_path, true, |bytes| match &mode {
@@ -34,17 +35,29 @@ impl Parser for JsonPostParser {
                         }
                     })
                     .await?;
-                (
-                    page.is_partial(),
-                    parse_page(ctx, post_path, post_id.as_deref(), &page),
-                )
-            };
-            match parsed {
-                Ok(draft) => return Ok(resolve_author_handle(ctx, draft).await),
-                Err(e) if is_partial => {
-                    tracing::warn!(path = %post_path, error = %e, "partial post parse failed; retrying full fetch");
+                match parse_page(ctx, post_path, post_id.as_deref(), &page) {
+                    Ok(draft) => partial_draft = Some(draft),
+                    Err(e) if page.is_partial() => {
+                        // Deadline-cut pages are prefixes of a gated-group
+                        // shell: Facebook slow-drips a page with no post data
+                        // at all, so the scanner never matched. Retrying the
+                        // full fetch would burn the rest of the Discord
+                        // budget re-reading the same shell — classify as
+                        // no-data instead of timing out.
+                        if page.was_cut_by_deadline()
+                            && !page_has_post_root(&get_json_block_texts(page.document(), true))
+                        {
+                            return Err(FacebedError::no_data(format!(
+                                "facebook served a gated or throttled shell for {post_path} (cut)"
+                            )));
+                        }
+                        tracing::warn!(path = %post_path, error = %e, "partial post parse failed; retrying full fetch");
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
+            }
+            if let Some(draft) = partial_draft {
+                return Ok(resolve_author_handle(ctx, draft).await);
             }
         }
 

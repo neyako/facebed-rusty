@@ -51,6 +51,7 @@ pub struct FetchedPage {
     pub html: String,
     document: Html,
     partial: bool,
+    deadline_cut: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +77,14 @@ impl FetchedPage {
     pub fn is_partial(&self) -> bool {
         self.partial
     }
+
+    /// True when the body read was abandoned at [`PARTIAL_STREAM_DEADLINE`]
+    /// without the scanner matching. The page is an incomplete prefix — not
+    /// an early-stop on recognized data — so callers should treat parse
+    /// failures on it as "no data yet", not "parser bug".
+    pub fn was_cut_by_deadline(&self) -> bool {
+        self.deadline_cut
+    }
 }
 
 /// Fallback UA when an account has no `user_agent` set in its cookie file
@@ -93,6 +102,15 @@ const HEADERS: &[(&str, &str)] = &[
 ];
 const SHARE_HEAD_USER_AGENT: &str = "python-requests/2.32.3";
 const VIDEO_HEAD_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Cap on how long [`Fetcher::fetch_until`] will keep streaming a page whose
+/// scanner has not matched. Gated-group shells carry no post data, so the
+/// scanner never fires and Facebook's throttled body read (observed as slow
+/// as ~40 KB/s) would otherwise run past Discord's response budget and turn
+/// a fast "no access" error into a timeout embed. Prod history (30d, 181
+/// partial fetches): the scanner matched at p99 2.9s / max 3.4s, so 4.5s
+/// never cuts a fetch that would have gone on to succeed.
+const PARTIAL_STREAM_DEADLINE: Duration = Duration::from_millis(4500);
 const VIDEO_HEAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const VIDEO_HEAD_CACHE_MAX: usize = 256;
 
@@ -408,7 +426,7 @@ impl Fetcher {
         let html = resp.text().await?;
         let read_ms = read_started.elapsed().as_millis();
         tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
-        self.page_from_html(url, html, post_path, false)
+        self.page_from_html(url, html, post_path, false, false)
     }
 
     /// Fetch a Facebook path, stopping early once `should_stop` says the
@@ -437,18 +455,51 @@ impl Fetcher {
         }
         let mut body = Vec::new();
         let mut stopped_early = false;
+        let mut deadline_cut = false;
         let read_started = Instant::now();
-        while let Some(chunk) = resp.chunk().await? {
-            body.extend_from_slice(&chunk);
-            if should_stop(&body) {
-                stopped_early = true;
+        loop {
+            let remaining = PARTIAL_STREAM_DEADLINE
+                .checked_sub(read_started.elapsed())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                deadline_cut = true;
                 break;
+            }
+            match tokio::time::timeout(remaining, resp.chunk()).await {
+                Err(_elapsed) => {
+                    deadline_cut = true;
+                    break;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Ok(Ok(Some(chunk))) => {
+                    body.extend_from_slice(&chunk);
+                    if should_stop(&body) {
+                        stopped_early = true;
+                        break;
+                    }
+                }
+                Ok(Ok(None)) => break,
             }
         }
         let read_ms = read_started.elapsed().as_millis();
         let html = String::from_utf8_lossy(&body).into_owned();
-        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
-        self.page_from_html(url, html, post_path, stopped_early)
+        if deadline_cut {
+            tracing::warn!(
+                path = %post_path,
+                account = %account_label,
+                len = html.len(),
+                read_ms,
+                "partial stream deadline exceeded (cut)"
+            );
+        }
+        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early || deadline_cut, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
+        self.page_from_html(
+            url,
+            html,
+            post_path,
+            stopped_early || deadline_cut,
+            deadline_cut,
+        )
     }
 
     fn request_for(&self, url: &str, use_cookies: bool) -> (RequestBuilder, String) {
@@ -482,6 +533,7 @@ impl Fetcher {
         html: String,
         post_path: &str,
         partial: bool,
+        deadline_cut: bool,
     ) -> FacebedResult<FetchedPage> {
         let parse_started = Instant::now();
         let document = Html::parse_document(&html);
@@ -491,6 +543,7 @@ impl Fetcher {
             html,
             document,
             partial,
+            deadline_cut,
         };
         let probe_started = Instant::now();
         check_or_raise(&page, post_path)?;
