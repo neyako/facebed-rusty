@@ -408,6 +408,17 @@ pub fn format_reel_post_embed(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let image_meta = post
+        .thumbnail
+        .as_ref()
+        .map(|u| {
+            let q = escape_attr(u);
+            format!(
+                r#"<meta property="og:image" content="{q}"/>
+<meta name="twitter:image" content="{q}"/>"#
+            )
+        })
+        .unwrap_or_default();
     let post_date = if activity_origin.is_some() {
         String::new()
     } else {
@@ -451,6 +462,7 @@ pub fn format_reel_post_embed(
     <meta property="twitter:player:stream:content_type" content="video/mp4"/>
 
     {video_meta}
+    {image_meta}
 
     <link rel="canonical" href="{url_q}"/>
     {oembed}
@@ -466,6 +478,7 @@ pub fn format_reel_post_embed(
         desc = escape_attr(truncate_chars(&description, 4096)),
         url_q = url_q,
         video_meta = video_meta,
+        image_meta = image_meta,
         oembed = oembed,
         activity = activity,
     )
@@ -981,6 +994,27 @@ mod tests {
         assert!(html.contains(r#"<meta name="twitter:card" content="player"/>"#));
         assert!(html.contains(r#"type="application/activity+json""#));
         assert!(html.contains("https://facebed.example/users/facebed/statuses/"));
+        // No thumbnail set — reel embed stays video-only.
+        assert!(!html.contains("og:image"));
+    }
+
+    #[test]
+    fn reel_embed_emits_thumbnail_fallback_image() {
+        let mut post = sample_post();
+        post.image_links.clear();
+        post.video_links = vec!["https://video.fbcdn.net/v.mp4".into()];
+        post.thumbnail = Some("https://img.example/video.jpg".into());
+
+        let html = format_reel_post_embed(&post, 0, None);
+
+        assert!(
+            html.contains(r#"<meta property="og:image" content="https://img.example/video.jpg"/>"#)
+        );
+        assert!(html
+            .contains(r#"<meta name="twitter:image" content="https://img.example/video.jpg"/>"#));
+        assert!(
+            html.contains(r#"<meta property="og:video" content="https://video.fbcdn.net/v.mp4"/>"#)
+        );
     }
 
     #[test]
