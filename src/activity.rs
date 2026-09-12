@@ -137,7 +137,9 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
             "id": account_id, "username": username, "acct": username,
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
-            "note": "", "url": post.url,
+            // Leave the account unlinked; the status retains its Facebook
+            // target. Discord rendering with an empty URL needs live QA.
+            "note": "", "url": "",
             "avatar": avatar, "avatar_static": avatar,
             "header": ACCOUNT_HEADER_URL, "header_static": ACCOUNT_HEADER_URL,
             "followers_count": 0, "following_count": 0, "statuses_count": 0,

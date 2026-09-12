@@ -20,7 +20,7 @@ Every supported Facebook embed type renders through Discord Activity with the re
 - `account.username`: bare author handle, then author ID, then `facebed` fallback.
 - `account.acct`: exactly the same bare value as `username`; never append `@fb.com`, `@facebook.com`, or another host.
 - `account.display_name`: parsed Facebook author name.
-- `account.url`: canonical post/comment URL, preserving the existing post-link behavior.
+- `account.url`: empty string in the current test build. The status's `url` and `uri` retain the Facebook post/comment URL. Whether Discord accepts an unlinked account without adding a host suffix still requires visual verification.
 - `account.avatar` and `avatar_static`: parsed author profile photo URL when present; otherwise Facebook's Graph profile-picture URL for a known handle, then `https://facebed.neyahub.com/favicon.ico`.
 - `account.header` and `header_static`: keep `https://facebed.neyahub.com/banner.png`.
 
@@ -56,7 +56,7 @@ Reel, watch, story, comment, and oversized-video HTML paths must emit the same a
 - Missing author ID or handle never prevents an embed; use `facebed` as the bare account key.
 - Missing or malformed embedded avatar never prevents an embed; try the Graph profile-picture URL for a known handle, then use the Facebed logo.
 - Do not create an open avatar-proxy endpoint or accept arbitrary remote URLs, avoiding an SSRF surface.
-- Do not change Facebook post/profile click targets, reaction counters, Markdown behavior, or gallery ordering.
+- Keep the Facebook status click target, reaction counters, Markdown behavior, and gallery ordering. The account is currently unlinked for the suffix experiment above.
 
 ## Verification
 
