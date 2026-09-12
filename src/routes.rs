@@ -188,7 +188,7 @@ async fn activity_status_for_id(state: AppState, id: String) -> Response {
         DISCORD_RESPONSE_BUDGET,
         crate::fetch::RESPONSE_DEADLINE.scope(
             Instant::now() + DISCORD_RESPONSE_BUDGET,
-            run_parser(&state, &path, kind),
+            scrape_with_accounts(&state, &path, kind),
         ),
     )
     .await
@@ -463,7 +463,8 @@ async fn catch_all(
     if let Some(wrapped) = url_clean::extract_share_url(&working) {
         working = wrapped;
     }
-    if RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working) {
+    let is_share = RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working);
+    if is_share {
         let share_path = url_clean::clean_path(&working);
         let cached = state
             .embed_cache
@@ -520,17 +521,6 @@ async fn catch_all(
                 Ok(Err(e)) => return error_response(&state, &working, e),
             }
         }
-        // Share pages often resolve to a reel whose Facebook HTML takes
-        // longer than Discord's initial crawl window. Emit Activity discovery
-        // immediately and warm its status cache in the background.
-        if is_bot {
-            if let Some(kind) = select_kind(&working) {
-                if let Some(shell) = share_activity_shell(&working, activity_origin.as_deref()) {
-                    spawn_share_activity_warm(&state, &working, kind);
-                    return html_response(shell);
-                }
-            }
-        }
     }
 
     // strip tracking AFTER share resolve
@@ -561,6 +551,13 @@ async fn catch_all(
     };
 
     debug!(working = %working, kind = ?kind, "dispatch");
+    // Give Discord discovery after resolution; the Activity endpoint scrapes
+    // on demand with its own bounded budget. Other crawlers need the full HTML.
+    if is_share && ua.to_ascii_lowercase().contains("discordbot") {
+        if let Some(shell) = share_activity_shell(&working, activity_origin.as_deref()) {
+            return html_response(shell);
+        }
+    }
     process_with_deadline(
         &state,
         PostRequest {
@@ -583,29 +580,6 @@ fn share_activity_shell(path: &str, origin: Option<&str>) -> Option<String> {
     Some(format!(
         r#"<!DOCTYPE html><html><head><title>Facebook post</title><meta property="og:title" content="Facebook post"/><meta property="og:url" content="{escaped_post}"/><link rel="canonical" href="{escaped_post}"/><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
     ))
-}
-fn spawn_share_activity_warm(state: &AppState, path: &str, kind: ParserKind) {
-    let state = state.clone();
-    let path = path.to_owned();
-    tokio::spawn(async move {
-        let _permit = match state.fetch_limit.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return,
-        };
-        let result = if state.ctx.cookies.load().is_empty() {
-            run_parser(&state, &path, kind).await
-        } else {
-            ACCOUNT_OVERRIDE
-                .scope(0, run_parser(&state, &path, kind))
-                .await
-        };
-        let Ok(post) = result else { return };
-        if let Some(id) = crate::activity::status_id(&post.url) {
-            if let Ok(mut cache) = state.embed_cache.lock() {
-                cache.insert_activity(&id, post, Instant::now());
-            }
-        }
-    });
 }
 
 fn request_origin(headers: &HeaderMap) -> Option<String> {
@@ -884,6 +858,40 @@ async fn process(state: &AppState, request: PostRequest<'_>) -> Response {
         Err(_) => return busy_response(),
     };
 
+    let process_started = crate::fetch::RESPONSE_DEADLINE
+        .try_with(|deadline| *deadline - DISCORD_RESPONSE_BUDGET)
+        .unwrap_or_else(|_| Instant::now());
+    let post = match scrape_with_accounts(state, path, kind).await {
+        Ok(post) => post,
+        Err(e) => return error_response(state, path, e),
+    };
+    let render_started = Instant::now();
+    let body = render_with_size_check(state, &post, request, process_started.elapsed()).await;
+    if let Ok(mut cache) = state.embed_cache.lock() {
+        if activity_eligible(&post) {
+            if let Some(id) = crate::activity::status_id(&post.url) {
+                cache.insert_activity(&id, post, Instant::now());
+            }
+        }
+        cache.insert(&cache_key, body.clone(), Instant::now());
+    }
+    debug!(
+        path = %path,
+        kind = ?kind,
+        render_ms = render_started.elapsed().as_millis(),
+        total_ms = process_started.elapsed().as_millis(),
+        "embed rendered"
+    );
+    html_response(body)
+}
+
+/// Both HTML and Activity hydration use the same account priority, affinity,
+/// and failure handling. Callers hold the fetch permit and response deadline.
+async fn scrape_with_accounts(
+    state: &AppState,
+    path: &str,
+    kind: ParserKind,
+) -> Result<ParsedPost, FacebedError> {
     // Retry across every cookie account in configured priority order. Primary
     // account gets first chance; extra accounts are fallback/load-balancing
     // hints via affinity, not blind per-request rotation.
@@ -952,28 +960,16 @@ async fn process(state: &AppState, request: PostRequest<'_>) -> Response {
                             .set_affinity(k.to_string(), account_index);
                     }
                 }
-                let render_started = Instant::now();
-                let body =
-                    render_with_size_check(state, &post, request, process_started.elapsed()).await;
-                if let Ok(mut cache) = state.embed_cache.lock() {
-                    if activity_eligible(&post) {
-                        if let Some(id) = crate::activity::status_id(&post.url) {
-                            cache.insert_activity(&id, post.clone(), Instant::now());
-                        }
-                    }
-                    cache.insert(&cache_key, body.clone(), Instant::now());
-                }
                 debug!(
                     path = %path,
                     kind = ?kind,
                     account = %state.ctx.cookies.load().label_at(account_index).unwrap_or(""),
                     attempt = loop_idx,
                     scrape_ms,
-                    render_ms = render_started.elapsed().as_millis(),
                     total_ms = process_started.elapsed().as_millis(),
-                    "embed rendered"
+                    "post scraped"
                 );
-                return html_response(body);
+                return Ok(post);
             }
             Err(e) if is_retryable(&e) && loop_idx + 1 < order.len() => {
                 if n > 0 {
@@ -999,16 +995,12 @@ async fn process(state: &AppState, request: PostRequest<'_>) -> Response {
                     total_ms = process_started.elapsed().as_millis(),
                     "embed render failed"
                 );
-                return error_response(state, path, e);
+                return Err(e);
             }
         }
     }
 
-    error_response(
-        state,
-        path,
-        last_err.unwrap_or_else(|| FacebedError::no_data(String::from("no accounts available"))),
-    )
+    Err(last_err.unwrap_or_else(|| FacebedError::no_data(String::from("no accounts available"))))
 }
 
 // Discord's embed crawler aborts ~10.0s after fetch start (measured 2026-07-16
@@ -1319,6 +1311,140 @@ mod tests {
             fetch_limit: Arc::new(tokio::sync::Semaphore::new(0)),
             metrics: Arc::new(Metrics::default()),
             started_at: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_share_discovery_uses_normalized_activity_cache_without_warming() {
+        for (resolved, normalized) in [
+            ("reel/123/?mibextid=tracking", "reel/123/"),
+            ("videos/123/?rdid=tracking", "reel/123/"),
+            (
+                "groups/example/?multi_permalinks=123",
+                "groups/example/posts/123/",
+            ),
+            ("alice/photos/caption/123/?fs=e", "photo.php?fbid=123"),
+            (
+                "alice/posts/123?comment_id=456&fs=e",
+                "alice/posts/123?comment_id=456",
+            ),
+        ] {
+            let state = test_state(); // No fetch permits: discovery must not scrape.
+            state.embed_cache.lock().unwrap().insert_share(
+                "share/r/example/".into(),
+                resolved.into(),
+                Instant::now(),
+            );
+            let app = router(state.clone());
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/share/r/example/?mibextid=other")
+                        .header(header::HOST, "facebed.example")
+                        .header(header::USER_AGENT, "Discordbot/2.0")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{resolved}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let link = {
+                let html = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+                let selector =
+                    scraper::Selector::parse("link[type='application/activity+json']").unwrap();
+                html.select(&selector)
+                    .next()
+                    .unwrap()
+                    .value()
+                    .attr("href")
+                    .unwrap()
+                    .to_owned()
+            };
+            let mut post = activity_post();
+            post.url = crate::url_clean::ensure_absolute(normalized);
+            post.author_handle = None;
+            post.author_id = Some("61579685171950".into());
+            let link_id = link.rsplit("/statuses/").next().unwrap();
+            let decoded = crate::activity::decode_status_path(link_id).unwrap();
+            let expected_path = activity_path(&crate::activity::status_id(&post.url).unwrap())
+                .unwrap()
+                .0;
+            assert_eq!(
+                decoded.trim_end_matches('/'),
+                expected_path.trim_end_matches('/'),
+                "{resolved}"
+            );
+            let id = link_id.to_owned();
+            let status_path = url::Url::parse(&link).unwrap().path().to_owned();
+            let request = || {
+                Request::builder()
+                    .uri(&status_path)
+                    .body(Body::empty())
+                    .unwrap()
+            };
+
+            // Cold hydration obeys the fetch cap; it never queues background work.
+            let response = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "2");
+            state
+                .embed_cache
+                .lock()
+                .unwrap()
+                .insert_activity(&id, post, Instant::now());
+            // The very next request can consume the canonical cache entry.
+            let response = app.oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["account"]["acct"], "61579685171950");
+            assert_eq!(json["account"]["username"], "61579685171950");
+        }
+    }
+
+    #[tokio::test]
+    async fn share_discovery_preserves_other_crawlers_and_human_redirects() {
+        let state = test_state();
+        {
+            let mut cache = state.embed_cache.lock().unwrap();
+            cache.insert_share(
+                "share/r/example/".into(),
+                "reel/123/?fs=e".into(),
+                Instant::now(),
+            );
+            cache.insert(
+                "https://facebed.example\nreel/123/",
+                "full cached card".into(),
+                Instant::now(),
+            );
+        }
+        let app = router(state);
+        for ua in ["Slackbot-LinkExpanding 1.0", "TelegramBot", "Mozilla/5.0"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/share/r/example/")
+                        .header(header::HOST, "facebed.example")
+                        .header(header::USER_AGENT, ua)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if ua == "Mozilla/5.0" {
+                assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+                assert_eq!(
+                    response.headers()[header::LOCATION],
+                    "https://www.facebook.com/share/r/example/"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::OK, "{ua}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(&body[..], b"full cached card", "{ua}");
+            }
         }
     }
 
