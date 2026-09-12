@@ -37,9 +37,8 @@ fn status_json_uses_bare_real_handle_without_platform_domain() {
     assert_eq!(json["account"]["id"], "100012345");
     assert_eq!(json["account"]["username"], "example.author");
     assert_eq!(json["account"]["acct"], "example.author");
-    assert_eq!(json["account"]["url"], "");
     assert_eq!(
-        json["url"],
+        json["account"]["url"],
         "https://www.facebook.com/groups/example/posts/123"
     );
 }
