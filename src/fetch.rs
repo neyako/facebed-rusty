@@ -8,7 +8,7 @@ use reqwest::{Client, RequestBuilder};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -17,6 +17,7 @@ tokio::task_local! {
     /// instead of the primary account. Used by the per-request retry loop to
     /// deterministically try fallback cookie accounts.
     pub static ACCOUNT_OVERRIDE: usize;
+    pub static RESPONSE_DEADLINE: Instant;
 }
 
 pub struct Fetcher {
@@ -24,6 +25,7 @@ pub struct Fetcher {
     media_client: Client,
     cookies: Arc<arc_swap::ArcSwap<CookieJar>>,
     media_size_cache: Mutex<MediaSizeCache>,
+    profile_cache: Mutex<HashMap<String, (Option<String>, Instant)>>,
 }
 
 /// Max redirect hops the media proxy will follow.
@@ -52,6 +54,7 @@ pub struct FetchedPage {
     document: Html,
     partial: bool,
     deadline_cut: bool,
+    json_blocks: OnceLock<Vec<JsonBlockText>>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +88,22 @@ impl FetchedPage {
     pub fn was_cut_by_deadline(&self) -> bool {
         self.deadline_cut
     }
+
+    pub fn json_block_texts(&self) -> &[JsonBlockText] {
+        self.json_blocks
+            .get_or_init(|| get_json_block_texts(self.document(), true))
+    }
+
+    /// Reuse blocks decoded while parsing a comment's parent without cloning
+    /// their JSON trees. Later readers can rebuild the cache from the document.
+    pub fn take_json_blocks(&mut self) -> Vec<Value> {
+        self.json_blocks
+            .take()
+            .unwrap_or_else(|| get_json_block_texts(self.document(), true))
+            .into_iter()
+            .filter_map(JsonBlockText::into_json)
+            .collect()
+    }
 }
 
 /// Fallback UA when an account has no `user_agent` set in its cookie file
@@ -101,6 +120,10 @@ const HEADERS: &[(&str, &str)] = &[
     ("sec-fetch-site", "none"),
 ];
 const SHARE_HEAD_USER_AGENT: &str = "python-requests/2.32.3";
+const PROFILE_LOOKUP_BUDGET: Duration = Duration::from_millis(500);
+const PROFILE_CACHE_TTL: Duration = Duration::from_secs(3600);
+const PROFILE_MISS_TTL: Duration = Duration::from_secs(90);
+const PROFILE_CACHE_MAX: usize = 512;
 const VIDEO_HEAD_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Cap on how long [`Fetcher::fetch_until`] will keep streaming a page whose
@@ -186,6 +209,7 @@ impl Fetcher {
             media_client,
             cookies,
             media_size_cache: Mutex::default(),
+            profile_cache: Mutex::default(),
         })
     }
 
@@ -318,7 +342,7 @@ impl Fetcher {
         let now = Instant::now();
         if let Ok(mut cache) = self.media_size_cache.lock() {
             if let Some(value) = cache.get(url, now) {
-                tracing::info!(
+                tracing::debug!(
                     size = ?value,
                     cached = true,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -343,6 +367,9 @@ impl Fetcher {
                     elapsed_ms = started.elapsed().as_millis(),
                     "video size probe failed"
                 );
+                if let Ok(mut cache) = self.media_size_cache.lock() {
+                    cache.insert(url, None, Instant::now());
+                }
                 return None;
             }
         };
@@ -366,7 +393,7 @@ impl Fetcher {
         if let Ok(mut cache) = self.media_size_cache.lock() {
             cache.insert(url, value, Instant::now());
         }
-        tracing::info!(
+        tracing::debug!(
             status = %status,
             size = ?value,
             cached = false,
@@ -380,32 +407,71 @@ impl Fetcher {
         if author_id.is_empty() || !author_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return None;
         }
-        let mut profile_url = Url::parse("https://www.facebook.com/profile.php").ok()?;
-        profile_url.query_pairs_mut().append_pair("id", author_id);
-        let account_count = self.cookies.load().len();
-        let account_order = if account_count == 0 {
-            vec![None]
-        } else {
-            share_account_order(self).into_iter().map(Some).collect()
-        };
-
-        for account_index in account_order {
-            let mut request = self.client.head(profile_url.as_str());
-            for (key, value) in HEADERS {
-                request = request.header(*key, *value);
-            }
-            request = attach_share_identity(self, request, account_index, DEFAULT_USER_AGENT);
-            let Ok(response) = request.send().await else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            if let Some(handle) = profile_handle_from_url(response.url().as_str()) {
-                return Some(handle);
+        if let Ok(cache) = self.profile_cache.lock() {
+            if let Some((value, checked_at)) = cache.get(author_id) {
+                let ttl = if value.is_some() {
+                    PROFILE_CACHE_TTL
+                } else {
+                    PROFILE_MISS_TTL
+                };
+                if checked_at.elapsed() <= ttl {
+                    return value.clone();
+                }
             }
         }
-        None
+        let budget = RESPONSE_DEADLINE
+            .try_with(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(Duration::from_millis(100))
+            })
+            .unwrap_or(PROFILE_LOOKUP_BUDGET)
+            .min(PROFILE_LOOKUP_BUDGET);
+        if budget.is_zero() {
+            return None;
+        }
+        let value = tokio::time::timeout(budget, self.fetch_profile_handle(author_id))
+            .await
+            .unwrap_or(None);
+        if let Ok(mut cache) = self.profile_cache.lock() {
+            // ponytail: bounded FIFO scan; use an LRU only if this small cache grows.
+            if cache.len() >= PROFILE_CACHE_MAX && !cache.contains_key(author_id) {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(id, _)| id.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(author_id.to_owned(), (value.clone(), Instant::now()));
+        }
+        value
+    }
+
+    async fn fetch_profile_handle(&self, author_id: &str) -> Option<String> {
+        let mut profile_url = Url::parse("https://www.facebook.com/profile.php").ok()?;
+        profile_url.query_pairs_mut().append_pair("id", author_id);
+        // Reuse the successful scrape identity. This optional decoration must
+        // never walk the entire cookie pool or prevent a usable embed.
+        let account_index = if self.cookies.load().is_empty() {
+            None
+        } else {
+            Some(ACCOUNT_OVERRIDE.try_with(|index| *index).unwrap_or(0))
+        };
+        let mut request = self.client.head(profile_url.as_str());
+        for (key, value) in HEADERS {
+            request = request.header(*key, *value);
+        }
+        let response = attach_share_identity(self, request, account_index, DEFAULT_USER_AGENT)
+            .send()
+            .await
+            .ok()?;
+        response
+            .status()
+            .is_success()
+            .then(|| profile_handle_from_url(response.url().as_str()))
+            .flatten()
     }
 
     /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
@@ -425,7 +491,7 @@ impl Fetcher {
         let read_started = Instant::now();
         let html = resp.text().await?;
         let read_ms = read_started.elapsed().as_millis();
-        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
+        tracing::debug!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
         self.page_from_html(url, html, post_path, false, false)
     }
 
@@ -492,7 +558,7 @@ impl Fetcher {
                 "partial stream deadline exceeded (cut)"
             );
         }
-        tracing::info!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early || deadline_cut, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
+        tracing::debug!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early || deadline_cut, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
         self.page_from_html(
             url,
             html,
@@ -544,6 +610,7 @@ impl Fetcher {
             document,
             partial,
             deadline_cut,
+            json_blocks: OnceLock::new(),
         };
         let probe_started = Instant::now();
         check_or_raise(&page, post_path)?;
@@ -667,14 +734,14 @@ async fn resolve_share_link_with_accounts(
 
         if let Some(path) = resolve_share_link_head(fetcher, path, Some(account_index)).await {
             if head_target_usable(&path, is_share_v) {
-                tracing::info!(account = %label, resolved = %path, "resolved share link with account head");
+                tracing::debug!(account = %label, resolved = %path, "resolved share link with account head");
                 return Some(ResolvedShare { path });
             }
         }
 
         match resolve_share_link_body(fetcher, path, Some(account_index)).await {
             Ok(resolved) if share_resolution_usable(&resolved) => {
-                tracing::info!(account = %label, resolved = %resolved.path, "resolved share link with account body");
+                tracing::debug!(account = %label, resolved = %resolved.path, "resolved share link with account body");
                 return Some(resolved);
             }
             Ok(resolved) => {
@@ -758,7 +825,7 @@ async fn resolve_share_link_body(
             .trim_start_matches("http://www.facebook.com/")
             .to_owned()
     });
-    tracing::info!(
+    tracing::debug!(
         path = %path,
         account = %share_account_label(fetcher, account_index),
         status = %status,
@@ -801,7 +868,7 @@ async fn resolve_share_link_head(
     let status = resp.status();
     let final_url = resp.url().to_string();
     if final_url == url {
-        tracing::info!(
+        tracing::debug!(
             path = %path,
             account = %share_account_label(fetcher, account_index),
             status = %status,
@@ -813,7 +880,7 @@ async fn resolve_share_link_head(
         return None;
     }
     let resolved = facebook_path_from_url(&final_url);
-    tracing::info!(
+    tracing::debug!(
         path = %path,
         account = %share_account_label(fetcher, account_index),
         status = %status,
@@ -870,6 +937,17 @@ fn facebook_path_from_url(raw: &str) -> Option<String> {
     Some(out)
 }
 
+pub(crate) fn is_named_handle(handle: &str) -> bool {
+    !handle.is_empty()
+        && !handle.eq_ignore_ascii_case("facebook.com")
+        && !handle.eq_ignore_ascii_case("www.facebook.com")
+        && !handle.to_ascii_lowercase().ends_with(".facebook.com")
+        && handle
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+        && handle.bytes().any(|byte| byte.is_ascii_alphabetic())
+}
+
 pub(crate) fn profile_handle_from_url(raw: &str) -> Option<String> {
     let parsed = Url::parse(raw).ok()?;
     if !parsed.host_str().is_some_and(is_facebook_page_host) {
@@ -899,7 +977,7 @@ pub(crate) fn profile_handle_from_url(raw: &str) -> Option<String> {
     {
         return None;
     }
-    Some(handle.to_owned())
+    is_named_handle(handle).then(|| handle.to_owned())
 }
 
 /// Pull the post's canonical URL out of an FB share-page HTML body. Tries
@@ -1129,8 +1207,31 @@ pub fn check_or_raise(page: &FetchedPage, post_path: &str) -> FacebedResult<()> 
     }
 }
 
+#[derive(Default)]
 pub struct JsonBlockText {
     pub text: String,
+    parsed: OnceLock<Option<Value>>,
+}
+
+impl JsonBlockText {
+    pub fn new(text: String) -> Self {
+        Self {
+            text,
+            ..Self::default()
+        }
+    }
+
+    pub fn json(&self) -> Option<&Value> {
+        self.parsed
+            .get_or_init(|| serde_json::from_str(&self.text).ok())
+            .as_ref()
+    }
+
+    fn into_json(self) -> Option<Value> {
+        self.parsed
+            .into_inner()
+            .unwrap_or_else(|| serde_json::from_str(&self.text).ok())
+    }
 }
 
 /// Extract every `<script type=application/json data-content-len=X data-sjs>` JSON blob.
@@ -1145,19 +1246,19 @@ pub fn get_json_block_texts(html: &Html, sort: bool) -> Vec<JsonBlockText> {
         .collect();
 
     if sort {
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.0));
     }
 
     entries
         .into_iter()
-        .map(|(_, text)| JsonBlockText { text })
+        .map(|(_, text)| JsonBlockText::new(text))
         .collect()
 }
 
 pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
     get_json_block_texts(html, sort)
         .into_iter()
-        .filter_map(|block| serde_json::from_str(&block.text).ok())
+        .filter_map(JsonBlockText::into_json)
         .collect()
 }
 
@@ -1165,9 +1266,9 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
 mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
-        head_target_usable, is_group_landing_target, is_post_like_share_target, probe_page_type,
-        profile_handle_from_url, share_resolution_usable, MediaSizeCache, PageType, ResolvedShare,
-        VIDEO_HEAD_CACHE_MAX, VIDEO_HEAD_CACHE_TTL,
+        head_target_usable, is_group_landing_target, is_named_handle, is_post_like_share_target,
+        probe_page_type, profile_handle_from_url, share_resolution_usable, MediaSizeCache,
+        PageType, ResolvedShare, VIDEO_HEAD_CACHE_MAX, VIDEO_HEAD_CACHE_TTL,
     };
     use scraper::Html;
     use std::time::{Duration, Instant};
@@ -1178,6 +1279,14 @@ mod tests {
             facebook_path_from_url("https://www.facebook.com/watch/?v=123&rdid=x"),
             Some("watch/?v=123&rdid=x".into())
         );
+    }
+
+    #[test]
+    fn named_handle_rejects_facebook_domain_decorations() {
+        assert!(is_named_handle("randomstringid"));
+        assert!(!is_named_handle("1321620837694852"));
+        assert!(!is_named_handle("www.facebook.com"));
+        assert!(!is_named_handle("facebook.com"));
     }
 
     #[test]

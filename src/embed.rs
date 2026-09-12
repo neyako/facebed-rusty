@@ -28,7 +28,7 @@ pub fn quote(s: &str) -> String {
     utf8_percent_encode(s, UNSAFE).to_string()
 }
 
-fn escape_attr(s: &str) -> String {
+pub(crate) fn escape_attr(s: &str) -> String {
     encode_quoted_attribute(s).to_string()
 }
 
@@ -37,10 +37,14 @@ fn enc_query(s: &str) -> String {
 }
 
 fn author_label(post: &ParsedPost) -> Cow<'_, str> {
-    post.author_handle.as_deref().map_or_else(
-        || Cow::Borrowed(post.author_name.as_str()),
-        |handle| Cow::Owned(format!("{} (@{handle})", post.author_name)),
-    )
+    post.author_handle
+        .as_deref()
+        .filter(|handle| crate::fetch::is_named_handle(handle))
+        .or(post.author_id.as_deref())
+        .map_or_else(
+            || Cow::Borrowed(post.author_name.as_str()),
+            |handle| Cow::Owned(format!("{} (@{handle})", post.author_name)),
+        )
 }
 
 /// oEmbed link the embed advertises to Discord. Discord reads
@@ -308,6 +312,7 @@ pub fn format_full_post_embed(
     tz_offset: i32,
     activity_origin: Option<&str>,
 ) -> String {
+    let activity_origin = activity_origin.filter(|_| crate::activity::eligible(post));
     let mut images = post.image_links.clone();
     let extra = if images.len() + post.video_links.len() > 4 {
         "contains 4+ media"
@@ -394,6 +399,7 @@ pub fn format_reel_post_embed(
     tz_offset: i32,
     activity_origin: Option<&str>,
 ) -> String {
+    let activity_origin = activity_origin.filter(|_| crate::activity::eligible(post));
     let video_meta = post
         .video_links
         .iter()
@@ -493,6 +499,7 @@ pub fn format_oversized_video_embed(
     tz_offset: i32,
     activity_origin: Option<&str>,
 ) -> String {
+    let activity_origin = activity_origin.filter(|_| crate::activity::eligible(post));
     let thumb = post.thumbnail.clone().unwrap_or_default();
     let post_date = if activity_origin.is_some() {
         String::new()
@@ -886,6 +893,18 @@ mod tests {
             assert!(html.contains("title=Example%20Author%20%28%40example%2Eauthor%29"));
             assert!(html.contains("/users/example.author/statuses/"));
         }
+    }
+
+    #[test]
+    fn numeric_only_author_keeps_activity_render_with_controlled_label() {
+        let mut post = sample_post();
+        post.author_name = "Đặng Khôi".into();
+        post.author_id = Some("1321620837694852".into());
+        post.author_handle = None;
+        let html = format_full_post_embed(&post, 0, Some("https://facebed.example"));
+        assert!(html.contains("Đặng Khôi (@1321620837694852)"));
+        assert!(html.contains(r#"type="application/activity+json""#));
+        assert!(html.contains("/users/1321620837694852/statuses/"));
     }
 
     #[test]

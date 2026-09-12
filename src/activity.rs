@@ -42,7 +42,22 @@ pub fn decode_status_path(id: &str) -> Option<String> {
     Some(url_clean::clean_path(&post_url))
 }
 
+pub fn eligible(post: &crate::parsers::ParsedPost) -> bool {
+    status_id(&post.url).is_some()
+}
+
+fn activity_username(post: &crate::parsers::ParsedPost) -> &str {
+    post.author_handle
+        .as_deref()
+        .filter(|handle| crate::fetch::is_named_handle(handle))
+        .or(post.author_id.as_deref())
+        .unwrap_or("facebed")
+}
+
 pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) -> String {
+    if !eligible(post) {
+        return String::new();
+    }
     let Ok(origin) = Url::parse(public_origin) else {
         return String::new();
     };
@@ -61,11 +76,7 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
     // Discord selects its Activity renderer only for the canonical Mastodon
     // status shape /users/<acct>/statuses/<id>; the REST shape
     // /api/v1/statuses/<id> is fetched but never selected.
-    let username = post
-        .author_handle
-        .as_deref()
-        .or(post.author_id.as_deref())
-        .unwrap_or("facebed");
+    let username = activity_username(post);
     segments
         .push("users")
         .push(username)
@@ -76,21 +87,30 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
 }
 
 pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
-    let username = post
-        .author_handle
-        .as_deref()
-        .or(post.author_id.as_deref())
-        .unwrap_or("facebed");
+    status_json_at_origin(id, post, None)
+}
+
+pub fn status_json_at_origin(
+    id: &str,
+    post: &crate::parsers::ParsedPost,
+    origin: Option<&str>,
+) -> String {
+    let username = activity_username(post);
     let account_id = post.author_id.as_deref().unwrap_or(username);
     let profile_avatar = post
         .author_handle
         .as_deref()
+        .filter(|handle| crate::fetch::is_named_handle(handle))
+        .or(post.author_id.as_deref())
         .and_then(facebook_profile_avatar);
     let avatar = post
         .author_avatar_url
         .as_deref()
         .or(profile_avatar.as_deref())
         .unwrap_or(ACCOUNT_AVATAR_URL);
+    let account_url = origin
+        .map(|origin| format!("{origin}/users/{username}"))
+        .unwrap_or_else(|| post.url.clone());
     let attachments = if post.image_links.is_empty() {
         post.video_links
             .first()
@@ -130,7 +150,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
             "id": account_id, "username": username, "acct": username,
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
-            "note": "", "url": post.url,
+            "note": "", "url": account_url,
             "avatar": avatar, "avatar_static": avatar,
             "header": ACCOUNT_HEADER_URL, "header_static": ACCOUNT_HEADER_URL,
             "followers_count": 0, "following_count": 0, "statuses_count": 0,
