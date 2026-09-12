@@ -331,6 +331,22 @@ fn status_json_uses_facebed_logo_for_avatar_and_banner_for_header() {
 }
 
 #[test]
+fn status_json_uses_numeric_author_id_for_profile_avatar() {
+    let mut post = post("numeric author".to_owned(), vec![]);
+    post.author_handle = None;
+    post.author_avatar_url = None;
+    post.author_id = Some("61579685171950".to_owned());
+
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    assert_eq!(
+        json["account"]["avatar"],
+        "https://graph.facebook.com/61579685171950/picture?type=small"
+    );
+    assert_eq!(json["account"]["username"], "61579685171950");
+}
+
+#[test]
 fn status_json_uses_facebook_profile_picture_when_handle_has_no_embedded_avatar() {
     // Given
     let mut post = post("text-only".to_owned(), vec![]);

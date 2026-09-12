@@ -92,6 +92,8 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
     let profile_avatar = post
         .author_handle
         .as_deref()
+        .filter(|handle| crate::fetch::is_named_handle(handle))
+        .or(post.author_id.as_deref())
         .and_then(facebook_profile_avatar);
     let avatar = post
         .author_avatar_url
