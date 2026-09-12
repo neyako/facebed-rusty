@@ -71,9 +71,6 @@ impl Parser for JsonPostParser {
 
 async fn resolve_author_handle(ctx: &ParserCtx, mut draft: ParsedPostDraft) -> ParsedPost {
     if let Some(author_id) = draft.unresolved_author_id {
-        if author_id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return draft.post;
-        }
         if let Some(handle) = ctx.fetcher.resolve_profile_handle(&author_id).await {
             draft.post.author_handle = Some(handle);
         }

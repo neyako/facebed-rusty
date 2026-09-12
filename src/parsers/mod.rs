@@ -100,11 +100,6 @@ impl ParserCtx {
 pub async fn resolve_facebook_author_handle(ctx: &ParserCtx, mut post: ParsedPost) -> ParsedPost {
     if post.author_handle.is_none() {
         if let Some(author_id) = post.author_id.as_deref() {
-            // Numeric IDs are already valid Activity usernames. A profile HEAD
-            // cannot improve them and only adds latency to the crawler path.
-            if author_id.bytes().all(|byte| byte.is_ascii_digit()) {
-                return post;
-            }
             post.author_handle = ctx.fetcher.resolve_profile_handle(author_id).await;
         }
     }

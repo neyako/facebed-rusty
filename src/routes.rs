@@ -537,7 +537,7 @@ async fn catch_all(
     let is_share = RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working);
     if is_share && ua.to_ascii_lowercase().contains("discordbot") {
         if let Some(origin) = activity_origin.as_deref() {
-            return share_activity_response(&state, &working, origin).await;
+            return share_activity_response(&state, &working, origin);
         }
     }
     if is_share {
@@ -639,28 +639,16 @@ async fn catch_all(
     .await
 }
 
-async fn share_activity_response(state: &AppState, path: &str, origin: &str) -> Response {
+fn share_activity_response(state: &AppState, path: &str, origin: &str) -> Response {
     let post_url = url_clean::ensure_absolute(&url_clean::clean_path(path));
     let Some(id) = crate::activity::status_id(&post_url) else {
         return activity_error_response(StatusCode::BAD_REQUEST);
     };
-    let post = match activity_post_for_id(state, &id).await {
-        Ok(post) => post,
-        Err(status) => return activity_error_response(status),
-    };
-    // Use the same author title, provider metadata and real-account discovery
-    // as direct post URLs. A bare Activity link makes Discord generate its own
-    // federated author label, including the Facebook domain.
-    // The completed scrape already populated the advertised Activity ID, so
-    // hydration is a cache read and the Activity media needs no video HEAD.
-    no_store_html_response(render(
-        &post,
-        state.config.load().timezone,
-        PostRequest {
-            path,
-            kind: ParserKind::JsonPost,
-            activity_origin: Some(origin),
-        },
+    let _ = start_activity(state, &id);
+    let activity_url = format!("{origin}/users/facebed/statuses/{id}");
+    let escaped_activity = crate::embed::escape_attr(&activity_url);
+    no_store_html_response(format!(
+        r#"<!DOCTYPE html><html><head><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
     ))
 }
 
@@ -1446,108 +1434,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_and_warm_shares_advertise_ready_activity_with_real_author_metadata() {
-        use std::future::{poll_fn, Future};
-        use std::task::Poll;
-
-        for handle in [Some("themarketinginterns"), None] {
-            let state = test_state(); // Any accidental second scrape returns 503.
-            let path = "share/v/example/";
-            let share_id =
-                crate::activity::status_id(&crate::url_clean::ensure_absolute(path)).unwrap();
-            let (finished, completion) =
-                tokio::sync::watch::channel(StatusCode::SERVICE_UNAVAILABLE);
-            state
-                .pending_activity
-                .lock()
-                .unwrap()
-                .insert(share_id.clone(), completion);
-            let app = router(state.clone());
-            let request = || {
-                Request::builder()
-                    .uri(format!("/{path}"))
-                    .header(header::HOST, "facebed.example")
-                    .header(header::USER_AGENT, "Discordbot/2.0")
-                    .body(Body::empty())
-                    .unwrap()
-            };
-            let mut cold = Box::pin(app.clone().oneshot(request()));
-            assert!(
-                poll_fn(|cx| Poll::Ready(cold.as_mut().poll(cx).is_pending())).await,
-                "discovery must wait for the author instead of advertising a placeholder"
-            );
-
-            let mut post = activity_post();
-            post.author_name = "Uploader".into();
-            post.author_id = Some("61579685171950".into());
-            post.author_handle = handle.map(str::to_owned);
-            post.author_avatar_url = Some("https://scontent.xx.fbcdn.net/uploader.jpg".into());
-            post.url = "https://www.facebook.com/reel/123/".into();
-            post.image_links.clear();
-            post.video_links = vec!["https://video.xx.fbcdn.net/123.mp4".into()];
-            let id = crate::activity::status_id(&post.url).unwrap();
-            {
-                let mut cache = state.embed_cache.lock().unwrap();
-                cache.insert_activity(&id, post.clone(), Instant::now());
-                cache.insert_activity(&share_id, post, Instant::now());
-            }
-            finished.send(StatusCode::OK).unwrap();
-            let response = cold.await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let cold_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let warm = app.clone().oneshot(request()).await.unwrap();
-            assert_eq!(
-                cold_body,
-                to_bytes(warm.into_body(), usize::MAX).await.unwrap()
-            );
-            let username = handle.unwrap_or("61579685171950");
-            let activity_path = format!("/users/{username}/statuses/{id}");
-            {
-                let html = scraper::Html::parse_document(std::str::from_utf8(&cold_body).unwrap());
-                let attr = |selector: &str, name: &str| {
-                    html.select(&scraper::Selector::parse(selector).unwrap())
-                        .next()
-                        .unwrap()
-                        .value()
-                        .attr(name)
-                        .unwrap()
-                        .to_owned()
-                };
-                assert_eq!(
-                    attr("meta[property='og:title']", "content"),
-                    format!("Uploader (@{username})")
-                );
-                assert_eq!(
-                    attr("meta[property='og:site_name']", "content"),
-                    "facebed on Rust"
-                );
-                assert_eq!(
-                    attr("link[type='application/activity+json']", "href"),
-                    format!("https://facebed.example{activity_path}")
-                );
-            }
-            let hydrated = app
-                .oneshot(
-                    Request::builder()
-                        .uri(activity_path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(hydrated.status(), StatusCode::OK);
-            let body = to_bytes(hydrated.into_body(), usize::MAX).await.unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(json["account"]["acct"], username);
-            assert_eq!(
-                json["account"]["avatar"],
-                "https://scontent.xx.fbcdn.net/uploader.jpg"
-            );
-            assert_eq!(json["media_attachments"][0]["type"], "video");
-        }
-    }
-
-    #[tokio::test]
     async fn share_activity_waits_for_completion_and_retains_early_failures() {
         use std::future::{poll_fn, Future};
         use std::task::Poll;
@@ -1641,6 +1527,35 @@ mod tests {
             .await
             .expect("activity response body");
         assert_eq!(&body[..], expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn activity_alias_uses_request_origin_for_account_identity() {
+        let state = test_state();
+        let post = activity_post();
+        let id = crate::activity::status_id(&post.url).unwrap();
+        state
+            .embed_cache
+            .lock()
+            .unwrap()
+            .insert_activity(&id, post, Instant::now());
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/users/example.author/statuses/{id}"))
+                    .header(header::HOST, "preview.example")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["account"]["url"],
+            "https://preview.example/users/example.author"
+        );
     }
 
     #[tokio::test]
