@@ -128,7 +128,7 @@ pub fn author_id_in_node(node: &Value) -> Option<String> {
 pub fn author_handle_in_node(node: &Value) -> Option<String> {
     let node = node.get("owner_as_page").unwrap_or(node);
     val_str_at(node, "username")
-        .filter(|username| !username.is_empty())
+        .filter(|username| crate::fetch::is_named_handle(username))
         .map(str::to_owned)
         .or_else(|| val_str_at(node, "url").and_then(profile_handle_from_url))
 }

@@ -11,6 +11,7 @@ pub const EMBED_CACHE_MAX: usize = 512;
 pub struct EmbedCache {
     entries: HashMap<String, CachedEmbed>,
     activity_entries: HashMap<String, CachedActivity>,
+    share_paths: HashMap<String, (String, Instant)>,
 }
 
 struct CachedEmbed {
@@ -24,6 +25,29 @@ struct CachedActivity {
 }
 
 impl EmbedCache {
+    pub fn get_share(&mut self, path: &str, now: Instant) -> Option<String> {
+        let (resolved, at) = self.share_paths.get(path)?;
+        if now.duration_since(*at) <= EMBED_CACHE_TTL {
+            return Some(resolved.clone());
+        }
+        self.share_paths.remove(path);
+        None
+    }
+
+    pub fn insert_share(&mut self, path: String, resolved: String, now: Instant) {
+        if self.share_paths.len() >= EMBED_CACHE_MAX && !self.share_paths.contains_key(&path) {
+            if let Some(oldest) = self
+                .share_paths
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone())
+            {
+                self.share_paths.remove(&oldest);
+            }
+        }
+        self.share_paths.insert(path, (resolved, now));
+    }
+
     /// Return a cached body for `key` if present and not expired. Expired
     /// entries are removed on access.
     pub fn get(&mut self, key: &str, now: Instant) -> Option<String> {
@@ -134,6 +158,20 @@ mod tests {
             cache.insert(&format!("p/{i}"), "x".into(), now);
         }
         assert!(cache.entries.len() <= EMBED_CACHE_MAX);
+    }
+
+    #[test]
+    fn share_cache_expires_and_bounds_entries() {
+        let mut cache = EmbedCache::default();
+        let now = Instant::now();
+        cache.insert_share("share/r/x".into(), "groups/g/posts/1".into(), now);
+        assert_eq!(
+            cache.get_share("share/r/x", now),
+            Some("groups/g/posts/1".into())
+        );
+        assert!(cache
+            .get_share("share/r/x", now + EMBED_CACHE_TTL + Duration::from_secs(1))
+            .is_none());
     }
 
     #[test]
