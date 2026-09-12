@@ -188,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
             crate::embed_cache::EmbedCache::default(),
         )),
         fetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FETCHES)),
+        pending_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         metrics: Arc::new(crate::routes::Metrics::default()),
         started_at: std::time::Instant::now(),
     };

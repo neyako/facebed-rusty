@@ -21,6 +21,7 @@ use axum::routing::get;
 use axum::Router;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
@@ -40,6 +41,8 @@ pub struct AppState {
     pub fetcher: Arc<Fetcher>,
     pub embed_cache: Arc<std::sync::Mutex<crate::embed_cache::EmbedCache>>,
     pub fetch_limit: Arc<tokio::sync::Semaphore>,
+    pub pending_activity:
+        Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<StatusCode>>>>,
     pub metrics: Arc<Metrics>,
     pub started_at: Instant,
 }
@@ -169,39 +172,98 @@ async fn user_activity_status(
 }
 
 async fn activity_status_for_id(state: AppState, id: String) -> Response {
-    let (path, kind) = match activity_path(&id) {
-        Ok(activity) => activity,
+    let mut completion = match start_activity(&state, &id) {
+        Ok(completion) => completion,
         Err(status) => return activity_error_response(status),
     };
+    // watch retains completion even if the scrape finishes before this request
+    // begins waiting. Notify::notify_waiters would lose that wakeup.
+    if tokio::time::timeout(DISCORD_RESPONSE_BUDGET, completion.changed())
+        .await
+        .is_err()
+    {
+        return activity_error_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let status = *completion.borrow();
+    if status == StatusCode::OK {
+        if let Ok(mut cache) = state.embed_cache.lock() {
+            if let Some(post) = cache.get_activity(&id, Instant::now()) {
+                return json_response(crate::activity::status_json(&id, &post));
+            }
+        }
+        return activity_error_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    activity_error_response(status)
+}
 
+/// Share discovery and Activity hydration join the same bounded scrape.
+fn start_activity(
+    state: &AppState,
+    id: &str,
+) -> Result<tokio::sync::watch::Receiver<StatusCode>, StatusCode> {
+    let path = crate::activity::decode_status_path(id).ok_or(StatusCode::BAD_REQUEST)?;
+    let kind = if RE_SHARE_V.is_match(&path) || RE_SHARE_PR.is_match(&path) {
+        None
+    } else {
+        Some(activity_path(id)?)
+    };
+    let mut pending = state
+        .pending_activity
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    // Check under the pending lock so a completing scrape cannot slip between
+    // the cache lookup and registering its replacement.
     if let Ok(mut cache) = state.embed_cache.lock() {
-        if let Some(post) = cache.get_activity(&id, Instant::now()) {
-            return json_response(crate::activity::status_json(&id, &post));
+        if cache.get_activity(id, Instant::now()).is_some() {
+            let (_, completion) = tokio::sync::watch::channel(StatusCode::OK);
+            return Ok(completion);
         }
     }
-
-    let _permit = match state.fetch_limit.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return activity_error_response(StatusCode::SERVICE_UNAVAILABLE),
-    };
-    let post = match tokio::time::timeout(
-        DISCORD_RESPONSE_BUDGET,
-        crate::fetch::RESPONSE_DEADLINE.scope(
-            Instant::now() + DISCORD_RESPONSE_BUDGET,
-            scrape_with_accounts(&state, &path, kind),
-        ),
-    )
-    .await
-    {
-        Ok(Ok(post)) => post,
-        Ok(Err(_)) => return activity_error_response(StatusCode::NOT_FOUND),
-        Err(_) => return activity_error_response(StatusCode::SERVICE_UNAVAILABLE),
-    };
-
-    if let Ok(mut cache) = state.embed_cache.lock() {
-        cache.insert_activity(&id, post.clone(), Instant::now());
+    if let Some(completion) = pending.get(id) {
+        return Ok(completion.clone());
     }
-    json_response(crate::activity::status_json(&id, &post))
+    let permit = state
+        .fetch_limit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let (finished, completion) = tokio::sync::watch::channel(StatusCode::SERVICE_UNAVAILABLE);
+    pending.insert(id.to_owned(), completion.clone());
+    let state = state.clone();
+    let id = id.to_owned();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            DISCORD_RESPONSE_BUDGET,
+            crate::fetch::RESPONSE_DEADLINE.scope(started + DISCORD_RESPONSE_BUDGET, async {
+                match kind {
+                    None => scrape_share_with_accounts(&state, &path).await,
+                    Some((path, kind)) => scrape_with_accounts(&state, &path, kind).await,
+                }
+            }),
+        )
+        .await;
+        let status = match result {
+            Ok(Ok(post)) => {
+                if let Ok(mut cache) = state.embed_cache.lock() {
+                    if let Some(canonical_id) = crate::activity::status_id(&post.url) {
+                        cache.insert_activity(&canonical_id, post.clone(), Instant::now());
+                    }
+                    cache.insert_activity(&id, post, Instant::now());
+                }
+                StatusCode::OK
+            }
+            Ok(Err(_)) => StatusCode::NOT_FOUND,
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        debug!(path = %path, elapsed_ms = started.elapsed().as_millis(), %status, "activity scrape finished");
+        let _ = finished.send(status);
+        if let Ok(mut pending) = state.pending_activity.lock() {
+            pending.remove(&id);
+        }
+    });
+    Ok(completion)
 }
 
 #[derive(serde::Deserialize)]
@@ -464,6 +526,11 @@ async fn catch_all(
         working = wrapped;
     }
     let is_share = RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working);
+    if is_share && ua.to_ascii_lowercase().contains("discordbot") {
+        if let Some(shell) = share_activity_shell(&state, &working, activity_origin.as_deref()) {
+            return html_response(shell);
+        }
+    }
     if is_share {
         let share_path = url_clean::clean_path(&working);
         let cached = state
@@ -561,6 +628,46 @@ async fn catch_all(
         started,
     )
     .await
+}
+
+fn share_activity_shell(state: &AppState, path: &str, origin: Option<&str>) -> Option<String> {
+    let origin = origin?;
+    let post_url = url_clean::ensure_absolute(&url_clean::clean_path(path));
+    let id = crate::activity::status_id(&post_url)?;
+    start_activity(state, &id).ok()?;
+    let activity_url = format!("{origin}/users/facebed/statuses/{id}");
+    let escaped_post = crate::embed::escape_attr(&post_url);
+    let escaped_activity = crate::embed::escape_attr(&activity_url);
+    Some(format!(
+        r#"<!DOCTYPE html><html><head><title>Facebook post</title><meta property="og:title" content="Facebook post"/><meta property="og:url" content="{escaped_post}"/><link rel="canonical" href="{escaped_post}"/><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
+    ))
+}
+
+async fn scrape_share_with_accounts(
+    state: &AppState,
+    path: &str,
+) -> Result<ParsedPost, FacebedError> {
+    let share_path = url_clean::clean_path(path);
+    let cached = state
+        .embed_cache
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.get_share(&share_path, Instant::now()));
+    let resolved = match cached {
+        Some(resolved) => resolved,
+        None => {
+            let resolved = resolve_share_link(&state.fetcher, path).await?.path;
+            if let Ok(mut cache) = state.embed_cache.lock() {
+                cache.insert_share(share_path, resolved.clone(), Instant::now());
+            }
+            resolved
+        }
+    };
+    let id = crate::activity::status_id(&url_clean::ensure_absolute(&resolved))
+        .ok_or_else(|| FacebedError::no_data("share did not resolve"))?;
+    let (path, kind) =
+        activity_path(&id).map_err(|_| FacebedError::no_data("unsupported share target"))?;
+    scrape_with_accounts(state, &path, kind).await
 }
 
 fn request_origin(headers: &HeaderMap) -> Option<String> {
@@ -1290,9 +1397,90 @@ mod tests {
                 crate::embed_cache::EmbedCache::default(),
             )),
             fetch_limit: Arc::new(tokio::sync::Semaphore::new(0)),
+            pending_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             started_at: Instant::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn share_discovery_joins_one_scrape_without_waiting_or_queueing() {
+        let state = test_state();
+        state.fetch_limit.add_permits(1);
+        let path = "share/v/example/";
+        let id = crate::activity::status_id(&crate::url_clean::ensure_absolute(path)).unwrap();
+        let first = super::share_activity_shell(&state, path, Some("https://embed.example"))
+            .expect("cold discovery");
+        assert!(first.contains(&format!("/users/facebed/statuses/{id}")));
+        assert_eq!(state.fetch_limit.available_permits(), 0);
+        assert_eq!(
+            super::share_activity_shell(&state, path, Some("https://embed.example")),
+            Some(first),
+        );
+        assert_eq!(state.pending_activity.lock().unwrap().len(), 1);
+        let second_id =
+            crate::activity::status_id("https://www.facebook.com/share/v/other/").unwrap();
+        assert!(matches!(
+            super::start_activity(&state, &second_id),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        ));
+        // No await: the spawned fetch has not been polled. The runtime cancels
+        // it on test completion, so this exercises admission without Facebook.
+    }
+
+    #[tokio::test]
+    async fn share_activity_waits_for_completion_and_retains_early_failures() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let state = test_state();
+        let id = crate::activity::status_id("https://www.facebook.com/share/v/example/").unwrap();
+        let (finished, completion) = tokio::sync::watch::channel(StatusCode::SERVICE_UNAVAILABLE);
+        state
+            .pending_activity
+            .lock()
+            .unwrap()
+            .insert(id.clone(), completion);
+        let mut response = Box::pin(super::activity_status_for_id(state.clone(), id.clone()));
+        assert!(poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx).is_pending())).await);
+        let post = activity_post();
+        let expected = crate::activity::status_json(&id, &post);
+        state
+            .embed_cache
+            .lock()
+            .unwrap()
+            .insert_activity(&id, post, Instant::now());
+        finished.send(StatusCode::OK).unwrap();
+        drop(finished);
+        let response = tokio::time::timeout(std::time::Duration::from_millis(100), response)
+            .await
+            .expect("completed scrape must wake Activity hydration");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_bytes()
+        );
+
+        let failed_id =
+            crate::activity::status_id("https://www.facebook.com/share/v/missing/").unwrap();
+        let (finished, completion) = tokio::sync::watch::channel(StatusCode::SERVICE_UNAVAILABLE);
+        finished.send(StatusCode::NOT_FOUND).unwrap();
+        drop(finished);
+        state
+            .pending_activity
+            .lock()
+            .unwrap()
+            .insert(failed_id.clone(), completion);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            super::activity_status_for_id(state, failed_id),
+        )
+        .await
+        .expect("early completion is retained");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
