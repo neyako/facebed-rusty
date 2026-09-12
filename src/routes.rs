@@ -528,7 +528,7 @@ async fn catch_all(
     let is_share = RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working);
     if is_share && ua.to_ascii_lowercase().contains("discordbot") {
         if let Some(shell) = share_activity_shell(&state, &working, activity_origin.as_deref()) {
-            return html_response(shell);
+            return no_store_html_response(shell);
         }
     }
     if is_share {
@@ -636,10 +636,9 @@ fn share_activity_shell(state: &AppState, path: &str, origin: Option<&str>) -> O
     let id = crate::activity::status_id(&post_url)?;
     start_activity(state, &id).ok()?;
     let activity_url = format!("{origin}/users/facebed/statuses/{id}");
-    let escaped_post = crate::embed::escape_attr(&post_url);
     let escaped_activity = crate::embed::escape_attr(&activity_url);
     Some(format!(
-        r#"<!DOCTYPE html><html><head><title>Facebook post</title><meta property="og:title" content="Facebook post"/><meta property="og:url" content="{escaped_post}"/><link rel="canonical" href="{escaped_post}"/><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
+        r#"<!DOCTYPE html><html><head><meta name="robots" content="noindex,noarchive"/><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
     ))
 }
 
@@ -1412,6 +1411,7 @@ mod tests {
         let first = super::share_activity_shell(&state, path, Some("https://embed.example"))
             .expect("cold discovery");
         assert!(first.contains(&format!("/users/facebed/statuses/{id}")));
+        assert!(!first.contains("og:"));
         assert_eq!(state.fetch_limit.available_permits(), 0);
         assert_eq!(
             super::share_activity_shell(&state, path, Some("https://embed.example")),
