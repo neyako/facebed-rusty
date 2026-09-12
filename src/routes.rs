@@ -160,40 +160,49 @@ async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> 
 async fn activity_status(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
 ) -> Response {
-    activity_status_for_id(state, id).await
+    activity_status_for_id(state, id, request_origin(&headers).as_deref()).await
 }
 
 async fn user_activity_status(
     State(state): State<AppState>,
     axum::extract::Path((_username, id)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    activity_status_for_id(state, id).await
+    activity_status_for_id(state, id, request_origin(&headers).as_deref()).await
 }
 
-async fn activity_status_for_id(state: AppState, id: String) -> Response {
-    let mut completion = match start_activity(&state, &id) {
-        Ok(completion) => completion,
-        Err(status) => return activity_error_response(status),
-    };
+async fn activity_status_for_id(state: AppState, id: String, origin: Option<&str>) -> Response {
+    match activity_post_for_id(&state, &id).await {
+        Ok(post) => json_response(match origin {
+            Some(origin) => crate::activity::status_json_at_origin(&id, &post, Some(origin)),
+            None => crate::activity::status_json(&id, &post),
+        }),
+        Err(status) => activity_error_response(status),
+    }
+}
+
+async fn activity_post_for_id(state: &AppState, id: &str) -> Result<ParsedPost, StatusCode> {
+    let mut completion = start_activity(state, id)?;
     // watch retains completion even if the scrape finishes before this request
     // begins waiting. Notify::notify_waiters would lose that wakeup.
     if tokio::time::timeout(DISCORD_RESPONSE_BUDGET, completion.changed())
         .await
         .is_err()
     {
-        return activity_error_response(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let status = *completion.borrow();
     if status == StatusCode::OK {
         if let Ok(mut cache) = state.embed_cache.lock() {
-            if let Some(post) = cache.get_activity(&id, Instant::now()) {
-                return json_response(crate::activity::status_json(&id, &post));
+            if let Some(post) = cache.get_activity(id, Instant::now()) {
+                return Ok(post);
             }
         }
-        return activity_error_response(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    activity_error_response(status)
+    Err(status)
 }
 
 /// Share discovery and Activity hydration join the same bounded scrape.
@@ -527,8 +536,8 @@ async fn catch_all(
     }
     let is_share = RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working);
     if is_share && ua.to_ascii_lowercase().contains("discordbot") {
-        if let Some(shell) = share_activity_shell(&state, &working, activity_origin.as_deref()) {
-            return no_store_html_response(shell);
+        if let Some(origin) = activity_origin.as_deref() {
+            return share_activity_response(&state, &working, origin).await;
         }
     }
     if is_share {
@@ -630,15 +639,28 @@ async fn catch_all(
     .await
 }
 
-fn share_activity_shell(state: &AppState, path: &str, origin: Option<&str>) -> Option<String> {
-    let origin = origin?;
+async fn share_activity_response(state: &AppState, path: &str, origin: &str) -> Response {
     let post_url = url_clean::ensure_absolute(&url_clean::clean_path(path));
-    let id = crate::activity::status_id(&post_url)?;
-    start_activity(state, &id).ok()?;
-    let activity_url = format!("{origin}/users/facebed/statuses/{id}");
-    let escaped_activity = crate::embed::escape_attr(&activity_url);
-    Some(format!(
-        r#"<!DOCTYPE html><html><head><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
+    let Some(id) = crate::activity::status_id(&post_url) else {
+        return activity_error_response(StatusCode::BAD_REQUEST);
+    };
+    let post = match activity_post_for_id(state, &id).await {
+        Ok(post) => post,
+        Err(status) => return activity_error_response(status),
+    };
+    // Use the same author title, provider metadata and real-account discovery
+    // as direct post URLs. A bare Activity link makes Discord generate its own
+    // federated author label, including the Facebook domain.
+    // The completed scrape already populated the advertised Activity ID, so
+    // hydration is a cache read and the Activity media needs no video HEAD.
+    no_store_html_response(render(
+        &post,
+        state.config.load().timezone,
+        PostRequest {
+            path,
+            kind: ParserKind::JsonPost,
+            activity_origin: Some(origin),
+        },
     ))
 }
 
@@ -1403,20 +1425,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_discovery_joins_one_scrape_without_waiting_or_queueing() {
+    async fn share_activity_joins_one_scrape_without_queueing() {
         let state = test_state();
         state.fetch_limit.add_permits(1);
         let path = "share/v/example/";
         let id = crate::activity::status_id(&crate::url_clean::ensure_absolute(path)).unwrap();
-        let first = super::share_activity_shell(&state, path, Some("https://embed.example"))
-            .expect("cold discovery");
-        assert!(first.contains(&format!("/users/facebed/statuses/{id}")));
-        assert!(!first.contains("og:"));
+        let first = super::start_activity(&state, &id).expect("cold scrape");
         assert_eq!(state.fetch_limit.available_permits(), 0);
-        assert_eq!(
-            super::share_activity_shell(&state, path, Some("https://embed.example")),
-            Some(first),
-        );
+        let second = super::start_activity(&state, &id).expect("shared scrape");
+        assert!(first.same_channel(&second));
         assert_eq!(state.pending_activity.lock().unwrap().len(), 1);
         let second_id =
             crate::activity::status_id("https://www.facebook.com/share/v/other/").unwrap();
@@ -1426,6 +1443,108 @@ mod tests {
         ));
         // No await: the spawned fetch has not been polled. The runtime cancels
         // it on test completion, so this exercises admission without Facebook.
+    }
+
+    #[tokio::test]
+    async fn cold_and_warm_shares_advertise_ready_activity_with_real_author_metadata() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        for handle in [Some("themarketinginterns"), None] {
+            let state = test_state(); // Any accidental second scrape returns 503.
+            let path = "share/v/example/";
+            let share_id =
+                crate::activity::status_id(&crate::url_clean::ensure_absolute(path)).unwrap();
+            let (finished, completion) =
+                tokio::sync::watch::channel(StatusCode::SERVICE_UNAVAILABLE);
+            state
+                .pending_activity
+                .lock()
+                .unwrap()
+                .insert(share_id.clone(), completion);
+            let app = router(state.clone());
+            let request = || {
+                Request::builder()
+                    .uri(format!("/{path}"))
+                    .header(header::HOST, "facebed.example")
+                    .header(header::USER_AGENT, "Discordbot/2.0")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let mut cold = Box::pin(app.clone().oneshot(request()));
+            assert!(
+                poll_fn(|cx| Poll::Ready(cold.as_mut().poll(cx).is_pending())).await,
+                "discovery must wait for the author instead of advertising a placeholder"
+            );
+
+            let mut post = activity_post();
+            post.author_name = "Uploader".into();
+            post.author_id = Some("61579685171950".into());
+            post.author_handle = handle.map(str::to_owned);
+            post.author_avatar_url = Some("https://scontent.xx.fbcdn.net/uploader.jpg".into());
+            post.url = "https://www.facebook.com/reel/123/".into();
+            post.image_links.clear();
+            post.video_links = vec!["https://video.xx.fbcdn.net/123.mp4".into()];
+            let id = crate::activity::status_id(&post.url).unwrap();
+            {
+                let mut cache = state.embed_cache.lock().unwrap();
+                cache.insert_activity(&id, post.clone(), Instant::now());
+                cache.insert_activity(&share_id, post, Instant::now());
+            }
+            finished.send(StatusCode::OK).unwrap();
+            let response = cold.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let cold_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let warm = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(
+                cold_body,
+                to_bytes(warm.into_body(), usize::MAX).await.unwrap()
+            );
+            let username = handle.unwrap_or("61579685171950");
+            let activity_path = format!("/users/{username}/statuses/{id}");
+            {
+                let html = scraper::Html::parse_document(std::str::from_utf8(&cold_body).unwrap());
+                let attr = |selector: &str, name: &str| {
+                    html.select(&scraper::Selector::parse(selector).unwrap())
+                        .next()
+                        .unwrap()
+                        .value()
+                        .attr(name)
+                        .unwrap()
+                        .to_owned()
+                };
+                assert_eq!(
+                    attr("meta[property='og:title']", "content"),
+                    format!("Uploader (@{username})")
+                );
+                assert_eq!(
+                    attr("meta[property='og:site_name']", "content"),
+                    "facebed on Rust"
+                );
+                assert_eq!(
+                    attr("link[type='application/activity+json']", "href"),
+                    format!("https://facebed.example{activity_path}")
+                );
+            }
+            let hydrated = app
+                .oneshot(
+                    Request::builder()
+                        .uri(activity_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(hydrated.status(), StatusCode::OK);
+            let body = to_bytes(hydrated.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["account"]["acct"], username);
+            assert_eq!(
+                json["account"]["avatar"],
+                "https://scontent.xx.fbcdn.net/uploader.jpg"
+            );
+            assert_eq!(json["media_attachments"][0]["type"], "video");
+        }
     }
 
     #[tokio::test]
@@ -1441,7 +1560,11 @@ mod tests {
             .lock()
             .unwrap()
             .insert(id.clone(), completion);
-        let mut response = Box::pin(super::activity_status_for_id(state.clone(), id.clone()));
+        let mut response = Box::pin(super::activity_status_for_id(
+            state.clone(),
+            id.clone(),
+            None,
+        ));
         assert!(poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx).is_pending())).await);
         let post = activity_post();
         let expected = crate::activity::status_json(&id, &post);
@@ -1476,7 +1599,7 @@ mod tests {
             .insert(failed_id.clone(), completion);
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            super::activity_status_for_id(state, failed_id),
+            super::activity_status_for_id(state, failed_id, None),
         )
         .await
         .expect("early completion is retained");

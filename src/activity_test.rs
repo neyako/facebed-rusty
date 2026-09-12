@@ -1,4 +1,4 @@
-use super::{alternate_link, decode_status_path, status_id, status_json};
+use super::{alternate_link, decode_status_path, status_id, status_json, status_json_at_origin};
 use crate::parsers::{ParsedPost, PostContext, ReactionKind};
 use serde_json::{json, Value};
 use url::Url;
@@ -41,6 +41,25 @@ fn status_json_uses_bare_real_handle_without_platform_domain() {
         json["account"]["url"],
         "https://www.facebook.com/groups/example/posts/123"
     );
+}
+
+#[test]
+fn status_json_uses_activity_origin_for_account_url() {
+    let post = post("local account".to_owned(), vec![]);
+    let json: Value = serde_json::from_str(&status_json_at_origin(
+        "123",
+        &post,
+        Some("https://facebed.example"),
+    ))
+    .unwrap();
+    assert_eq!(
+        json["account"]["url"],
+        "https://facebed.example/users/example.author"
+    );
+    assert!(!json["account"]["url"]
+        .as_str()
+        .unwrap()
+        .contains("facebook.com"));
 }
 
 #[test]

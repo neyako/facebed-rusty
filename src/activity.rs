@@ -87,6 +87,14 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
 }
 
 pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
+    status_json_at_origin(id, post, None)
+}
+
+pub fn status_json_at_origin(
+    id: &str,
+    post: &crate::parsers::ParsedPost,
+    origin: Option<&str>,
+) -> String {
     let username = activity_username(post);
     let account_id = post.author_id.as_deref().unwrap_or(username);
     let profile_avatar = post
@@ -100,6 +108,9 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         .as_deref()
         .or(profile_avatar.as_deref())
         .unwrap_or(ACCOUNT_AVATAR_URL);
+    let account_url = origin
+        .map(|origin| format!("{origin}/users/{username}"))
+        .unwrap_or_else(|| post.url.clone());
     let attachments = if post.image_links.is_empty() {
         post.video_links
             .first()
@@ -139,7 +150,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
             "id": account_id, "username": username, "acct": username,
             "display_name": post.author_name, "locked": false, "bot": true,
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
-            "note": "", "url": post.url,
+            "note": "", "url": account_url,
             "avatar": avatar, "avatar_static": avatar,
             "header": ACCOUNT_HEADER_URL, "header_static": ACCOUNT_HEADER_URL,
             "followers_count": 0, "following_count": 0, "statuses_count": 0,
