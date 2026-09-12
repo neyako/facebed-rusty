@@ -144,21 +144,25 @@ pub fn author_avatar_in_node(node: &Value) -> Option<String> {
         "profile_pic_url_hd",
         "profilePictureUrl",
     ] {
-        let Some(value) = node.get(key) else {
-            continue;
-        };
-        let Some(raw) = value
-            .as_str()
-            .or_else(|| value.get("uri").and_then(Value::as_str))
-            .or_else(|| value.get("url").and_then(Value::as_str))
-        else {
-            continue;
-        };
-        let Ok(url) = Url::parse(raw) else {
-            continue;
-        };
-        if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
-            return Some(raw.to_owned());
+        let values = node
+            .get(key)
+            .into_iter()
+            .chain(jq::all(node, key))
+            .collect::<Vec<_>>();
+        for value in values {
+            let Some(raw) = value
+                .as_str()
+                .or_else(|| value.get("uri").and_then(Value::as_str))
+                .or_else(|| value.get("url").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            let Ok(url) = Url::parse(raw) else {
+                continue;
+            };
+            if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
+                return Some(raw.to_owned());
+            }
         }
     }
     None

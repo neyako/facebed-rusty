@@ -110,11 +110,14 @@ fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedRe
     let thumbnail =
         thumbnail_in_node(&selected.media).or_else(|| thumbnail_in_node(&selected.context));
 
+    let author_avatar_url =
+        author_avatar_in_node(&owner).or_else(|| find_avatar_for_author_id(&blocks, &owner_id));
+
     Ok(ParsedPost {
         author_name: op_name,
         author_id: Some(owner_id),
         author_handle: author_handle_in_node(&owner),
-        author_avatar_url: author_avatar_in_node(&owner),
+        author_avatar_url,
         context: None,
         text: post_text,
         allow_discord_markdown: false,
@@ -128,6 +131,33 @@ fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedRe
         video_links: vec![video_link],
         thumbnail,
     })
+}
+
+fn find_avatar_for_author_id(blocks: &[Value], author_id: &str) -> Option<String> {
+    blocks
+        .iter()
+        .find_map(|block| find_avatar_node(block, author_id))
+}
+
+fn find_avatar_node(node: &Value, author_id: &str) -> Option<String> {
+    match node {
+        Value::Object(map) => {
+            if node
+                .get("id")
+                .is_some_and(|id| value_matches_id(id, author_id))
+            {
+                if let Some(avatar) = author_avatar_in_node(node) {
+                    return Some(avatar);
+                }
+            }
+            map.values()
+                .find_map(|child| find_avatar_node(child, author_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_avatar_node(child, author_id)),
+        _ => None,
+    }
 }
 
 /// Bug-1 fix: relax the selector. Old Python code required `browser_native_sd_url + creation_story`
@@ -790,9 +820,9 @@ impl ValueExt for Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_message_text, find_owner_with_name, find_video_link, get_reaction_counts,
-        is_deep_dive_shell, owner_has_name, owner_id_for_post, reel_id_from_path,
-        select_content_node,
+        find_avatar_for_author_id, find_message_text, find_owner_with_name, find_video_link,
+        get_reaction_counts, is_deep_dive_shell, owner_has_name, owner_id_for_post,
+        reel_id_from_path, select_content_node,
     };
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node, val_str_at};
     use serde_json::{json, Value};
@@ -1771,5 +1801,17 @@ mod tests {
         assert_eq!(reel_id_from_path("reel/1/2/3"), None);
         assert_eq!(reel_id_from_path("prefix/reel/1"), None);
         assert_eq!(reel_id_from_path("reel/not-a-number"), None);
+    }
+
+    #[test]
+    fn avatar_falls_back_to_matching_owner_block() {
+        let blocks = vec![json!({
+            "video": {"id": "123", "owner": {"id": "42", "name": "Uploader"}},
+            "profile": {"id": "42", "profile_picture": {"uri": "https://img.example/uploader.jpg"}}
+        })];
+        assert_eq!(
+            find_avatar_for_author_id(&blocks, "42").as_deref(),
+            Some("https://img.example/uploader.jpg")
+        );
     }
 }
