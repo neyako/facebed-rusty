@@ -638,7 +638,7 @@ fn share_activity_shell(state: &AppState, path: &str, origin: Option<&str>) -> O
     let activity_url = format!("{origin}/users/facebed/statuses/{id}");
     let escaped_activity = crate::embed::escape_attr(&activity_url);
     Some(format!(
-        r#"<!DOCTYPE html><html><head><meta name="robots" content="noindex,noarchive"/><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
+        r#"<!DOCTYPE html><html><head><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
     ))
 }
 
