@@ -228,7 +228,7 @@ fn status_json_escapes_activity_engagement() {
 fn status_json_renders_safe_group_markdown_as_activity_html() {
     // Given
     let mut post = post(
-        "> quoted <unsafe>&\n# **Heading**\n\\**literal**\n**unmatched".to_owned(),
+        "> quoted <unsafe>&\n# **Heading**\n*(italic)*\n_underscored italic_\n\\**literal**\n**unmatched".to_owned(),
         vec![],
     );
     post.allow_discord_markdown = true;
@@ -240,6 +240,8 @@ fn status_json_renders_safe_group_markdown_as_activity_html() {
     // Then
     assert!(content.contains("<blockquote>quoted &lt;unsafe&gt;&amp;</blockquote>"));
     assert!(content.contains("<strong>Heading</strong>"));
+    assert!(content.contains("<em>(italic)</em>"));
+    assert!(content.contains("<em>underscored italic</em>"));
     assert!(!content.contains("# **Heading**"));
     assert!(content.contains(r"\**literal**"));
     assert!(content.contains("**unmatched"));
