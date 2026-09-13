@@ -42,7 +42,22 @@ pub fn decode_status_path(id: &str) -> Option<String> {
     Some(url_clean::clean_path(&post_url))
 }
 
+pub fn eligible(post: &crate::parsers::ParsedPost) -> bool {
+    status_id(&post.url).is_some()
+}
+
+fn activity_username(post: &crate::parsers::ParsedPost) -> &str {
+    post.author_handle
+        .as_deref()
+        .filter(|handle| crate::fetch::is_named_handle(handle))
+        .or(post.author_id.as_deref())
+        .unwrap_or("facebed")
+}
+
 pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) -> String {
+    if !eligible(post) {
+        return String::new();
+    }
     let Ok(origin) = Url::parse(public_origin) else {
         return String::new();
     };
@@ -61,11 +76,7 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
     // Discord selects its Activity renderer only for the canonical Mastodon
     // status shape /users/<acct>/statuses/<id>; the REST shape
     // /api/v1/statuses/<id> is fetched but never selected.
-    let username = post
-        .author_handle
-        .as_deref()
-        .or(post.author_id.as_deref())
-        .unwrap_or("facebed");
+    let username = activity_username(post);
     segments
         .push("users")
         .push(username)
@@ -76,15 +87,13 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
 }
 
 pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
-    let username = post
-        .author_handle
-        .as_deref()
-        .or(post.author_id.as_deref())
-        .unwrap_or("facebed");
+    let username = activity_username(post);
     let account_id = post.author_id.as_deref().unwrap_or(username);
     let profile_avatar = post
         .author_handle
         .as_deref()
+        .filter(|handle| crate::fetch::is_named_handle(handle))
+        .or(post.author_id.as_deref())
         .and_then(facebook_profile_avatar);
     let avatar = post
         .author_avatar_url
@@ -244,9 +253,9 @@ fn render_activity_markdown_line(output: &mut String, line: &str) {
 }
 
 fn render_activity_inline(output: &mut String, text: &str) {
-    // Facebook text-delighter markers: `**bold**` and `` `code` ``. Markers of
-    // each kind pair up first-with-second, third-with-fourth; unmatched
-    // trailing markers and escaped ones stay literal.
+    // Facebook group Markdown uses `**bold**`, `*italic*`, `_italic_`, and
+    // `` `code` ``. Markers pair first-with-second, third-with-fourth;
+    // unmatched trailing markers and escaped ones stay literal.
     let characters = text.chars().collect::<Vec<_>>();
     let mut bold_markers = Vec::new();
     let mut code_markers = Vec::new();
@@ -274,6 +283,7 @@ fn render_activity_inline(output: &mut String, text: &str) {
     }
 
     let (bold_opens, bold_closes) = pair_activity_markers(&bold_markers);
+    let (italic_opens, italic_closes) = crate::embed::group_italic_markers(&characters);
     let (code_opens, code_closes) = pair_activity_markers(&code_markers);
 
     let mut plain = String::new();
@@ -299,6 +309,18 @@ fn render_activity_inline(output: &mut String, text: &str) {
             flush_activity_text(output, &mut plain);
             output.push_str("</strong>");
             index += 2;
+            continue;
+        }
+        if italic_opens.binary_search(&index).is_ok() {
+            flush_activity_text(output, &mut plain);
+            output.push_str("<em>");
+            index += 1;
+            continue;
+        }
+        if italic_closes.binary_search(&index).is_ok() {
+            flush_activity_text(output, &mut plain);
+            output.push_str("</em>");
+            index += 1;
             continue;
         }
         if code_opens.binary_search(&index).is_ok() {

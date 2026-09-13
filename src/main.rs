@@ -188,13 +188,14 @@ async fn main() -> anyhow::Result<()> {
             crate::embed_cache::EmbedCache::default(),
         )),
         fetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FETCHES)),
+        pending_activity: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         metrics: Arc::new(crate::routes::Metrics::default()),
         started_at: std::time::Instant::now(),
     };
     let app = router(state).layer(
         tower_http::trace::TraceLayer::new_for_http()
-            .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO))
-            .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO)),
+            .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::DEBUG))
+            .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::DEBUG)),
     );
 
     info!("listening on {}", addr);

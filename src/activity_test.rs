@@ -228,7 +228,7 @@ fn status_json_escapes_activity_engagement() {
 fn status_json_renders_safe_group_markdown_as_activity_html() {
     // Given
     let mut post = post(
-        "> quoted <unsafe>&\n# **Heading**\n\\**literal**\n**unmatched".to_owned(),
+        "> quoted <unsafe>&\n# **Heading**\n*(italic)*\n_underscored italic_\n\\**literal**\n**unmatched".to_owned(),
         vec![],
     );
     post.allow_discord_markdown = true;
@@ -240,6 +240,8 @@ fn status_json_renders_safe_group_markdown_as_activity_html() {
     // Then
     assert!(content.contains("<blockquote>quoted &lt;unsafe&gt;&amp;</blockquote>"));
     assert!(content.contains("<strong>Heading</strong>"));
+    assert!(content.contains("<em>(italic)</em>"));
+    assert!(content.contains("<em>underscored italic</em>"));
     assert!(!content.contains("# **Heading**"));
     assert!(content.contains(r"\**literal**"));
     assert!(content.contains("**unmatched"));
@@ -248,7 +250,10 @@ fn status_json_renders_safe_group_markdown_as_activity_html() {
 #[test]
 fn status_json_keeps_non_group_markdown_literal() {
     // Given
-    let post = post("> quote\n# **Heading**".to_owned(), vec![]);
+    let post = post(
+        "> quote\n# **Heading**\n*italic* _italic_".to_owned(),
+        vec![],
+    );
 
     // When
     let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
@@ -258,6 +263,37 @@ fn status_json_keeps_non_group_markdown_literal() {
     assert!(content.contains("&gt; quote<br># **Heading**"));
     assert!(!content.contains("<blockquote>"));
     assert!(!content.contains("<strong>Heading</strong>"));
+    assert!(content.contains("*italic* _italic_"));
+    assert!(!content.contains("<em>"));
+}
+
+#[test]
+fn group_italic_preserves_literal_markers_and_bullets() {
+    for (text, expected) in [
+        (
+            "*(Bản Barebone – RAM & SSD)*",
+            "<em>(Bản Barebone – RAM &amp; SSD)</em>",
+        ),
+        ("*one* and _two_", "<em>one</em> and <em>two</em>"),
+        (
+            "*with **bold** inside*",
+            "<em>with <strong>bold</strong> inside</em>",
+        ),
+        ("* item with *italic*", "• item with <em>italic</em>"),
+        (
+            r"\*literal\* and \_literal\_",
+            r"\*literal\* and \_literal\_",
+        ),
+        ("`*code* _code_`", "<code>*code* _code_</code>"),
+        ("*mismatched_", "*mismatched_"),
+        ("*unmatched", "*unmatched"),
+        (
+            "2 * 3 * 4 and snake_case_name",
+            "2 * 3 * 4 and snake_case_name",
+        ),
+    ] {
+        assert_eq!(super::render_activity_markdown(text), expected, "{text}");
+    }
 }
 
 #[test]
@@ -328,6 +364,22 @@ fn status_json_uses_facebed_logo_for_avatar_and_banner_for_header() {
         "https://facebed.neyahub.com/banner.png"
     );
     assert_eq!(json["account"]["header_static"], json["account"]["header"]);
+}
+
+#[test]
+fn status_json_uses_numeric_author_id_for_profile_avatar() {
+    let mut post = post("numeric author".to_owned(), vec![]);
+    post.author_handle = None;
+    post.author_avatar_url = None;
+    post.author_id = Some("61579685171950".to_owned());
+
+    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+
+    assert_eq!(
+        json["account"]["avatar"],
+        "https://graph.facebook.com/61579685171950/picture?type=small"
+    );
+    assert_eq!(json["account"]["username"], "61579685171950");
 }
 
 #[test]

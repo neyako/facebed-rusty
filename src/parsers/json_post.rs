@@ -1,5 +1,5 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::{get_json_block_texts, FetchedPage, JsonBlockText};
+use crate::fetch::{FetchedPage, JsonBlockText};
 use crate::jq;
 use crate::parsers::util::{
     contains_bytes, interaction_counts_with_reaction_ids, JsonBlockScanner, Story,
@@ -45,7 +45,7 @@ impl Parser for JsonPostParser {
                         // budget re-reading the same shell — classify as
                         // no-data instead of timing out.
                         if page.was_cut_by_deadline()
-                            && !page_has_post_root(&get_json_block_texts(page.document(), true))
+                            && !page_has_post_root(page.json_block_texts())
                         {
                             return Err(FacebedError::no_data(format!(
                                 "facebook served a gated or throttled shell for {post_path} (cut)"
@@ -94,14 +94,14 @@ fn parse_page(
     page: &FetchedPage,
 ) -> FacebedResult<ParsedPostDraft> {
     let html = page.document();
-    let blocks = get_json_block_texts(html, true);
+    let blocks = page.json_block_texts();
     let canonical_post_id = canonical_page_post_id(html);
-    let Some(post_json) = get_post_json_for_page(&blocks, post_id, canonical_post_id.as_deref())
+    let Some(post_json) = get_post_json_for_page(blocks, post_id, canonical_post_id.as_deref())
     else {
         // Zero recognizable post roots anywhere → Facebook served an empty
         // hydration shell (gated group, throttled variant). No data, not a
         // parser bug — don't page the webhook with 5 MB of shell HTML.
-        if !page_has_post_root(&blocks) {
+        if !page_has_post_root(blocks) {
             return Err(FacebedError::no_data(format!(
                 "facebook served an empty shell for {post_path}"
             )));
@@ -112,7 +112,7 @@ fn parse_page(
             page.url.clone(),
         ));
     };
-    let root = get_root_node(&post_json).ok_or_else(|| {
+    let root = get_root_node(post_json).ok_or_else(|| {
         FacebedError::parse_with("Cannot process post", page.html.clone(), page.url.clone())
     })?;
     let story_json = root.pointer("/content/story").ok_or_else(|| {
@@ -214,15 +214,15 @@ fn interaction_identity_candidates(
 
 /// Select the requested story using its URL ID or Facebook's page-canonical post ID.
 #[cfg(test)]
-fn get_post_json(blocks: &[JsonBlockText], post_id: Option<&str>) -> Option<Value> {
+fn get_post_json<'a>(blocks: &'a [JsonBlockText], post_id: Option<&str>) -> Option<&'a Value> {
     get_post_json_for_page(blocks, post_id, None)
 }
 
-fn get_post_json_for_page(
-    blocks: &[JsonBlockText],
+fn get_post_json_for_page<'a>(
+    blocks: &'a [JsonBlockText],
     post_id: Option<&str>,
     canonical_post_id: Option<&str>,
-) -> Option<Value> {
+) -> Option<&'a Value> {
     // First pass: id-aware match.
     if let Some(pid) = post_id {
         for block in blocks {
@@ -231,10 +231,10 @@ fn get_post_json_for_page(
             if !contains_candidate_id {
                 continue;
             }
-            let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
+            let Some(bloc) = block.json() else {
                 continue;
             };
-            let Some(story) = get_root_node(&bloc).and_then(|root| root.pointer("/content/story"))
+            let Some(story) = get_root_node(bloc).and_then(|root| root.pointer("/content/story"))
             else {
                 continue;
             };
@@ -251,10 +251,10 @@ fn get_post_json_for_page(
         // route config). The permalink target always lives in `data.node_v2` —
         // bind to it instead.
         for block in blocks {
-            let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
+            let Some(bloc) = block.json() else {
                 continue;
             };
-            let Some(data) = jq::first(&bloc, "data") else {
+            let Some(data) = jq::first(bloc, "data") else {
                 continue;
             };
             let is_permalink_target = data
@@ -273,10 +273,10 @@ fn get_post_json_for_page(
         if !block.text.contains("i18n_reaction_count") {
             continue;
         }
-        let Ok(bloc) = serde_json::from_str::<Value>(&block.text) else {
+        let Some(bloc) = block.json() else {
             continue;
         };
-        if jq::has(&bloc, &["i18n_reaction_count"]) {
+        if jq::has(bloc, &["i18n_reaction_count"]) {
             return Some(bloc);
         }
     }
@@ -322,6 +322,7 @@ fn canonical_page_post_id(html: &scraper::Html) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn should_try_partial_fetch(post_id: Option<&str>) -> bool {
     post_id.is_some_and(|pid| partial_fetch_mode(pid).is_some())
 }
@@ -485,8 +486,8 @@ fn group_handle_from_post_path(post_path: &str) -> Option<&str> {
 fn page_has_post_root(blocks: &[JsonBlockText]) -> bool {
     blocks
         .iter()
-        .filter_map(|block| serde_json::from_str::<Value>(&block.text).ok())
-        .any(|bloc| get_root_node(&bloc).is_some())
+        .filter_map(JsonBlockText::json)
+        .any(|bloc| get_root_node(bloc).is_some())
 }
 
 fn get_root_node(post_json: &Value) -> Option<&Value> {
@@ -524,8 +525,8 @@ mod tests {
     use serde_json::json;
 
     fn post_block(story_url: &str, marker: &str) -> JsonBlockText {
-        JsonBlockText {
-            text: json!({
+        JsonBlockText::new(
+            json!({
                 "i18n_reaction_count": "1",
                 "data": {
                     "comet_ufi_summary_and_actions_renderer": {},
@@ -537,7 +538,7 @@ mod tests {
                 }
             })
             .to_string(),
-        }
+        )
     }
 
     #[test]
@@ -545,8 +546,7 @@ mod tests {
         // The request pfbid appears only inside a route config (no story), and
         // the permalink story block carries a different URL-local pfbid token
         // plus a numeric post id — exactly what FB serves for 615… accounts.
-        let route = JsonBlockText {
-            text: json!({
+        let route = JsonBlockText::new(json!({
                 "require": [
                     {
                         "__bbox": {
@@ -559,10 +559,8 @@ mod tests {
                     }
                 ]
             })
-            .to_string(),
-        };
-        let target = JsonBlockText {
-            text: json!({
+            .to_string());
+        let target = JsonBlockText::new(json!({
                 "require": [
                     {
                         "__bbox": {
@@ -585,8 +583,7 @@ mod tests {
                     }
                 ]
             })
-            .to_string(),
-        };
+            .to_string());
         let blocks = vec![route, target];
 
         let got = get_post_json(&blocks, Some("pfbidREQUESTED"));
@@ -604,12 +601,12 @@ mod tests {
 
     #[test]
     fn hydration_shell_has_no_post_root() {
-        let shell = JsonBlockText {
-            text: json!({"require": [{"__bbox": {"result": {"data": {
+        let shell = JsonBlockText::new(
+            json!({"require": [{"__bbox": {"result": {"data": {
                 "viewer": {"news_feed": {"edges": []}}
             }}}}]})
             .to_string(),
-        };
+        );
         assert!(!page_has_post_root(&[shell]));
 
         let post = post_block("https://www.facebook.com/foo/posts/123", "x");
@@ -661,7 +658,7 @@ mod tests {
 
         // Then
         assert_eq!(
-            get_root_node(&selected)
+            get_root_node(selected)
                 .and_then(|root| root.pointer("/content/story/post_id"))
                 .and_then(|id| id.as_str()),
             Some("28131981629721302")
@@ -714,7 +711,7 @@ mod tests {
         let selected = get_post_json(&blocks, Some("pfbidREQUESTED")).unwrap();
 
         assert_eq!(
-            get_root_node(&selected)
+            get_root_node(selected)
                 .and_then(|root| root.pointer("/content/story/wwwURL"))
                 .and_then(|url| url.as_str()),
             Some("https://www.facebook.com/dantech0xff/posts/pfbidREQUESTED")
@@ -739,7 +736,8 @@ mod tests {
         target.text = target_json.to_string();
 
         // When
-        let selected = get_post_json(&[target], Some("pfbidREQUESTED"));
+        let blocks = [target];
+        let selected = get_post_json(&blocks, Some("pfbidREQUESTED"));
 
         // Then
         assert!(
@@ -775,7 +773,7 @@ mod tests {
         let selected = get_post_json(&blocks, Some("123")).unwrap();
 
         assert_eq!(
-            get_root_node(&selected)
+            get_root_node(selected)
                 .and_then(|root| root.pointer("/content/story/wwwURL"))
                 .and_then(|url| url.as_str()),
             Some("https://www.facebook.com/dantech0xff/posts/123")

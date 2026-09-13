@@ -1,5 +1,4 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::get_json_blocks;
 use crate::jq;
 use crate::parsers::json_post::parse_fetched_post;
 use crate::parsers::util::{
@@ -166,9 +165,9 @@ impl Parser for CommentParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let comment_id = comment_id_in(post_path)
             .ok_or_else(|| FacebedError::parse("comment path without comment_id"))?;
-        let page = ctx.fetcher.fetch(post_path, true).await?;
+        let mut page = ctx.fetcher.fetch(post_path, true).await?;
         let parent = parse_fetched_post(ctx, post_path, &page).ok();
-        let blocks = get_json_blocks(page.document(), true);
+        let blocks = page.take_json_blocks();
         let Some(node) = find_comment_node(&blocks, &comment_id) else {
             // Deep replies / stale ids aren't server-rendered. NoData (not
             // Parse) so routes falls back to the plain post embed. (ccn)

@@ -91,10 +91,13 @@ fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedRe
         )
     })?;
 
-    let post_url =
-        find_shareable_url(&blocks).unwrap_or_else(|| crate::url_clean::ensure_absolute(post_path));
+    let post_url = find_shareable_url(&selected.context)
+        .or_else(|| find_shareable_url_from_blocks(&blocks, video_id))
+        .unwrap_or_else(|| crate::url_clean::ensure_absolute(post_path));
 
-    let date = find_creation_time(&blocks).unwrap_or(0);
+    let date = find_creation_time(&selected.context)
+        .or_else(|| find_creation_time_from_blocks(&blocks, video_id))
+        .unwrap_or(0);
     let post_text = find_message_text(&blocks, &selected.context, video_id);
 
     let (likes, cmts, shares) = get_reaction_counts(&blocks, is_ig, video_id).unwrap_or((
@@ -110,11 +113,14 @@ fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedRe
     let thumbnail =
         thumbnail_in_node(&selected.media).or_else(|| thumbnail_in_node(&selected.context));
 
+    let author_avatar_url =
+        author_avatar_in_node(&owner).or_else(|| find_avatar_for_author_id(&blocks, &owner_id));
+
     Ok(ParsedPost {
         author_name: op_name,
         author_id: Some(owner_id),
         author_handle: author_handle_in_node(&owner),
-        author_avatar_url: author_avatar_in_node(&owner),
+        author_avatar_url,
         context: None,
         text: post_text,
         allow_discord_markdown: false,
@@ -128,6 +134,33 @@ fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedRe
         video_links: vec![video_link],
         thumbnail,
     })
+}
+
+fn find_avatar_for_author_id(blocks: &[Value], author_id: &str) -> Option<String> {
+    blocks
+        .iter()
+        .find_map(|block| find_avatar_node(block, author_id))
+}
+
+fn find_avatar_node(node: &Value, author_id: &str) -> Option<String> {
+    match node {
+        Value::Object(map) => {
+            if node
+                .get("id")
+                .is_some_and(|id| value_matches_id(id, author_id))
+            {
+                if let Some(avatar) = author_avatar_in_node(node) {
+                    return Some(avatar);
+                }
+            }
+            map.values()
+                .find_map(|child| find_avatar_node(child, author_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_avatar_node(child, author_id)),
+        _ => None,
+    }
 }
 
 /// Bug-1 fix: relax the selector. Old Python code required `browser_native_sd_url + creation_story`
@@ -579,31 +612,50 @@ fn value_matches_id(value: &Value, needle: &str) -> bool {
     }
 }
 
-fn find_shareable_url(blocks: &[Value]) -> Option<String> {
-    for bloc in blocks {
-        for ctx in jq::all(bloc, "short_form_video_context") {
-            if let Some(u) = ctx.get("shareable_url").and_then(|v| v.as_str()) {
-                return Some(u.to_owned());
-            }
-        }
-    }
-    None
+fn find_shareable_url(node: &Value) -> Option<String> {
+    jq::all(node, "short_form_video_context")
+        .into_iter()
+        .find_map(|ctx| {
+            ctx.get("shareable_url")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
-fn find_creation_time(blocks: &[Value]) -> Option<i64> {
-    for bloc in blocks {
-        for ct in jq::all(bloc, "creation_time") {
-            if let Some(n) = ct.as_i64() {
-                return Some(n);
-            }
-            if let Some(s) = ct.as_str() {
-                if let Ok(n) = s.parse() {
-                    return Some(n);
-                }
-            }
-        }
+fn find_shareable_url_from_blocks(blocks: &[Value], video_id: &str) -> Option<String> {
+    blocks
+        .iter()
+        .filter(|block| contains_id(block, video_id))
+        .find_map(find_shareable_url)
+}
+
+fn find_creation_time(node: &Value) -> Option<i64> {
+    jq::all(node, "creation_time").into_iter().find_map(|ct| {
+        ct.as_i64()
+            .or_else(|| ct.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+fn find_creation_time_from_blocks(blocks: &[Value], video_id: &str) -> Option<i64> {
+    blocks
+        .iter()
+        .filter(|block| contains_id(block, video_id))
+        .find_map(find_creation_time)
+}
+
+fn contains_id(node: &Value, video_id: &str) -> bool {
+    if video_id.is_empty() {
+        return false;
     }
-    None
+    match node {
+        Value::Object(map) => {
+            node.get("id")
+                .is_some_and(|id| value_matches_id(id, video_id))
+                || map.values().any(|child| contains_id(child, video_id))
+        }
+        Value::Array(values) => values.iter().any(|child| contains_id(child, video_id)),
+        _ => false,
+    }
 }
 
 fn find_message_text(blocks: &[Value], content_node: &Value, video_id: &str) -> String {
@@ -790,12 +842,31 @@ impl ValueExt for Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_message_text, find_owner_with_name, find_video_link, get_reaction_counts,
-        is_deep_dive_shell, owner_has_name, owner_id_for_post, reel_id_from_path,
-        select_content_node,
+        contains_id, find_avatar_for_author_id, find_message_text, find_owner_with_name,
+        find_video_link, get_reaction_counts, is_deep_dive_shell, owner_has_name,
+        owner_id_for_post, reel_id_from_path, select_content_node,
     };
     use crate::parsers::util::{author_avatar_in_node, author_id_in_node, val_str_at};
     use serde_json::{json, Value};
+
+    #[test]
+    fn metadata_fallback_ignores_unrelated_recommendations() {
+        let blocks = vec![
+            json!({"id": "recommended", "creation_time": 111}),
+            json!({"id": "target", "creation_time": 222, "short_form_video_context": {
+                "shareable_url": "https://www.facebook.com/reel/target"
+            }}),
+        ];
+        assert!(!contains_id(&blocks[0], "target"));
+        assert_eq!(
+            super::find_creation_time_from_blocks(&blocks, "target"),
+            Some(222)
+        );
+        assert_eq!(
+            super::find_shareable_url_from_blocks(&blocks, "target").as_deref(),
+            Some("https://www.facebook.com/reel/target")
+        );
+    }
 
     #[test]
     fn deep_dive_shell_detected_by_delivery_without_creation_story() {
@@ -1771,5 +1842,17 @@ mod tests {
         assert_eq!(reel_id_from_path("reel/1/2/3"), None);
         assert_eq!(reel_id_from_path("prefix/reel/1"), None);
         assert_eq!(reel_id_from_path("reel/not-a-number"), None);
+    }
+
+    #[test]
+    fn avatar_falls_back_to_matching_owner_block() {
+        let blocks = vec![json!({
+            "video": {"id": "123", "owner": {"id": "42", "name": "Uploader"}},
+            "profile": {"id": "42", "profile_picture": {"uri": "https://img.example/uploader.jpg"}}
+        })];
+        assert_eq!(
+            find_avatar_for_author_id(&blocks, "42").as_deref(),
+            Some("https://img.example/uploader.jpg")
+        );
     }
 }
