@@ -159,18 +159,14 @@ async fn oembed(
     State(state): State<AppState>,
     axum::extract::Query(p): axum::extract::Query<OEmbedParams>,
 ) -> Response {
-    if !p.status.is_empty() && p.author.is_empty() {
-        if let Ok(post) = activity_post_for_id(&state, &p.status).await {
-            let handle = post
-                .author_handle
-                .as_deref()
-                .filter(|handle| crate::fetch::is_named_handle(handle))
-                .or(post.author_id.as_deref());
-            let author = handle
-                .map(|handle| format!("{} (@{handle})", post.author_name))
-                .unwrap_or_else(|| post.author_name.clone());
-            return json_response(build_oembed_json(&author, &author, &post.url, "rich"));
-        }
+    if !p.status.is_empty() {
+        return match activity_post_for_id(&state, &p.status).await {
+            Ok(post) => {
+                let author = crate::embed::author_label(&post);
+                json_response(build_oembed_json(&author, &author, &post.url, "rich"))
+            }
+            Err(status) => activity_error_response(status),
+        };
     }
     json_response(build_oembed_json(&p.author, &p.title, &p.url, &p.kind))
 }
@@ -178,25 +174,20 @@ async fn oembed(
 async fn activity_status(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
-    headers: HeaderMap,
 ) -> Response {
-    activity_status_for_id(state, id, request_origin(&headers).as_deref()).await
+    activity_status_for_id(state, id).await
 }
 
 async fn user_activity_status(
     State(state): State<AppState>,
     axum::extract::Path((_username, id)): axum::extract::Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Response {
-    activity_status_for_id(state, id, request_origin(&headers).as_deref()).await
+    activity_status_for_id(state, id).await
 }
 
-async fn activity_status_for_id(state: AppState, id: String, origin: Option<&str>) -> Response {
+async fn activity_status_for_id(state: AppState, id: String) -> Response {
     match activity_post_for_id(&state, &id).await {
-        Ok(post) => json_response(match origin {
-            Some(origin) => crate::activity::status_json_at_origin(&id, &post, Some(origin)),
-            None => crate::activity::status_json(&id, &post),
-        }),
+        Ok(post) => json_response(crate::activity::status_json(&id, &post)),
         Err(status) => activity_error_response(status),
     }
 }
@@ -1454,17 +1445,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_activity_shell_advertises_oembed_and_activity_links() {
-        let response = super::share_activity_response(
-            &test_state(),
-            "share/v/example/",
-            "https://facebed.example",
-        );
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("type=\"application/json+oembed\""));
-        assert!(body.contains("type=\"application/activity+json\""));
-        assert!(body.contains("/oembed.json?status="));
+    async fn share_discovery_resolves_author_label_and_activity_from_same_post() {
+        for handle in [Some("example.author"), None] {
+            let state = test_state();
+            let path = "share/v/example/";
+            let id = crate::activity::status_id(&crate::url_clean::ensure_absolute(path)).unwrap();
+            let mut post = activity_post();
+            post.author_handle = handle.map(str::to_owned);
+            post.author_id = Some("61579685171950".into());
+            post.author_avatar_url = Some("https://img.example/uploader.jpg".into());
+            state
+                .embed_cache
+                .lock()
+                .unwrap()
+                .insert_activity(&id, post.clone(), Instant::now());
+            let app = router(state.clone());
+            let response = super::share_activity_response(&state, path, "https://facebed.example");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let document = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+            let selector = scraper::Selector::parse("link[rel=alternate]").unwrap();
+            let links: Vec<_> = document.select(&selector).collect();
+            assert_eq!(links.len(), 2);
+            for link in links {
+                let url = url::Url::parse(link.value().attr("href").unwrap()).unwrap();
+                let request = Request::builder()
+                    .uri(&url[url::Position::BeforePath..])
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if link.value().attr("type") == Some("application/json+oembed") {
+                    let handle = handle.unwrap_or(post.author_id.as_deref().unwrap());
+                    assert_eq!(
+                        json["author_name"],
+                        format!("{} (@{handle})", post.author_name)
+                    );
+                    assert_eq!(json["title"], json["author_name"]);
+                    assert_eq!(json["author_url"], post.url);
+                    assert_eq!(json["type"], "rich");
+                } else {
+                    assert_eq!(link.value().attr("type"), Some("application/activity+json"));
+                    assert_eq!(
+                        json["account"]["avatar"],
+                        post.author_avatar_url.as_deref().unwrap()
+                    );
+                    assert_eq!(json["content"], post.text);
+                }
+            }
+        }
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/oembed.json?status=invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1480,11 +1520,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(id.clone(), completion);
-        let mut response = Box::pin(super::activity_status_for_id(
-            state.clone(),
-            id.clone(),
-            None,
-        ));
+        let mut response = Box::pin(super::activity_status_for_id(state.clone(), id.clone()));
         assert!(poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx).is_pending())).await);
         let post = activity_post();
         let expected = crate::activity::status_json(&id, &post);
@@ -1519,7 +1555,7 @@ mod tests {
             .insert(failed_id.clone(), completion);
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            super::activity_status_for_id(state, failed_id, None),
+            super::activity_status_for_id(state, failed_id),
         )
         .await
         .expect("early completion is retained");
@@ -1564,7 +1600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activity_alias_uses_request_origin_for_account_identity() {
+    async fn activity_alias_keeps_clickable_facebook_post_on_preview_origin() {
         let state = test_state();
         let post = activity_post();
         let id = crate::activity::status_id(&post.url).unwrap();
@@ -1572,7 +1608,7 @@ mod tests {
             .embed_cache
             .lock()
             .unwrap()
-            .insert_activity(&id, post, Instant::now());
+            .insert_activity(&id, post.clone(), Instant::now());
         let response = router(state)
             .oneshot(
                 Request::builder()
@@ -1586,10 +1622,7 @@ mod tests {
             .unwrap();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json["account"]["url"],
-            "https://preview.example/users/example.author"
-        );
+        assert_eq!(json["account"]["url"], post.url);
     }
 
     #[tokio::test]

@@ -36,7 +36,7 @@ fn enc_query(s: &str) -> String {
     utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-fn author_label(post: &ParsedPost) -> Cow<'_, str> {
+pub(crate) fn author_label(post: &ParsedPost) -> Cow<'_, str> {
     post.author_handle
         .as_deref()
         .filter(|handle| crate::fetch::is_named_handle(handle))
