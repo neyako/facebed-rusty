@@ -151,23 +151,9 @@ struct OEmbedParams {
     url: String,
     #[serde(default, rename = "type")]
     kind: String,
-    #[serde(default)]
-    status: String,
 }
 
-async fn oembed(
-    State(state): State<AppState>,
-    axum::extract::Query(p): axum::extract::Query<OEmbedParams>,
-) -> Response {
-    if !p.status.is_empty() {
-        return match activity_post_for_id(&state, &p.status).await {
-            Ok(post) => {
-                let author = crate::embed::author_label(&post);
-                json_response(build_oembed_json(&author, &author, &post.url, "rich"))
-            }
-            Err(status) => activity_error_response(status),
-        };
-    }
+async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> Response {
     json_response(build_oembed_json(&p.author, &p.title, &p.url, &p.kind))
 }
 
@@ -196,9 +182,10 @@ async fn activity_post_for_id(state: &AppState, id: &str) -> Result<ParsedPost, 
     let mut completion = start_activity(state, id)?;
     // watch retains completion even if the scrape finishes before this request
     // begins waiting. Notify::notify_waiters would lose that wakeup.
-    if tokio::time::timeout(DISCORD_RESPONSE_BUDGET, completion.changed())
-        .await
-        .is_err()
+    if *completion.borrow() == StatusCode::SERVICE_UNAVAILABLE
+        && tokio::time::timeout(DISCORD_RESPONSE_BUDGET, completion.changed())
+            .await
+            .is_err()
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -546,7 +533,7 @@ async fn catch_all(
     let is_share = RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working);
     if is_share && ua.to_ascii_lowercase().contains("discordbot") {
         if let Some(origin) = activity_origin.as_deref() {
-            return share_activity_response(&state, &working, origin);
+            return share_activity_response(&state, &working, origin).await;
         }
     }
     if is_share {
@@ -648,18 +635,23 @@ async fn catch_all(
     .await
 }
 
-fn share_activity_response(state: &AppState, path: &str, origin: &str) -> Response {
+async fn share_activity_response(state: &AppState, path: &str, origin: &str) -> Response {
     let post_url = url_clean::ensure_absolute(&url_clean::clean_path(path));
     let Some(id) = crate::activity::status_id(&post_url) else {
         return activity_error_response(StatusCode::BAD_REQUEST);
     };
-    let _ = start_activity(state, &id);
-    let activity_url = format!("{origin}/users/facebed/statuses/{id}");
-    let escaped_activity = crate::embed::escape_attr(&activity_url);
-    let oembed_url = format!("{origin}/oembed.json?status={id}");
-    let escaped_oembed = crate::embed::escape_attr(&oembed_url);
-    no_store_html_response(format!(
-        r#"<!DOCTYPE html><html><head><link rel="alternate" href="{escaped_oembed}" type="application/json+oembed"/><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
+    let post = match activity_post_for_id(state, &id).await {
+        Ok(post) => post,
+        Err(status) => return activity_error_response(status),
+    };
+    no_store_html_response(render(
+        &post,
+        state.config.load().timezone,
+        PostRequest {
+            path,
+            kind: ParserKind::JsonPost,
+            activity_origin: Some(origin),
+        },
     ))
 }
 
@@ -1459,52 +1451,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert_activity(&id, post.clone(), Instant::now());
-            let app = router(state.clone());
-            let response = super::share_activity_response(&state, path, "https://facebed.example");
+            let response =
+                super::share_activity_response(&state, path, "https://facebed.example").await;
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let document = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
-            let selector = scraper::Selector::parse("link[rel=alternate]").unwrap();
-            let links: Vec<_> = document.select(&selector).collect();
-            assert_eq!(links.len(), 2);
-            for link in links {
-                let url = url::Url::parse(link.value().attr("href").unwrap()).unwrap();
-                let request = Request::builder()
-                    .uri(&url[url::Position::BeforePath..])
-                    .body(Body::empty())
-                    .unwrap();
-                let response = app.clone().oneshot(request).await.unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                if link.value().attr("type") == Some("application/json+oembed") {
-                    let handle = handle.unwrap_or(post.author_id.as_deref().unwrap());
-                    assert_eq!(
-                        json["author_name"],
-                        format!("{} (@{handle})", post.author_name)
-                    );
-                    assert_eq!(json["title"], json["author_name"]);
-                    assert_eq!(json["author_url"], post.url);
-                    assert_eq!(json["type"], "rich");
-                } else {
-                    assert_eq!(link.value().attr("type"), Some("application/activity+json"));
-                    assert_eq!(
-                        json["account"]["avatar"],
-                        post.author_avatar_url.as_deref().unwrap()
-                    );
-                    assert_eq!(json["content"], post.text);
-                }
-            }
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let handle = handle.unwrap_or(post.author_id.as_deref().unwrap());
+            assert!(body.contains("type=\"application/json+oembed\""));
+            assert!(body.contains("type=\"application/activity+json\""));
+            assert!(body.contains(&format!("users/{handle}/statuses/")));
+            assert!(body.contains(&format!("{} (@{handle})", post.author_name)));
+            assert!(body.contains("/oembed.json?author="));
         }
-        let response = router(test_state())
-            .oneshot(
-                Request::builder()
-                    .uri("/oembed.json?status=invalid")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
