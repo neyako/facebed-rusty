@@ -258,7 +258,6 @@ fn render_activity_inline(output: &mut String, text: &str) {
     // unmatched trailing markers and escaped ones stay literal.
     let characters = text.chars().collect::<Vec<_>>();
     let mut bold_markers = Vec::new();
-    let mut italic_markers = Vec::new();
     let mut code_markers = Vec::new();
     let mut index = 0;
     while index < characters.len() {
@@ -275,13 +274,6 @@ fn render_activity_inline(output: &mut String, text: &str) {
             index += 2;
             continue;
         }
-        if (characters[index] == '*' || characters[index] == '_')
-            && is_italic_marker(&characters, index)
-        {
-            italic_markers.push(index);
-            index += 1;
-            continue;
-        }
         if characters[index] == '`' {
             code_markers.push(index);
             index += 1;
@@ -291,7 +283,7 @@ fn render_activity_inline(output: &mut String, text: &str) {
     }
 
     let (bold_opens, bold_closes) = pair_activity_markers(&bold_markers);
-    let (italic_opens, italic_closes) = pair_activity_markers(&italic_markers);
+    let (italic_opens, italic_closes) = crate::embed::group_italic_markers(&characters);
     let (code_opens, code_closes) = pair_activity_markers(&code_markers);
 
     let mut plain = String::new();
@@ -347,28 +339,6 @@ fn render_activity_inline(output: &mut String, text: &str) {
         index += 1;
     }
     flush_activity_text(output, &mut plain);
-}
-
-fn is_italic_marker(chars: &[char], index: usize) -> bool {
-    let marker = chars[index];
-    if marker == '*'
-        && (chars.get(index.wrapping_sub(1)) == Some(&'*') || chars.get(index + 1) == Some(&'*'))
-    {
-        return false;
-    }
-    if marker == '_' {
-        let previous = index.checked_sub(1).and_then(|i| chars.get(i));
-        let next = chars.get(index + 1);
-        if previous.is_some_and(|c| c.is_alphanumeric())
-            && next.is_some_and(|c| c.is_alphanumeric())
-        {
-            return false;
-        }
-    }
-    chars
-        .get(index.checked_sub(1).unwrap_or(index))
-        .is_some_and(|c| !c.is_whitespace())
-        || chars.get(index + 1).is_some_and(|c| !c.is_whitespace())
 }
 
 fn pair_activity_markers(markers: &[usize]) -> (Vec<usize>, Vec<usize>) {

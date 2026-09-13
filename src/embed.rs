@@ -166,7 +166,6 @@ fn render_inline(out: &mut String, s: &str) {
     let chars: Vec<char> = s.chars().collect();
 
     let mut markers: Vec<usize> = Vec::new();
-    let mut italic_markers: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '\\' {
@@ -176,11 +175,6 @@ fn render_inline(out: &mut String, s: &str) {
         if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
             markers.push(i);
             i += 2;
-            continue;
-        }
-        if (chars[i] == '*' || chars[i] == '_') && is_group_italic_marker(&chars, i) {
-            italic_markers.push(i);
-            i += 1;
             continue;
         }
         i += 1;
@@ -196,16 +190,7 @@ fn render_inline(out: &mut String, s: &str) {
             closes.insert(pos);
         }
     }
-    let italic_paired = italic_markers.len() - (italic_markers.len() % 2);
-    let mut italic_opens = std::collections::HashSet::new();
-    let mut italic_closes = std::collections::HashSet::new();
-    for (n, &pos) in italic_markers.iter().take(italic_paired).enumerate() {
-        if n % 2 == 0 {
-            italic_opens.insert(pos);
-        } else {
-            italic_closes.insert(pos);
-        }
-    }
+    let (italic_opens, italic_closes) = group_italic_markers(&chars);
 
     let mut i = 0;
     while i < chars.len() {
@@ -238,12 +223,7 @@ fn render_inline(out: &mut String, s: &str) {
             i += 2;
             continue;
         }
-        if (c == '*' || c == '_') && italic_opens.contains(&i) {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if (c == '*' || c == '_') && italic_closes.contains(&i) {
+        if italic_opens.binary_search(&i).is_ok() || italic_closes.binary_search(&i).is_ok() {
             out.push(c);
             i += 1;
             continue;
@@ -258,25 +238,49 @@ fn render_inline(out: &mut String, s: &str) {
     }
 }
 
-fn is_group_italic_marker(chars: &[char], index: usize) -> bool {
-    if chars[index] == '*'
-        && (chars.get(index.wrapping_sub(1)) == Some(&'*') || chars.get(index + 1) == Some(&'*'))
-    {
-        return false;
-    }
-    if chars[index] == '_' {
+/// Pair single, unescaped group emphasis markers. Keep code, bold runs,
+/// intraword underscores, unmatched delimiters, and bullet stars literal.
+pub(crate) fn group_italic_markers(chars: &[char]) -> (Vec<usize>, Vec<usize>) {
+    let (mut opens, mut closes) = (Vec::new(), Vec::new());
+    let mut opening = None;
+    let mut in_code = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let marker = chars[index];
+        if marker == '\\' {
+            index += 2;
+            continue;
+        }
+        if marker == '`' {
+            in_code = !in_code;
+        }
         let previous = index.checked_sub(1).and_then(|i| chars.get(i));
         let next = chars.get(index + 1);
-        if previous.is_some_and(|c| c.is_alphanumeric())
-            && next.is_some_and(|c| c.is_alphanumeric())
+        if !in_code
+            && matches!(marker, '*' | '_')
+            && previous != Some(&marker)
+            && next != Some(&marker)
+            && !(marker == '_'
+                && previous.is_some_and(|c| c.is_alphanumeric())
+                && next.is_some_and(|c| c.is_alphanumeric()))
         {
-            return false;
+            match opening {
+                Some((start, delimiter))
+                    if marker == delimiter && previous.is_some_and(|c| !c.is_whitespace()) =>
+                {
+                    opens.push(start);
+                    closes.push(index);
+                    opening = None;
+                }
+                None if next.is_some_and(|c| !c.is_whitespace()) => {
+                    opening = Some((index, marker));
+                }
+                _ => {}
+            }
         }
+        index += 1;
     }
-    chars
-        .get(index.checked_sub(1).unwrap_or(index))
-        .is_some_and(|c| !c.is_whitespace())
-        || chars.get(index + 1).is_some_and(|c| !c.is_whitespace())
+    (opens, closes)
 }
 
 fn truncate_chars(s: &str, max: usize) -> &str {
@@ -756,8 +760,22 @@ mod tests {
     #[test]
     fn preserves_group_italic_markdown() {
         assert_eq!(
-            format_description_text("*(italic)* and _underlined italic_", true),
-            "*(italic)* and _underlined italic_"
+            format_description_text("*(italic)* and _italic_", true),
+            "*(italic)* and _italic_"
+        );
+        assert_eq!(
+            format_description_text("*mismatched_", true),
+            r"\*mismatched\_"
+        );
+        assert_eq!(format_description_text("2 * 3 * 4", true), r"2 \* 3 \* 4");
+        assert_eq!(
+            format_description_text("* item with *italic*", true),
+            r"\* item with *italic*"
+        );
+        assert_eq!(format_description_text("`*code*`", true), r"\`\*code\*\`");
+        assert_eq!(
+            format_description_text("*italic* _italic_", false),
+            r"\*italic\* \_italic\_"
         );
     }
 
