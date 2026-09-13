@@ -151,9 +151,27 @@ struct OEmbedParams {
     url: String,
     #[serde(default, rename = "type")]
     kind: String,
+    #[serde(default)]
+    status: String,
 }
 
-async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> Response {
+async fn oembed(
+    State(state): State<AppState>,
+    axum::extract::Query(p): axum::extract::Query<OEmbedParams>,
+) -> Response {
+    if !p.status.is_empty() && p.author.is_empty() {
+        if let Ok(post) = activity_post_for_id(&state, &p.status).await {
+            let handle = post
+                .author_handle
+                .as_deref()
+                .filter(|handle| crate::fetch::is_named_handle(handle))
+                .or(post.author_id.as_deref());
+            let author = handle
+                .map(|handle| format!("{} (@{handle})", post.author_name))
+                .unwrap_or_else(|| post.author_name.clone());
+            return json_response(build_oembed_json(&author, &author, &post.url, "rich"));
+        }
+    }
     json_response(build_oembed_json(&p.author, &p.title, &p.url, &p.kind))
 }
 
@@ -647,8 +665,10 @@ fn share_activity_response(state: &AppState, path: &str, origin: &str) -> Respon
     let _ = start_activity(state, &id);
     let activity_url = format!("{origin}/users/facebed/statuses/{id}");
     let escaped_activity = crate::embed::escape_attr(&activity_url);
+    let oembed_url = format!("{origin}/oembed.json?status={id}");
+    let escaped_oembed = crate::embed::escape_attr(&oembed_url);
     no_store_html_response(format!(
-        r#"<!DOCTYPE html><html><head><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
+        r#"<!DOCTYPE html><html><head><link rel="alternate" href="{escaped_oembed}" type="application/json+oembed"/><link rel="alternate" href="{escaped_activity}" type="application/activity+json"/></head></html>"#
     ))
 }
 
@@ -1431,6 +1451,20 @@ mod tests {
         ));
         // No await: the spawned fetch has not been polled. The runtime cancels
         // it on test completion, so this exercises admission without Facebook.
+    }
+
+    #[tokio::test]
+    async fn share_activity_shell_advertises_oembed_and_activity_links() {
+        let response = super::share_activity_response(
+            &test_state(),
+            "share/v/example/",
+            "https://facebed.example",
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("type=\"application/json+oembed\""));
+        assert!(body.contains("type=\"application/activity+json\""));
+        assert!(body.contains("/oembed.json?status="));
     }
 
     #[tokio::test]
