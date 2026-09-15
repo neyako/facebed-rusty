@@ -1,9 +1,9 @@
 name: CI/CD
 on:
   push:
-    branches: ["main", "rust"]
+    branches: ["main"]
   pull_request:
-    branches: ["main", "rust"]
+    branches: ["main"]
   workflow_dispatch:
 
 env:
