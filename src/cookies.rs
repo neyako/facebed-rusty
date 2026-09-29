@@ -405,6 +405,14 @@ impl CookieJar {
         Some(&self.accounts[i % self.accounts.len()].label)
     }
 
+    /// Account indices in configured priority, healthy ones first and
+    /// cooled-down ones as a last resort.
+    pub fn priority_order(&self) -> Vec<usize> {
+        let (healthy, cooled): (Vec<usize>, Vec<usize>) =
+            (0..self.len()).partition(|&i| !self.in_cooldown(i));
+        healthy.into_iter().chain(cooled).collect()
+    }
+
     /// Account index previously known to succeed for this scope key.
     pub fn affinity_for(&self, key: &str) -> Option<usize> {
         self.affinity.lock().ok()?.get(key).copied()

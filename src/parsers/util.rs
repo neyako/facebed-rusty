@@ -89,6 +89,15 @@ pub fn val_str(v: &Value) -> String {
     }
 }
 
+/// FB ids arrive as strings or numbers depending on the payload.
+pub fn value_matches_id(value: &Value, id: &str) -> bool {
+    match value {
+        Value::String(s) => s == id,
+        Value::Number(n) => n.to_string() == id,
+        _ => false,
+    }
+}
+
 pub fn val_str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
@@ -469,23 +478,6 @@ pub fn extract_link_card(story_json: &Value) -> Option<(String, String)> {
     None
 }
 
-#[allow(dead_code)]
-pub fn interaction_counts(
-    post_json: &Value,
-    post_id: Option<&str>,
-) -> Result<(String, String, String), FacebedError> {
-    let (reactions, comments, shares, _) = interaction_counts_with_reactions(post_json, post_id)?;
-    Ok((reactions, comments, shares))
-}
-
-pub fn interaction_counts_with_reactions(
-    post_json: &Value,
-    post_id: Option<&str>,
-) -> Result<(String, String, String, Vec<ReactionKind>), FacebedError> {
-    let ids = post_id.into_iter().collect::<Vec<_>>();
-    interaction_counts_with_reaction_ids(post_json, &ids)
-}
-
 pub fn interaction_counts_with_reaction_ids(
     post_json: &Value,
     post_ids: &[&str],
@@ -652,11 +644,29 @@ fn parse_reaction_number(value: &str) -> Option<f64> {
 mod tests {
     use super::{
         author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
-        images_from_post, interaction_counts, interaction_counts_with_reactions,
-        top_reactions_from_feedback, Story,
+        images_from_post, interaction_counts_with_reaction_ids, top_reactions_from_feedback, Story,
     };
+    use crate::error::FacebedError;
     use crate::parsers::ReactionKind;
     use serde_json::json;
+    use serde_json::Value;
+
+    fn interaction_counts(
+        post_json: &Value,
+        post_id: Option<&str>,
+    ) -> Result<(String, String, String), FacebedError> {
+        let (reactions, comments, shares, _) =
+            interaction_counts_with_reactions(post_json, post_id)?;
+        Ok((reactions, comments, shares))
+    }
+
+    fn interaction_counts_with_reactions(
+        post_json: &Value,
+        post_id: Option<&str>,
+    ) -> Result<(String, String, String, Vec<ReactionKind>), FacebedError> {
+        let ids = post_id.into_iter().collect::<Vec<_>>();
+        interaction_counts_with_reaction_ids(post_json, &ids)
+    }
 
     #[test]
     fn human_format_expands_thousands_without_a_suffix() {

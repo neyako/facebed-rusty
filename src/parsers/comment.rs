@@ -164,7 +164,7 @@ impl Parser for CommentParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let comment_id = comment_id_in(post_path)
             .ok_or_else(|| FacebedError::parse("comment path without comment_id"))?;
-        let mut page = ctx.fetcher.fetch(post_path, true).await?;
+        let mut page = ctx.fetcher.fetch(post_path).await?;
         let parent = parse_fetched_post(ctx, post_path, &page).ok();
         let blocks = page.take_json_blocks();
         let Some(node) = find_comment_node(&blocks, &comment_id) else {

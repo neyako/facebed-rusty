@@ -20,7 +20,7 @@ static WATCH_FEED_RE: LazyLock<Regex> =
 
 impl Parser for VideoWatchParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
+        let page = ctx.fetcher.fetch(post_path).await?;
         let html = page.document();
         let blocks = get_json_blocks(html, true);
         let target_video_id = target_video_id(post_path);
@@ -223,15 +223,7 @@ fn owner_name_from_candidate(owner: &Value) -> Option<String> {
 fn block_mentions_id(block: &Value, needle: &str) -> bool {
     jq::all(block, "id")
         .into_iter()
-        .any(|value| value_matches_id(value, needle))
-}
-
-fn value_matches_id(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(s) => s == needle,
-        Value::Number(n) => n.to_string() == needle,
-        _ => false,
-    }
+        .any(|value| crate::parsers::util::value_matches_id(value, needle))
 }
 
 fn get_content_node(

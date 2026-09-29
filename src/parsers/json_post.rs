@@ -29,7 +29,7 @@ impl Parser for JsonPostParser {
             {
                 let page = ctx
                     .fetcher
-                    .fetch_until(post_path, true, |bytes| match &mode {
+                    .fetch_until(post_path, |bytes| match &mode {
                         PartialFetchMode::PostId => scanner.found_match(bytes, &pid),
                         PartialFetchMode::PermalinkNode => scanner.found_permalink_target(bytes),
                     })
@@ -61,7 +61,7 @@ impl Parser for JsonPostParser {
         }
 
         let parsed = {
-            let page = ctx.fetcher.fetch(post_path, true).await?;
+            let page = ctx.fetcher.fetch(post_path).await?;
             parse_page(ctx, post_path, post_id.as_deref(), &page)
         };
         Ok(resolve_author_handle(ctx, parsed?).await)
@@ -285,21 +285,13 @@ fn get_post_json_for_page<'a>(
 fn story_matches_post_id(story: &Value, post_id: &str) -> bool {
     story
         .get("post_id")
-        .is_some_and(|value| value_matches_post_id(value, post_id))
+        .is_some_and(|value| crate::parsers::util::value_matches_id(value, post_id))
         || story
             .get("wwwURL")
             .and_then(Value::as_str)
             .and_then(canonical_story_post_id)
             .as_deref()
             == Some(post_id)
-}
-
-fn value_matches_post_id(value: &Value, post_id: &str) -> bool {
-    match value {
-        Value::String(value) => value == post_id,
-        Value::Number(value) => value.to_string() == post_id,
-        _ => false,
-    }
 }
 
 static PAGE_CANONICAL_LINK_SEL: LazyLock<scraper::Selector> =

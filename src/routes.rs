@@ -208,7 +208,7 @@ fn start_activity(
     id: &str,
 ) -> Result<tokio::sync::watch::Receiver<StatusCode>, StatusCode> {
     let path = crate::activity::decode_status_path(id).ok_or(StatusCode::BAD_REQUEST)?;
-    let kind = if RE_SHARE_V.is_match(&path) || RE_SHARE_PR.is_match(&path) {
+    let kind = if is_share_path(&path) {
         None
     } else {
         Some(activity_path(id)?)
@@ -364,11 +364,13 @@ static RE_SLUGGED_PHOTO: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/photos/[^/?]+/(\d+)/?(?:\?.*)?$").unwrap());
 static RE_PHOTO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
 static RE_WATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^/*watch").unwrap());
-static RE_SHARE_V: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
-static RE_SHARE_PR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(/)?share/([pr]/)?[a-zA-Z0-9\-._]*(/)?").unwrap());
 static RE_STORIES: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/?stories/\d+/[A-Za-z0-9=_-]+").unwrap());
+
+/// `share/`, `share/v/`, `share/p/`, `share/r/` short links, resolved by redirect.
+fn is_share_path(path: &str) -> bool {
+    path.trim_start_matches('/').starts_with("share/")
+}
 
 fn is_facebook_url(path: &str) -> bool {
     let full = format!("https://www.facebook.com/{path}");
@@ -443,7 +445,7 @@ async fn catch_all(
     if let Some(wrapped) = url_clean::extract_share_url(&working) {
         working = wrapped;
     }
-    let is_share = RE_SHARE_V.is_match(&working) || RE_SHARE_PR.is_match(&working);
+    let is_share = is_share_path(&working);
     if is_share && ua.to_ascii_lowercase().contains("discordbot") {
         if let Some(origin) = activity_origin.as_deref() {
             return share_activity_response(&state, &working, origin).await;
@@ -1112,19 +1114,17 @@ fn final_error(mut failed: Vec<(Option<usize>, FacebedError)>) -> FacebedError {
 /// this group/profile hoisted to the front, then cooled-down accounts as a
 /// last resort. An empty jar yields `[None]` (one guest attempt).
 fn account_order(jar: &crate::cookies::CookieJar, key: Option<&str>) -> Vec<Option<usize>> {
-    let n = jar.len();
-    if n == 0 {
+    if jar.is_empty() {
         return vec![None];
     }
-    let (mut healthy, cooled): (Vec<usize>, Vec<usize>) =
-        (0..n).partition(|&i| !jar.in_cooldown(i));
+    let mut order = jar.priority_order();
     if let Some(pref) = key.and_then(|k| jar.affinity_for(k)) {
-        if let Some(pos) = healthy.iter().position(|&i| i == pref) {
-            let pref = healthy.remove(pos);
-            healthy.insert(0, pref);
+        if let Some(pos) = order.iter().position(|&i| i == pref && !jar.in_cooldown(i)) {
+            let pref = order.remove(pos);
+            order.insert(0, pref);
         }
     }
-    healthy.into_iter().chain(cooled).map(Some).collect()
+    order.into_iter().map(Some).collect()
 }
 
 // Discord's embed crawler aborts ~10.0s after fetch start (measured 2026-07-16

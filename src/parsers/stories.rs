@@ -26,7 +26,7 @@ pub struct StoriesParser;
 
 impl Parser for StoriesParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
+        let page = ctx.fetcher.fetch(post_path).await?;
         let html = page.document();
         let blocks = get_json_blocks(html, true);
         let (bucket, node) = find_story_bucket_and_node(&blocks).ok_or_else(|| {

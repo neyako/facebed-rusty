@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(fb_path) = args.dump.as_deref() {
         let page = fetcher
-            .fetch(fb_path, true)
+            .fetch(fb_path)
             .await
             .map_err(|e| anyhow::anyhow!("dump fetch failed: {e}"))?;
         std::fs::create_dir_all(&args.dump_dir)?;

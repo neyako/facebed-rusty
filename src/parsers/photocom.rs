@@ -12,7 +12,7 @@ pub struct PhotocomParser;
 
 impl Parser for PhotocomParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
+        let page = ctx.fetcher.fetch(post_path).await?;
         let html = page.document();
         let blocks = get_json_blocks(html, true);
         // `type=3` also tags plain album photos (`photo.php?fbid=..&set=a.<album>`).

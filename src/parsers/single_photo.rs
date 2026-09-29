@@ -13,7 +13,7 @@ pub struct SinglePhotoParser;
 
 impl Parser for SinglePhotoParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
+        let page = ctx.fetcher.fetch(post_path).await?;
         parse_page(post_path, &page)
     }
 }

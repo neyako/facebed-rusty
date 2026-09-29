@@ -27,13 +27,6 @@ pub struct Fetcher {
     profile_cache: Mutex<HashMap<String, (Option<String>, Instant)>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageType {
-    HasData,
-    LoginWall,
-    Unknown,
-}
-
 pub struct FetchedPage {
     pub url: String,
     pub html: String,
@@ -448,10 +441,10 @@ impl Fetcher {
     }
 
     /// Fetch a Facebook path. Optionally attach cookies. Raises LoginWall on login walls.
-    pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
+    pub async fn fetch(&self, post_path: &str) -> FacebedResult<FetchedPage> {
         let started = Instant::now();
         let url = facebook_fetch_url(post_path)?;
-        let (req, account_label) = self.request_for(&url, use_cookies);
+        let (req, account_label) = self.request_for(&url);
         let resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
@@ -474,7 +467,6 @@ impl Fetcher {
     pub async fn fetch_until<F>(
         &self,
         post_path: &str,
-        use_cookies: bool,
         mut should_stop: F,
     ) -> FacebedResult<FetchedPage>
     where
@@ -482,7 +474,7 @@ impl Fetcher {
     {
         let started = Instant::now();
         let url = facebook_fetch_url(post_path)?;
-        let (req, account_label) = self.request_for(&url, use_cookies);
+        let (req, account_label) = self.request_for(&url);
         let mut resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
@@ -541,7 +533,9 @@ impl Fetcher {
         )
     }
 
-    fn request_for(&self, url: &str, use_cookies: bool) -> (RequestBuilder, String) {
+    /// GET `url` as the attempt's identity: the account in [`ACCOUNT_OVERRIDE`]
+    /// (account 0 outside a race), or no cookies for guest (`None`).
+    fn request_for(&self, url: &str) -> (RequestBuilder, String) {
         let mut req = self.client.get(url);
         for (k, v) in HEADERS {
             req = req.header(*k, *v);
@@ -549,14 +543,12 @@ impl Fetcher {
         let mut account_label = String::new();
         let mut user_agent: &str = DEFAULT_USER_AGENT;
         let guard = self.cookies.load();
-        if use_cookies {
-            let index = ACCOUNT_OVERRIDE.try_with(|i| *i).unwrap_or(Some(0));
-            if let Some(acc) = index.and_then(|i| guard.account_at(i)) {
-                account_label = acc.label.clone();
-                req = req.header("cookie", acc.header_value());
-                if let Some(ua) = acc.user_agent.as_deref() {
-                    user_agent = ua;
-                }
+        let index = ACCOUNT_OVERRIDE.try_with(|i| *i).unwrap_or(Some(0));
+        if let Some(acc) = index.and_then(|i| guard.account_at(i)) {
+            account_label = acc.label.clone();
+            req = req.header("cookie", acc.header_value());
+            if let Some(ua) = acc.user_agent.as_deref() {
+                user_agent = ua;
             }
         }
         (req.header("user-agent", user_agent), account_label)
@@ -646,12 +638,7 @@ async fn resolve_share_link_public(
         }
     }
 
-    let resolved = resolve_share_link_body(fetcher, path, None).await?;
-    if share_resolution_usable(&resolved) {
-        return Ok(resolved);
-    }
-
-    Ok(resolved)
+    resolve_share_link_body(fetcher, path, None).await
 }
 
 fn is_share_v_path(path: &str) -> bool {
@@ -693,7 +680,7 @@ async fn resolve_share_link_with_accounts(
     path: &str,
     is_share_v: bool,
 ) -> Option<ResolvedShare> {
-    for account_index in share_account_order(fetcher) {
+    for account_index in fetcher.cookies.load().priority_order() {
         let label = fetcher
             .cookies
             .load()
@@ -726,21 +713,6 @@ async fn resolve_share_link_with_accounts(
         }
     }
     None
-}
-
-fn share_account_order(fetcher: &Fetcher) -> Vec<usize> {
-    let guard = fetcher.cookies.load();
-    let n = guard.len();
-    let mut healthy = Vec::new();
-    let mut cooled = Vec::new();
-    for i in 0..n {
-        if guard.in_cooldown(i) {
-            cooled.push(i);
-        } else {
-            healthy.push(i);
-        }
-    }
-    healthy.into_iter().chain(cooled).collect()
 }
 
 async fn resolve_share_link_body(
@@ -1139,42 +1111,28 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-pub fn probe_page_type(html: &Html, body: &str) -> PageType {
-    if let Some(el) = html.select(&CANONICAL_LINK_SEL).next() {
-        if let Some(href) = el.value().attr("href") {
-            if LOGIN_HREF_RE.is_match(href) {
-                return PageType::LoginWall;
-            }
-        }
-    }
-    if let Some(el) = html.select(&REFRESH_META_SEL).next() {
-        if let Some(content) = el.value().attr("content") {
-            if LOGIN_META_RE.is_match(content) {
-                return PageType::LoginWall;
-            }
-        }
-    }
-
-    let has_post_data = body.contains("i18n_reaction_count");
-    let has_login_preloader =
-        body.contains("login_data") || body.contains("useCometLogInFormQuery");
-
-    if has_post_data {
-        PageType::HasData
-    } else if has_login_preloader {
-        PageType::LoginWall
-    } else {
-        PageType::Unknown
-    }
+/// True when Facebook served a login wall instead of the content. A page
+/// that carries post data wins over a stray login preloader.
+pub fn is_login_wall(html: &Html, body: &str) -> bool {
+    let attr_matches = |sel: &Selector, attr: &str, re: &Regex| {
+        html.select(sel)
+            .next()
+            .and_then(|el| el.value().attr(attr))
+            .is_some_and(|value| re.is_match(value))
+    };
+    attr_matches(&CANONICAL_LINK_SEL, "href", &LOGIN_HREF_RE)
+        || attr_matches(&REFRESH_META_SEL, "content", &LOGIN_META_RE)
+        || (!body.contains("i18n_reaction_count")
+            && (body.contains("login_data") || body.contains("useCometLogInFormQuery")))
 }
 
 pub fn check_or_raise(page: &FetchedPage, post_path: &str) -> FacebedResult<()> {
-    match probe_page_type(page.document(), &page.html) {
-        PageType::LoginWall => Err(FacebedError::LoginWall(format!(
+    if is_login_wall(page.document(), &page.html) {
+        return Err(FacebedError::LoginWall(format!(
             "Facebook served a login wall for {post_path} - content requires authentication"
-        ))),
-        _ => Ok(()),
+        )));
     }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1236,9 +1194,9 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
 mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
-        head_target_usable, is_group_landing_target, is_named_handle, is_post_like_share_target,
-        probe_page_type, profile_handle_from_url, share_resolution_usable, MediaSizeCache,
-        PageType, ResolvedShare, VIDEO_HEAD_CACHE_MAX, VIDEO_HEAD_CACHE_TTL,
+        head_target_usable, is_group_landing_target, is_login_wall, is_named_handle,
+        is_post_like_share_target, profile_handle_from_url, share_resolution_usable,
+        MediaSizeCache, ResolvedShare, VIDEO_HEAD_CACHE_MAX, VIDEO_HEAD_CACHE_TTL,
     };
     use scraper::Html;
     use std::time::{Duration, Instant};
@@ -1406,17 +1364,17 @@ mod tests {
     }
 
     #[test]
-    fn probe_page_type_uses_raw_post_data_fast_path() {
-        let body = r#"<script type="application/json">{"i18n_reaction_count":"1K"}</script>"#;
+    fn login_wall_ignores_preloader_when_post_data_present() {
+        let body = r#"<script>{"i18n_reaction_count":"1K","login_data":{}}</script>"#;
         let doc = Html::parse_document(body);
-        assert_eq!(probe_page_type(&doc, body), PageType::HasData);
+        assert!(!is_login_wall(&doc, body));
     }
 
     #[test]
-    fn probe_page_type_detects_raw_login_preloader() {
+    fn login_wall_detects_raw_login_preloader() {
         let body = r#"<script>{"queryName":"useCometLogInFormQuery","login_data":{}}</script>"#;
         let doc = Html::parse_document(body);
-        assert_eq!(probe_page_type(&doc, body), PageType::LoginWall);
+        assert!(is_login_wall(&doc, body));
     }
 
     #[test]
