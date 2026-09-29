@@ -152,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
             while hup.recv().await.is_some() {
                 match CookieJar::load_strict(&cookies_path) {
                     Ok(new_jar) => {
+                        new_jar.inherit_state(&jar.load());
                         let n = new_jar.len();
                         jar.store(Arc::new(new_jar));
                         info!("reloaded {n} cookie account(s) on SIGHUP");

@@ -88,7 +88,8 @@ each as either:
 
 `useragents.json` next to them maps labels to a user agent. At startup every account
 is checked live against Facebook; bad ones page the webhook. `SIGHUP` reloads config
-and cookies (`CookieJar::load_strict`: a malformed file keeps the running jar).
+and cookies (`CookieJar::load_strict`: a malformed file keeps the running jar;
+`inherit_state` keeps affinity, and cooldowns for accounts whose cookie is unchanged).
 
 ## Architecture
 

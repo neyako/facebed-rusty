@@ -413,6 +413,33 @@ impl CookieJar {
         Some(&self.accounts[i % self.accounts.len()].label)
     }
 
+    /// Carry runtime state from the jar a SIGHUP reload replaces. Affinity
+    /// follows the label (same Facebook account). Cooldown and failure counts
+    /// carry over only if the cookie is unchanged: a re-exported cookie is
+    /// usually the fix for them, so it starts clean.
+    pub fn inherit_state(&self, old: &CookieJar) {
+        let index_of = |label: &str| self.accounts.iter().position(|a| a.label == label);
+        for (j, previous) in old.accounts.iter().enumerate() {
+            let Some(i) = index_of(&previous.label) else {
+                continue;
+            };
+            if previous.header_value() == self.accounts[i].header_value() {
+                let until = old.cooldown_until[j].load(Ordering::Relaxed);
+                let failures = old.consecutive_failures[j].load(Ordering::Relaxed);
+                self.cooldown_until[i].store(until, Ordering::Relaxed);
+                self.consecutive_failures[i].store(failures, Ordering::Relaxed);
+            }
+        }
+        let (Ok(previous), Ok(mut current)) = (old.affinity.lock(), self.affinity.lock()) else {
+            return;
+        };
+        for (key, &j) in previous.iter() {
+            if let Some(i) = old.accounts.get(j).and_then(|a| index_of(&a.label)) {
+                current.insert(key.clone(), i);
+            }
+        }
+    }
+
     /// Account indices in configured priority, healthy ones first and
     /// cooled-down ones as a last resort.
     pub fn priority_order(&self) -> Vec<usize> {
@@ -476,6 +503,28 @@ mod tests {
         fs::write(dir.path().join("cookies-bad.json"), "{not json").unwrap();
         assert_eq!(CookieJar::load(&main).unwrap().len(), 1);
         assert!(CookieJar::load_strict(&main).is_err());
+    }
+
+    #[test]
+    fn reload_keeps_affinity_and_only_keeps_health_for_unchanged_cookies() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        let alice = dir.path().join("cookies-alice.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        fs::write(&alice, r#"[{"name":"c_user","value":"2"}]"#).unwrap();
+        let old = CookieJar::load(&main).unwrap();
+        let (default, alice_index) = (0, 1);
+        old.mark_failed(default);
+        old.mark_failed(alice_index);
+        old.set_affinity("groups/1".into(), alice_index);
+
+        // alice re-exported her cookie; default is untouched.
+        fs::write(&alice, r#"[{"name":"c_user","value":"3"}]"#).unwrap();
+        let new = CookieJar::load(&main).unwrap();
+        new.inherit_state(&old);
+        assert!(new.in_cooldown(default));
+        assert!(!new.in_cooldown(alice_index));
+        assert_eq!(new.affinity_for("groups/1"), Some(alice_index));
     }
 
     #[test]
