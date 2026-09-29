@@ -48,7 +48,8 @@ pub(super) async fn scrape_with_accounts(
 /// The first identity in `order` starts at once. The next starts as soon as
 /// an attempt fails, or after [`ACCOUNT_HEDGE_AFTER`] without a result, and
 /// the first success wins (the rest are aborted). Only healthy accounts are
-/// used as a slow-read hedge; with a single account the hedge re-runs it.
+/// used as a slow-read hedge; with a single account the hedge re-runs it, and
+/// that re-read is dropped if it is not done within [`ACCOUNT_HEDGE_AFTER`].
 ///
 /// Guest (no cookies) is the last resort, started only after a failure:
 /// public page posts still load when the author blocked our account or the
@@ -93,14 +94,23 @@ where
     let mut solo_hedge = queue.is_empty();
     let mut guest_fallback = first.is_some();
     let mut tasks = tokio::task::JoinSet::new();
-    let spawn = |tasks: &mut tokio::task::JoinSet<_>, identity: Option<usize>| {
+    // `reread`: the identity already has an attempt running. A re-read only
+    // helps if it is fast; one still running after ACCOUNT_HEDGE_AFTER is
+    // slow-dripped too and can never overtake the original, so it is dropped
+    // (`None`) instead of holding the response until it is cut.
+    let spawn = |tasks: &mut tokio::task::JoinSet<_>, identity: Option<usize>, reread: bool| {
         let fut = attempt(identity);
         tasks.spawn(crate::fetch::RESPONSE_DEADLINE.scope(deadline, async move {
             let started = TokioInstant::now();
-            (identity, started.elapsed(), fut.await)
+            let result = if reread {
+                tokio::time::timeout(ACCOUNT_HEDGE_AFTER, fut).await.ok()
+            } else {
+                Some(fut.await)
+            };
+            (identity, started.elapsed(), result)
         }));
     };
-    spawn(&mut tasks, first);
+    spawn(&mut tasks, first, false);
     let mut hedge_at = race_started + ACCOUNT_HEDGE_AFTER;
     let mut failed: Vec<(Option<usize>, FacebedError)> = Vec::new();
     let mut penalized: Vec<usize> = Vec::new();
@@ -108,8 +118,8 @@ where
     loop {
         let hedge = match queue.front() {
             Some(Some(i)) if state.ctx.cookies.load().in_cooldown(*i) => None,
-            Some(next) => Some(*next),
-            None if solo_hedge => Some(first),
+            Some(next) => Some((*next, false)),
+            None if solo_hedge => Some((first, true)),
             None => None,
         }
         .filter(|_| hedge_at <= last_start);
@@ -118,6 +128,15 @@ where
                 let Some(joined) = joined else { break };
                 let Ok((identity, elapsed, result)) = joined else {
                     warn!(path = %path, "scrape attempt aborted");
+                    continue;
+                };
+                let Some(result) = result else {
+                    info!(
+                        path = %path,
+                        account = %label(identity),
+                        race_ms = race_started.elapsed().as_millis(),
+                        "dropping slow re-read"
+                    );
                     continue;
                 };
                 match result {
@@ -165,15 +184,15 @@ where
                             std::mem::take(&mut guest_fallback).then_some(None)
                         });
                         if let Some(next) = next.filter(|_| TokioInstant::now() <= last_start) {
-                            spawn(&mut tasks, next);
+                            spawn(&mut tasks, next, false);
                             hedge_at = TokioInstant::now() + ACCOUNT_HEDGE_AFTER;
                         }
                     }
                 }
             }
             _ = tokio::time::sleep_until(hedge_at), if hedge.is_some() => {
-                let next = hedge.flatten();
-                if queue.front() == Some(&next) {
+                let Some((next, reread)) = hedge else { continue };
+                if !reread {
                     queue.pop_front();
                 }
                 solo_hedge = false;
@@ -183,7 +202,7 @@ where
                     race_ms = race_started.elapsed().as_millis(),
                     "slow scrape; hedging with another attempt"
                 );
-                spawn(&mut tasks, next);
+                spawn(&mut tasks, next, reread);
                 hedge_at = TokioInstant::now() + ACCOUNT_HEDGE_AFTER;
             }
         }
@@ -299,9 +318,12 @@ mod tests {
 
     use std::sync::Arc;
 
-    #[tokio::test(start_paused = true)]
-    async fn slow_first_read_loses_to_hedge_after_guest_fails() {
-        use crate::error::FacebedError;
+    /// One account: its first read is cut at 4.8s, the 3s re-read takes
+    /// `reread_ms` and succeeds, guest (started on the failure) hits a login
+    /// wall. Returns the outcome, the race duration, and the attempt count.
+    async fn race_one_slow_account(
+        reread_ms: u64,
+    ) -> (Result<ParsedPost, FacebedError>, std::time::Duration, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -317,11 +339,9 @@ mod tests {
         let attempt = |identity: Option<usize>| {
             let call = calls.fetch_add(1, Ordering::SeqCst);
             async move {
-                // Account slow-drips and is cut at 4.8s; its 3s hedge twin is
-                // fast; guest (started on the failure) hits a login wall.
                 let (delay, result) = match (identity, call) {
                     (Some(0), 0) => (4800, Err(FacebedError::no_data("cut"))),
-                    (Some(0), _) => (2700, Ok(activity_post())),
+                    (Some(0), _) => (reread_ms, Ok(activity_post())),
                     (None, _) => (700, Err(FacebedError::LoginWall("guest".into()))),
                     _ => unreachable!(),
                 };
@@ -329,6 +349,7 @@ mod tests {
                 result
             }
         };
+        let started = tokio::time::Instant::now();
         let result = super::race_identities(
             &state,
             "groups/1/posts/2/",
@@ -338,9 +359,24 @@ mod tests {
             attempt,
         )
         .await;
-        assert!(result.is_ok());
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(!state.ctx.cookies.load().in_cooldown(0));
+        (result, started.elapsed(), calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_reread_wins_after_the_first_read_and_guest_fail() {
+        let (result, elapsed, calls) = race_one_slow_account(2700).await;
+        assert!(result.is_ok());
+        assert_eq!(elapsed.as_millis(), 5700);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_reread_is_dropped_instead_of_holding_the_response() {
+        // The re-read would finish at 7s; it is dropped 3s after it started.
+        let (result, elapsed, _) = race_one_slow_account(4000).await;
+        assert!(matches!(result, Err(FacebedError::NoData(_))));
+        assert_eq!(elapsed.as_millis(), 6000);
     }
 
     #[test]

@@ -200,8 +200,10 @@ attachment (no reqwest cookie store).
 cooled-down last). The next identity starts on failure **or** after `ACCOUNT_HEDGE_AFTER`
 (3s) with no result; first success wins and the rest are aborted. FB randomly
 slow-drips page bodies (~0.3 MB/s vs ~2 MB/s), so the hedge matters even with one
-account: then it re-runs the same account. Only healthy accounts hedge; nothing starts
-with less than `ATTEMPT_MIN_REMAINING` (3s) of budget left. `fetch::ACCOUNT_OVERRIDE`
+account: then it re-runs the same account, and drops that re-read if it isn't done
+within 3s (a slow re-read can never overtake the original on the same page; waiting
+for it only delayed private-group errors to ~7.7s). Only healthy accounts hedge;
+nothing starts with less than `ATTEMPT_MIN_REMAINING` (3s) of budget left. `fetch::ACCOUNT_OVERRIDE`
 carries the attempt's identity (`Some(index)` or `None` = guest).
 
 Guest (no cookies) is the last resort, started only after a failure, never as the
