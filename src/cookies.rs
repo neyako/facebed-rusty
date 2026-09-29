@@ -122,6 +122,7 @@ impl CookieJar {
     ///
     /// Each file may be either:
     ///   - Cookie-Editor flat array `[{name, value, ...}, ...]` → 1 account, label from filename
+    ///     (also accepted wrapped as `{"url": ..., "cookies": [...]}`)
     ///   - Multi-account object `{"accounts": [{"label": "...", "entries": [...]}, ...]}`
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         Self::load_with(path, false)
@@ -197,6 +198,13 @@ impl CookieJar {
     fn load_file(path: &Path) -> anyhow::Result<Vec<CookieAccount>> {
         let raw = std::fs::read_to_string(path)?;
         let v: serde_json::Value = serde_json::from_str(&raw)?;
+        // `{"url": ..., "cookies": [...]}` exports wrap the flat array.
+        let v = match v {
+            serde_json::Value::Object(mut map) if map.contains_key("cookies") => {
+                map.remove("cookies").unwrap_or_default()
+            }
+            v => v,
+        };
 
         let fname_label = path
             .file_stem()
@@ -486,7 +494,11 @@ mod tests {
 
         fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
         fs::write(&alice, r#"[{"name":"c_user","value":"2"}]"#).unwrap();
-        fs::write(&two, r#"[{"name":"c_user","value":"3"}]"#).unwrap();
+        fs::write(
+            &two,
+            r#"{"url":"https://www.facebook.com","cookies":[{"name":"c_user","value":"3"}]}"#,
+        )
+        .unwrap();
         fs::write(&example, r#"[{"name":"c_user","value":"99"}]"#).unwrap();
 
         let jar = CookieJar::load(&main).unwrap();

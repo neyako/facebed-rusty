@@ -87,7 +87,8 @@ and every JSON block, exit; the input for parser fixtures).
 Cookies are optional. `cookies.json` plus every sibling `cookies*.json` is loaded,
 each as either:
 - a flat Cookie-Editor array: one account, labeled from the file name
-  (`cookies-alice.json` → `alice`, `cookies.json` → `default`), or
+  (`cookies-alice.json` → `alice`, `cookies.json` → `default`), also accepted
+  wrapped as `{"url": ..., "cookies": [...]}`, or
 - `{"accounts": [{"label": ..., "entries": [...]}]}`: several accounts.
 
 `useragents.json` next to them maps labels to a user agent. At startup every account
