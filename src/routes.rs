@@ -60,36 +60,30 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn root() -> impl IntoResponse {
-    match tokio::fs::read_to_string("assets/index.html").await {
-        Ok(s) => {
-            let body = s.replace("{|CREDIT|}", crate::embed::credit());
-            html_response(body)
-        }
-        Err(_) => (StatusCode::NOT_FOUND, "").into_response(),
-    }
+// Assets are compiled in, so the binary needs no files beside it.
+static INDEX_HTML: LazyLock<String> = LazyLock::new(|| {
+    include_str!("../assets/index.html").replace("{|CREDIT|}", crate::embed::credit())
+});
+
+async fn root() -> Response {
+    html_response(INDEX_HTML.clone())
 }
 
-async fn favicon() -> impl IntoResponse {
-    static_asset("assets/favicon.ico", "image/x-icon").await
+async fn favicon() -> Response {
+    static_asset(include_bytes!("../assets/favicon.ico"), "image/x-icon")
 }
 
-async fn banner() -> impl IntoResponse {
-    static_asset("assets/banner.png", "image/png").await
+async fn banner() -> Response {
+    static_asset(include_bytes!("../assets/banner.png"), "image/png")
 }
 
-async fn static_asset(path: &str, ct: &'static str) -> Response {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static(ct),
-            );
-            (StatusCode::OK, headers, bytes).into_response()
-        }
-        Err(_) => (StatusCode::NOT_FOUND, "").into_response(),
-    }
+fn static_asset(bytes: &'static [u8], content_type: &'static str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    (StatusCode::OK, headers, bytes).into_response()
 }
 
 fn html_response(body: String) -> Response {
