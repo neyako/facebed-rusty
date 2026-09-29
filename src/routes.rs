@@ -54,7 +54,6 @@ pub fn router(state: AppState) -> Router {
         .route("/favicon.ico", get(favicon))
         .route("/banner.png", get(banner))
         .route("/healthz", get(healthz))
-        .route("/media", get(media))
         .route("/api/v1/statuses/:id", get(activity_status))
         .route("/users/:username/statuses/:id", get(user_activity_status))
         .route("/*path", get(catch_all))
@@ -272,70 +271,6 @@ fn start_activity(
         }
     });
     Ok(completion)
-}
-
-#[derive(serde::Deserialize)]
-struct MediaParams {
-    #[serde(default)]
-    u: String,
-}
-
-const MAX_MEDIA_BYTES: u64 = 30 * 1024 * 1024;
-
-async fn media(
-    State(state): State<AppState>,
-    axum::extract::Query(p): axum::extract::Query<MediaParams>,
-) -> Response {
-    let Ok(parsed) = Url::parse(&p.u) else {
-        return (StatusCode::BAD_REQUEST, "bad url").into_response();
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return (StatusCode::BAD_REQUEST, "bad scheme").into_response();
-    }
-    if !media_target_allowed(&p.u) {
-        return (StatusCode::FORBIDDEN, "host not allowed").into_response();
-    }
-
-    let upstream = match state.fetcher.media_client().get(parsed).send().await {
-        Ok(r) => r,
-        Err(_) => return (StatusCode::BAD_GATEWAY, "upstream error").into_response(),
-    };
-    if !upstream.status().is_success() {
-        return (StatusCode::BAD_GATEWAY, "upstream status").into_response();
-    }
-    if let Some(len) = upstream.content_length() {
-        if len > MAX_MEDIA_BYTES {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "too large").into_response();
-        }
-    }
-
-    let ct = upstream
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
-    let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::CONTENT_TYPE, ct);
-    headers.insert(
-        axum::http::header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400"),
-    );
-    let body = axum::body::Body::from_stream(upstream.bytes_stream());
-    (StatusCode::OK, headers, body).into_response()
-}
-
-/// Returns true iff `u` is a fetchable Facebook media URL.
-fn media_target_allowed(u: &str) -> bool {
-    match Url::parse(u) {
-        Ok(parsed) => {
-            matches!(parsed.scheme(), "http" | "https")
-                && parsed
-                    .host_str()
-                    .map(crate::url_clean::is_facebook_media_host)
-                    .unwrap_or(false)
-        }
-        Err(_) => false,
-    }
 }
 
 async fn healthz(State(state): State<AppState>) -> Response {
@@ -1475,9 +1410,9 @@ fn error_response(state: &AppState, path: &str, e: FacebedError) -> Response {
 mod tests {
     use super::{
         activity_eligible, activity_error_response, activity_path, build_healthz_json,
-        build_oembed_json, group_multi_permalink_path, is_facebook_url, media_target_allowed,
-        normalize_reel_path, request_origin, rewrite_videos_path, router, scope_key, select_kind,
-        strip_comment_id, AppState, Metrics, ParserKind,
+        build_oembed_json, group_multi_permalink_path, is_facebook_url, normalize_reel_path,
+        request_origin, rewrite_videos_path, router, scope_key, select_kind, strip_comment_id,
+        AppState, Metrics, ParserKind,
     };
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
@@ -2211,21 +2146,6 @@ mod tests {
         assert!(json.contains(r#""cookie_accounts":2"#));
         assert!(json.contains(r#""label":"primary""#));
         assert!(json.contains(r#""in_cooldown":true"#));
-    }
-
-    #[test]
-    fn media_guard_blocks_non_facebook_hosts() {
-        assert!(media_target_allowed(
-            "https://scontent.xx.fbcdn.net/v/x.jpg"
-        ));
-        assert!(media_target_allowed("https://video.fbcdn.net/v.mp4"));
-        assert!(!media_target_allowed("https://evil.example.com/x.jpg"));
-        assert!(!media_target_allowed("https://evilfbcdn.net/x.jpg"));
-        assert!(!media_target_allowed("file:///etc/passwd"));
-        assert!(!media_target_allowed(
-            "http://169.254.169.254/latest/meta-data"
-        ));
-        assert!(!media_target_allowed("not a url"));
     }
 
     #[test]
