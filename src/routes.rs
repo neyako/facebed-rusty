@@ -420,28 +420,6 @@ async fn catch_all(
     debug!(path = %path, bot = is_bot, ua = %ua, "request");
     let started = Instant::now();
 
-    // image-in-comment priority
-    if let Ok(parsed) = Url::parse(&format!("https://www.facebook.com/{path}")) {
-        let types: Vec<String> = parsed
-            .query_pairs()
-            .filter(|(k, _)| k == "type")
-            .map(|(_, v)| v.into_owned())
-            .collect();
-        if types.iter().any(|t| t.contains('3')) {
-            let cleaned = url_clean::clean_path(&path);
-            return process_with_deadline(
-                &state,
-                PostRequest {
-                    path: &cleaned,
-                    kind: ParserKind::Photocom,
-                    activity_origin: activity_origin.as_deref(),
-                },
-                started,
-            )
-            .await;
-        }
-    }
-
     // crawler gate
     if !is_bot {
         let target = url_clean::ensure_absolute(&path);
@@ -550,8 +528,10 @@ async fn catch_all(
         working = normalized;
     }
 
-    // dispatch — comment permalinks first, then path-shape routing
-    let kind = if crate::parsers::comment::comment_id_in(&working).is_some() {
+    // dispatch — image-in-comment and comment permalinks first, then path shape
+    let kind = if is_photocom(&working) {
+        ParserKind::Photocom
+    } else if crate::parsers::comment::comment_id_in(&working).is_some() {
         ParserKind::Comment
     } else {
         match select_kind(&working) {
@@ -722,6 +702,17 @@ fn select_kind(working: &str) -> Option<ParserKind> {
     }
 }
 
+/// `type=3` marks image-in-comment photo links (and, it turns out, plain
+/// album photos; [`PhotocomParser`] falls back to a single-photo embed).
+fn is_photocom(path: &str) -> bool {
+    Url::parse(&url_clean::ensure_absolute(path))
+        .map(|url| {
+            url.query_pairs()
+                .any(|(key, value)| key == "type" && value == "3")
+        })
+        .unwrap_or(false)
+}
+
 fn activity_path(id: &str) -> Result<(String, ParserKind), StatusCode> {
     let mut path = crate::activity::decode_status_path(id).ok_or(StatusCode::BAD_REQUEST)?;
     if let Some(group_post) = group_multi_permalink_path(&path) {
@@ -737,14 +728,7 @@ fn activity_path(id: &str) -> Result<(String, ParserKind), StatusCode> {
         path = normalized;
     }
 
-    let is_photocom = Url::parse(&url_clean::ensure_absolute(&path))
-        .ok()
-        .map(|url| {
-            url.query_pairs()
-                .any(|(key, value)| key == "type" && value.contains('3'))
-        })
-        .unwrap_or(false);
-    if is_photocom {
+    if is_photocom(&path) {
         return Ok((path, ParserKind::Photocom));
     }
     if crate::parsers::comment::comment_id_in(&path).is_some() {
@@ -2071,6 +2055,32 @@ mod tests {
         assert_eq!(
             strip_comment_id("reel/999?comment_id=1&reply_comment_id=2"),
             "reel/999"
+        );
+    }
+
+    #[tokio::test]
+    async fn humans_are_redirected_even_for_type_3_photo_links() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/photo.php?fbid=1&set=a.2&type=3")
+                    .header(header::USER_AGENT, "Mozilla/5.0 (iPhone)")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    }
+
+    #[test]
+    fn photocom_needs_exact_type_3() {
+        assert!(super::is_photocom("photo.php?fbid=1&set=a.2&type=3"));
+        assert!(!super::is_photocom("photo.php?fbid=1&type=13"));
+        assert!(!super::is_photocom("photo.php?fbid=1"));
+        assert_eq!(
+            crate::url_clean::clean_path("photo.php?fbid=1&set=a.2&type=3&mibextid=x"),
+            "photo.php?fbid=1&set=a.2&type=3"
         );
     }
 
