@@ -1,5 +1,5 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::get_json_blocks;
+use crate::fetch::{get_json_blocks, FetchedPage};
 use crate::jq;
 use crate::parsers::util::{
     author_avatar_in_node, author_handle_in_node, author_id_in_node, b64_decode_ascii,
@@ -15,67 +15,73 @@ pub struct SinglePhotoParser;
 impl Parser for SinglePhotoParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.document();
-        let blocks = get_json_blocks(html, true);
-        let content_node = get_content_node(&blocks).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Cannot process post (cn)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-        let interaction = get_interactions_node(&blocks).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Cannot process post (in)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-        let text = longest_post_text(&content_node);
-        let owner = content_node.get("owner").unwrap_or(&Value::Null);
-        let author = owner
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let date = content_node
-            .get("created_time")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let interaction_ids = focal_interaction_ids(&content_node);
-        let interaction_refs = interaction_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let (likes, cmts, shares, top_reaction_ids) =
-            interaction_counts_with_reaction_ids(&interaction, &interaction_refs)?;
-        let image = get_single_image(&blocks).ok_or_else(|| {
-            FacebedError::parse_with(
-                "cannot find single image",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-
-        Ok(ParsedPost {
-            author_name: author,
-            author_id: author_id_in_node(owner),
-            author_handle: author_handle_in_node(owner),
-            author_avatar_url: author_avatar_in_node(owner),
-            context: None,
-            text: text.trim().to_owned(),
-            allow_discord_markdown: false,
-            image_links: vec![image],
-            url: ensure_absolute(post_path),
-            date,
-            likes,
-            top_reaction_ids,
-            comments: cmts,
-            shares,
-            video_links: Vec::new(),
-            thumbnail: None,
-        })
+        parse_page(post_path, &page)
     }
+}
+
+/// Parse an already-fetched photo page. Shared with [`crate::parsers::photocom`],
+/// which lands here when a `type=3` link turns out to be a plain album photo.
+pub(crate) fn parse_page(post_path: &str, page: &FetchedPage) -> FacebedResult<ParsedPost> {
+    let html = page.document();
+    let blocks = get_json_blocks(html, true);
+    let content_node = get_content_node(&blocks).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Cannot process post (cn)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+    let interaction = get_interactions_node(&blocks).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Cannot process post (in)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+    let text = longest_post_text(&content_node);
+    let owner = content_node.get("owner").unwrap_or(&Value::Null);
+    let author = owner
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let date = content_node
+        .get("created_time")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let interaction_ids = focal_interaction_ids(&content_node);
+    let interaction_refs = interaction_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let (likes, cmts, shares, top_reaction_ids) =
+        interaction_counts_with_reaction_ids(&interaction, &interaction_refs)?;
+    let image = get_single_image(&blocks).ok_or_else(|| {
+        FacebedError::parse_with(
+            "cannot find single image",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+
+    Ok(ParsedPost {
+        author_name: author,
+        author_id: author_id_in_node(owner),
+        author_handle: author_handle_in_node(owner),
+        author_avatar_url: author_avatar_in_node(owner),
+        context: None,
+        text: text.trim().to_owned(),
+        allow_discord_markdown: false,
+        image_links: vec![image],
+        url: ensure_absolute(post_path),
+        date,
+        likes,
+        top_reaction_ids,
+        comments: cmts,
+        shares,
+        video_links: Vec::new(),
+        thumbnail: None,
+    })
 }
 
 fn get_content_node(blocks: &[Value]) -> Option<Value> {

@@ -5,7 +5,7 @@ use crate::parsers::util::{
     author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
     top_reactions_from_feedback, val_str_at,
 };
-use crate::parsers::{ParsedPost, Parser, ParserCtx};
+use crate::parsers::{single_photo, ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
 
 pub struct PhotocomParser;
@@ -16,13 +16,11 @@ impl Parser for PhotocomParser {
         let page = ctx.fetcher.fetch(post_path, true).await?;
         let html = page.document();
         let blocks = get_json_blocks(html, true);
-        let content = get_content_node(&blocks).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Cannot process photocom (cn)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
+        // `type=3` also tags plain album photos (`photo.php?fbid=..&set=a.<album>`).
+        // Those pages carry no attached comment; embed them as a single photo.
+        let Some(content) = get_content_node(&blocks) else {
+            return single_photo::parse_page(post_path, &page);
+        };
         let data = content
             .get("data")
             .ok_or_else(|| FacebedError::parse("missing data"))?;
@@ -86,12 +84,18 @@ impl Parser for PhotocomParser {
 }
 
 fn get_content_node(blocks: &[Value]) -> Option<Value> {
-    for bloc in blocks {
-        if jq::has(bloc, &["attached_comment"]) && !jq::has(bloc, &["unified_reactors"]) {
-            return jq::first(bloc, "result").cloned();
+    blocks.iter().find_map(|bloc| {
+        if !jq::has(bloc, &["attached_comment"]) || jq::has(bloc, &["unified_reactors"]) {
+            return None;
         }
-    }
-    None
+        jq::first(bloc, "result")
+            .filter(|result| {
+                !result
+                    .pointer("/data/attached_comment")
+                    .map_or(true, Value::is_null)
+            })
+            .cloned()
+    })
 }
 
 fn get_reaction_count(blocks: &[Value]) -> Option<i64> {
@@ -137,7 +141,7 @@ mod tests {
         let blocks = vec![
             json!({
                 "attached_comment": {},
-                "result": {"data": {"owner": {
+                "result": {"data": {"attached_comment": {"id": "c1"}, "owner": {
                     "id": "55",
                     "name": "Comment Owner",
                     "profile_picture_depth_0": {"uri": "https://img.example/comment-owner.jpg"}
@@ -168,5 +172,14 @@ mod tests {
                 "https://www.facebook.com/c".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn album_photo_without_attached_comment_has_no_content_node() {
+        let blocks = vec![json!({
+            "attached_comment": null,
+            "result": {"data": {"attached_comment": null, "owner": {"name": "Page"}}}
+        })];
+        assert!(get_content_node(&blocks).is_none());
     }
 }
