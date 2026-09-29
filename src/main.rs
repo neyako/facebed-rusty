@@ -148,9 +148,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             while hup.recv().await.is_some() {
-                match validate_cookie_json_files(&cookies_path)
-                    .and_then(|_| CookieJar::load(&cookies_path))
-                {
+                match CookieJar::load_strict(&cookies_path) {
                     Ok(new_jar) => {
                         let n = new_jar.len();
                         jar.store(Arc::new(new_jar));
@@ -201,45 +199,5 @@ async fn main() -> anyhow::Result<()> {
     info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_cookie_json_files(path: &std::path::Path) -> anyhow::Result<()> {
-    let mut files = Vec::new();
-    if path.exists() {
-        files.push(path.to_path_buf());
-    }
-
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    for entry in std::fs::read_dir(&parent)
-        .map_err(|e| anyhow::anyhow!("scan {}: {}", parent.display(), e))?
-        .flatten()
-    {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
-        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if name.starts_with("cookies") && name.ends_with(".json") && name != "cookies.example.json"
-        {
-            files.push(p);
-        }
-    }
-    files.sort();
-    files.dedup();
-
-    for p in files {
-        let raw = std::fs::read_to_string(&p)
-            .map_err(|e| anyhow::anyhow!("read {}: {}", p.display(), e))?;
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .map_err(|e| anyhow::anyhow!("parse {}: {}", p.display(), e))?;
-    }
     Ok(())
 }

@@ -124,59 +124,32 @@ impl CookieJar {
     ///   - Cookie-Editor flat array `[{name, value, ...}, ...]` → 1 account, label from filename
     ///   - Multi-account object `{"accounts": [{"label": "...", "entries": [...]}, ...]}`
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let mut accounts = Vec::new();
-        let mut seen: HashSet<PathBuf> = HashSet::new();
+        Self::load_with(path, false)
+    }
 
-        let mut load_one = |p: &Path, accounts: &mut Vec<CookieAccount>| {
-            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            if !seen.insert(canon) {
-                return;
-            }
-            match Self::load_file(p) {
-                Ok(mut got) => accounts.append(&mut got),
-                Err(e) => warn!("failed to load {}: {}", p.display(), e),
-            }
-        };
+    /// Like [`Self::load`], but any unreadable or malformed cookie file is an
+    /// error instead of a skipped warning. SIGHUP reload uses this so a bad
+    /// edit keeps the running jar instead of silently dropping accounts.
+    pub fn load_strict(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with(path, true)
+    }
 
-        if path.exists() {
-            load_one(path, &mut accounts);
-        } else {
+    fn load_with(path: &Path, strict: bool) -> anyhow::Result<Self> {
+        if !path.exists() {
             warn!("{} not found", path.display());
         }
-
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        match std::fs::read_dir(&parent) {
-            Ok(rd) => {
-                let mut sibs: Vec<PathBuf> = rd
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        if !p.is_file() {
-                            return false;
-                        }
-                        let n = match p.file_name().and_then(|s| s.to_str()) {
-                            Some(n) => n,
-                            None => return false,
-                        };
-                        n.starts_with("cookies")
-                            && n.ends_with(".json")
-                            && n != "cookies.example.json"
-                    })
-                    .collect();
-                sibs.sort();
-                for p in sibs {
-                    load_one(&p, &mut accounts);
-                }
+        let mut accounts = Vec::new();
+        for file in cookie_files(path, &parent) {
+            match Self::load_file(&file) {
+                Ok(mut got) => accounts.append(&mut got),
+                Err(e) if strict => anyhow::bail!("{}: {e}", file.display()),
+                Err(e) => warn!("failed to load {}: {}", file.display(), e),
             }
-            Err(e) => warn!(
-                "could not scan {} for cookie files: {}",
-                parent.display(),
-                e
-            ),
         }
 
         // Sidecar useragents.json: { "alice": "UA-string", ... }. Lets users
@@ -272,6 +245,41 @@ impl CookieJar {
 /// `{ "<account-label>": "<user-agent>", ... }`. Missing file => empty map;
 /// parse errors are warned but non-fatal so a typo doesn't take the server
 /// down.
+/// `path` (if present) plus sibling `cookies*.json` files in `parent`,
+/// primary first, siblings sorted, each file once.
+fn cookie_files(path: &Path, parent: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if path.exists() {
+        files.push(path.to_path_buf());
+    }
+    match std::fs::read_dir(parent) {
+        Ok(rd) => {
+            let mut siblings: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.file_name().and_then(|s| s.to_str()).is_some_and(|n| {
+                            n.starts_with("cookies")
+                                && n.ends_with(".json")
+                                && n != "cookies.example.json"
+                        })
+                })
+                .collect();
+            siblings.sort();
+            files.extend(siblings);
+        }
+        Err(e) => warn!(
+            "could not scan {} for cookie files: {}",
+            parent.display(),
+            e
+        ),
+    }
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    files.retain(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
+    files
+}
+
 fn load_useragents(dir: &Path) -> HashMap<String, String> {
     let path = dir.join("useragents.json");
     if !path.exists() {
@@ -458,6 +466,16 @@ mod tests {
         let mut labels: Vec<_> = jar.accounts.iter().map(|a| a.label.clone()).collect();
         labels.sort();
         assert_eq!(labels, vec!["2", "alice", "default"]);
+    }
+
+    #[test]
+    fn strict_load_rejects_a_malformed_sibling_lenient_skips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        fs::write(dir.path().join("cookies-bad.json"), "{not json").unwrap();
+        assert_eq!(CookieJar::load(&main).unwrap().len(), 1);
+        assert!(CookieJar::load_strict(&main).is_err());
     }
 
     #[test]
