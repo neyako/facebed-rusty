@@ -147,7 +147,10 @@ struct OEmbedParams {
 }
 
 async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> Response {
-    json_response(build_oembed_json(&p.author, &p.title, &p.url, &p.kind))
+    match build_oembed_json(&p.author, &p.title, &p.url, &p.kind) {
+        Some(body) => json_response(body),
+        None => (StatusCode::BAD_REQUEST, "url must be a Facebook post").into_response(),
+    }
 }
 
 async fn activity_status(
@@ -288,7 +291,16 @@ async fn healthz(State(state): State<AppState>) -> Response {
 
 /// Build the oEmbed 1.0 document Discord reads to render the author/provider
 /// line. Kept pure (no extractors) so it is unit-testable.
-fn build_oembed_json(engagement: &str, title: &str, url: &str, kind: &str) -> String {
+/// The embeds only ever link a Facebook post here, so any other `url` is
+/// someone minting facebed-branded oEmbed documents; refuse it. Text is
+/// capped for the same reason (real labels are a name or a reaction line).
+fn build_oembed_json(engagement: &str, title: &str, url: &str, kind: &str) -> Option<String> {
+    const MAX_CHARS: usize = 300;
+    if !url_clean::is_facebook_page_url(url) {
+        return None;
+    }
+    let cap = |s: &str| s.chars().take(MAX_CHARS).collect::<String>();
+    let (engagement, title) = (cap(engagement), cap(title));
     let kind = match kind {
         "video" | "photo" | "rich" => kind,
         _ => "link",
@@ -303,6 +315,7 @@ fn build_oembed_json(engagement: &str, title: &str, url: &str, kind: &str) -> St
         "title": title,
     })
     .to_string()
+    .into()
 }
 
 fn build_healthz_json(
@@ -2198,7 +2211,8 @@ mod tests {
 
     #[test]
     fn oembed_json_has_author_and_provider() {
-        let json = build_oembed_json("❤️ 19", "Jane Doe", "https://www.facebook.com/x", "video");
+        let json =
+            build_oembed_json("❤️ 19", "Jane Doe", "https://www.facebook.com/x", "video").unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["author_name"], "❤️ 19");
         assert_eq!(value["title"], "Jane Doe");
@@ -2208,7 +2222,15 @@ mod tests {
 
     #[test]
     fn oembed_json_defaults_unknown_type_to_link() {
-        let json = build_oembed_json("❤️ 1", "A", "https://x", "garbage");
+        let json = build_oembed_json("❤️ 1", "A", "https://www.facebook.com/x", "garbage").unwrap();
         assert!(json.contains(r#""type":"link""#));
+    }
+
+    #[test]
+    fn oembed_refuses_non_facebook_urls_and_caps_text() {
+        assert!(build_oembed_json("a", "b", "https://evil.example/x", "link").is_none());
+        let long = "x".repeat(5000);
+        let json = build_oembed_json(&long, &long, "https://www.facebook.com/x", "link").unwrap();
+        assert!(json.len() < 1000);
     }
 }
