@@ -5,8 +5,6 @@ use serde_json::json;
 use url::Url;
 
 const MAX_STATUS_BYTES: usize = 2_048;
-const ACCOUNT_AVATAR_URL: &str = "https://facebed.neyahub.com/favicon.ico";
-const ACCOUNT_HEADER_URL: &str = "https://facebed.neyahub.com/banner.png";
 
 pub fn status_id(post_url: &str) -> Option<String> {
     if post_url.len() > MAX_STATUS_BYTES || !url_clean::is_facebook_page_url(post_url) {
@@ -86,7 +84,11 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
     format!(r#"<link href="{status_url}" rel="alternate" type="application/activity+json"/>"#)
 }
 
-pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
+/// `origin` is this server's public origin (e.g. `https://facebed.example`);
+/// the fallback avatar and header are served from it.
+pub fn status_json(id: &str, post: &crate::parsers::ParsedPost, origin: &str) -> String {
+    let fallback_avatar = format!("{origin}/favicon.ico");
+    let header = format!("{origin}/banner.png");
     let username = activity_username(post);
     let account_id = post.author_id.as_deref().unwrap_or(username);
     let profile_avatar = post
@@ -99,7 +101,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         .author_avatar_url
         .as_deref()
         .or(profile_avatar.as_deref())
-        .unwrap_or(ACCOUNT_AVATAR_URL);
+        .unwrap_or(&fallback_avatar);
     let attachments = if post.image_links.is_empty() {
         post.video_links
             .first()
@@ -141,7 +143,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
             "note": "", "url": post.url,
             "avatar": avatar, "avatar_static": avatar,
-            "header": ACCOUNT_HEADER_URL, "header_static": ACCOUNT_HEADER_URL,
+            "header": header, "header_static": header,
             "followers_count": 0, "following_count": 0, "statuses_count": 0,
             "last_status_at": null,
         },

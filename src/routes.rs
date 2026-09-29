@@ -159,20 +159,22 @@ async fn oembed(axum::extract::Query(p): axum::extract::Query<OEmbedParams>) -> 
 async fn activity_status(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
 ) -> Response {
-    activity_status_for_id(state, id).await
+    activity_status_for_id(state, id, request_origin(&headers).unwrap_or_default()).await
 }
 
 async fn user_activity_status(
     State(state): State<AppState>,
     axum::extract::Path((_username, id)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    activity_status_for_id(state, id).await
+    activity_status_for_id(state, id, request_origin(&headers).unwrap_or_default()).await
 }
 
-async fn activity_status_for_id(state: AppState, id: String) -> Response {
+async fn activity_status_for_id(state: AppState, id: String, origin: String) -> Response {
     match activity_post_for_id(&state, &id).await {
-        Ok(post) => json_response(crate::activity::status_json(&id, &post)),
+        Ok(post) => json_response(crate::activity::status_json(&id, &post, &origin)),
         Err(status) => activity_error_response(status),
     }
 }
@@ -538,7 +540,12 @@ async fn catch_all(
     } else {
         match select_kind(&working) {
             Some(kind) => kind,
-            None => return html_response(format_error_embed("https://git.facebed.com", "C")),
+            None => {
+                return html_response(format_error_embed(
+                    &url_clean::ensure_absolute(&working),
+                    "C",
+                ))
+            }
         }
     };
 
@@ -1581,10 +1588,14 @@ mod tests {
             .lock()
             .unwrap()
             .insert(id.clone(), completion);
-        let mut response = Box::pin(super::activity_status_for_id(state.clone(), id.clone()));
+        let mut response = Box::pin(super::activity_status_for_id(
+            state.clone(),
+            id.clone(),
+            String::new(),
+        ));
         assert!(poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx).is_pending())).await);
         let post = activity_post();
-        let expected = crate::activity::status_json(&id, &post);
+        let expected = crate::activity::status_json(&id, &post, "");
         state
             .embed_cache
             .lock()
@@ -1616,7 +1627,7 @@ mod tests {
             .insert(failed_id.clone(), completion);
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            super::activity_status_for_id(state, failed_id),
+            super::activity_status_for_id(state, failed_id, String::new()),
         )
         .await
         .expect("early completion is retained");
@@ -1629,7 +1640,7 @@ mod tests {
         let state = test_state();
         let post = activity_post();
         let id = crate::activity::status_id(&post.url).expect("activity status id");
-        let expected = crate::activity::status_json(&id, &post);
+        let expected = crate::activity::status_json(&id, &post, "");
         state
             .embed_cache
             .lock()
@@ -1694,7 +1705,7 @@ mod tests {
         post.video_links = vec!["https://video.example/post.mp4".into()];
         post.thumbnail = Some("https://img.example/post.jpg".into());
         let id = crate::activity::status_id(&post.url).expect("activity status id");
-        let expected = crate::activity::status_json(&id, &post);
+        let expected = crate::activity::status_json(&id, &post, "");
         state
             .embed_cache
             .lock()
