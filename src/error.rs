@@ -20,14 +20,8 @@ pub enum FacebedError {
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-
-    #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
 
     #[error("other: {0}")]
     Other(#[from] anyhow::Error),
@@ -75,7 +69,7 @@ impl FacebedError {
             | Self::RateLimited { .. }
             | Self::Checkpointed => "C",
             Self::Parse { .. } => "P",
-            Self::Http(_) | Self::Io(_) | Self::Json(_) | Self::Yaml(_) => "U",
+            Self::Http(_) | Self::Json(_) => "U",
             Self::Other(_) => "X",
         }
     }

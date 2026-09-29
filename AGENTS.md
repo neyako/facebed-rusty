@@ -171,7 +171,7 @@ search by key.
 - `RateLimited`, `Checkpointed` → code **C**, and cool the account down.
 - `Parse { html, url }` → code **P** — parser bug. Build it with `parse_with` so the page
   HTML rides along; `routes::error_response` posts it to the webhook for offline triage.
-- Http/Io/Json/Yaml → code **U**.
+- Http/Json → code **U**.
 - Other anyhow → code **X**.
 - The timeout embed (`format_timeout_embed`) shows **T**; it is not a `FacebedError`.
 
