@@ -36,7 +36,11 @@ src/
                           and flags cut prefixes via FetchedPage::was_cut_by_deadline
   jq.rs                   recursive Value walker (first/all/has/enumerate)
   notifier.rs             Discord webhook, fire-and-forget tokio::spawn
-  routes.rs               axum routes, URL dispatch, account race, render
+  routes/
+    mod.rs                router, catch-all embed handler, scrape-and-render, error responses
+    dispatch.rs           path rewrites + parser choice (`route`), ParserKind, affinity scope key
+    activity.rs           Activity endpoints + share-discovery scrape
+    race.rs               account race (`race_identities`), account health
   url_clean.rs            strip mobile tracking params, share_url override
   parsers/
     mod.rs                ParsedPost struct, Parser trait, ParserCtx
@@ -95,7 +99,7 @@ and cookies (`CookieJar::load_strict`: a malformed file keeps the running jar;
 
 ### Request flow
 
-1. `axum::Router` (`routes.rs::router`) serves `/`, `/favicon.ico`, `/banner.png`,
+1. `axum::Router` (`routes/mod.rs::router`) serves `/`, `/favicon.ico`, `/banner.png`,
    `/healthz` (counts only), `/oembed.json` (author/provider line Discord reads),
    the Activity routes `/api/v1/statuses/:id` and `/users/:user/statuses/:id`, and
    every other path via `catch_all`.
@@ -150,7 +154,7 @@ Multi-strategy probe, in order:
 
 Adding a new FB schema variant? Add a probe to this function — every parser uses it.
 
-### Video size probe (routes.rs::render_with_size_check)
+### Video size probe (routes/mod.rs::render_with_size_check)
 
 `head_content_length` HEADs the video URL (~0.6s) to catch >25 MB files Discord's
 media proxy refuses to inline. Skipped once the request is older than
@@ -186,7 +190,7 @@ Checked in `FetchedPage::from_html` before a parser sees the page. A login wall 
 3. `login_data` / `useCometLogInFormQuery` in the body **and** no `i18n_reaction_count`
    (post data wins over a stray login preloader).
 
-### Multi-cookie / multi-account (cookies.rs, routes.rs::scrape_with_accounts)
+### Multi-cookie / multi-account (cookies.rs, routes/race.rs)
 
 `CookieJar` holds a `Vec<CookieAccount>`, each with a label + entries. Header-based
 attachment (no reqwest cookie store).
@@ -216,7 +220,7 @@ of this group" is per-scope, which affinity already handles. Affinity keys are
 ## Patterns to follow
 
 - **New URL scheme**: add parser file under `src/parsers/`, declare in `parsers/mod.rs`,
-  add `ParserKind` variant + regex in `routes.rs`, wire dispatch order BEFORE `is_facebook_url`
+  add `ParserKind` variant + regex in `routes/dispatch.rs`, wire it into `select_kind` BEFORE the `is_facebook_url`
   fallback. Keep fetch and parse separate so a fixture test can cover it.
 - **Robust JSON extraction**: never index FB JSON by hardcoded path. Use `jq::first/all/has` to
   search by key. If you must hardcode a path because key names collide, add a TODO + recon notes.
@@ -251,7 +255,7 @@ inspect the returned HTML's OG tags.
 ## Tests
 
 `cargo test --locked`: focused unit tests next to the code, including the
-account race on a paused clock (`routes.rs`) and parser fixtures (`parsers/fixtures.rs`).
+account race on a paused clock (`routes/race.rs`) and parser fixtures (`parsers/fixtures.rs`).
 
 Parser fixtures are real pages minimized to the JSON the output depends on. When
 Facebook changes a shape, capture the page with `--dump`, run the ignored
