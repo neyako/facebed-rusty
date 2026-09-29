@@ -16,5 +16,7 @@ services:
       - ./cookies.json:/facebed/cookies.json:ro
       # - ./cookies-alice.json:/facebed/cookies-alice.json:ro
       # - ./cookies-bob.json:/facebed/cookies-bob.json:ro
+      # Per-account user agents (optional), see useragents.example.json.
+      # - ./useragents.json:/facebed/useragents.json:ro
     environment:
       RUST_LOG: info

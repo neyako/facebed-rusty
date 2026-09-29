@@ -52,6 +52,8 @@ authors, and Discord alert settings. Restart the service after changes.
 
 Leave `cookies.json` empty (`[]`) to try public posts. If Facebook asks you to log
 in, save a Cookie-Editor export there. The account must have access to the post.
+When it can't see a public post (for example, the author blocked it), facebed
+retries without cookies.
 See [cookies.example.json](cookies.example.json) for the format.
 
 For more accounts, add files such as `cookies-alice.json` and enable their mounts
@@ -68,6 +70,7 @@ Requires Rust 1.86 or newer.
 ```bash
 cargo run -- -c config.yaml
 cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 ```
 
