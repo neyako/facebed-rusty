@@ -30,7 +30,11 @@ impl Parser for ReelsParser {
     }
 }
 
-fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedResult<ParsedPost> {
+pub(crate) fn parse_reel(
+    ctx: &ParserCtx,
+    post_path: &str,
+    page: &FetchedPage,
+) -> FacebedResult<ParsedPost> {
     let html = page.document();
     let blocks = get_json_blocks(html, true);
 

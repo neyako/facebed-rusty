@@ -13,6 +13,9 @@ pub mod stories;
 pub mod util;
 pub mod video_watch;
 
+#[cfg(test)]
+mod fixtures;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostContext {
     pub author_name: String,

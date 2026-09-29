@@ -52,6 +52,38 @@ pub struct CookieAccountCheck {
 }
 
 impl FetchedPage {
+    /// Parse `html` and reject login walls. Parser tests build pages from
+    /// fixtures with this, bypassing the network.
+    pub(crate) fn from_html(
+        url: String,
+        html: String,
+        post_path: &str,
+        partial: bool,
+        deadline_cut: bool,
+    ) -> FacebedResult<Self> {
+        let parse_started = Instant::now();
+        let document = Html::parse_document(&html);
+        let parse_ms = parse_started.elapsed().as_millis();
+        let page = Self {
+            url,
+            html,
+            document,
+            partial,
+            deadline_cut,
+            json_blocks: OnceLock::new(),
+        };
+        let probe_started = Instant::now();
+        check_or_raise(&page, post_path)?;
+        tracing::debug!(
+            path = %post_path,
+            partial,
+            parse_ms,
+            probe_ms = probe_started.elapsed().as_millis(),
+            "facebook html parsed"
+        );
+        Ok(page)
+    }
+
     pub fn document(&self) -> &Html {
         &self.document
     }
@@ -404,7 +436,7 @@ impl Fetcher {
         let html = resp.text().await?;
         let read_ms = read_started.elapsed().as_millis();
         tracing::debug!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
-        self.page_from_html(url, html, post_path, false, false)
+        FetchedPage::from_html(url, html, post_path, false, false)
     }
 
     /// Fetch a Facebook path, stopping early once `should_stop` says the
@@ -470,7 +502,7 @@ impl Fetcher {
             );
         }
         tracing::debug!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early || deadline_cut, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
-        self.page_from_html(
+        FetchedPage::from_html(
             url,
             html,
             post_path,
@@ -498,37 +530,6 @@ impl Fetcher {
             }
         }
         (req.header("user-agent", user_agent), account_label)
-    }
-
-    fn page_from_html(
-        &self,
-        url: String,
-        html: String,
-        post_path: &str,
-        partial: bool,
-        deadline_cut: bool,
-    ) -> FacebedResult<FetchedPage> {
-        let parse_started = Instant::now();
-        let document = Html::parse_document(&html);
-        let parse_ms = parse_started.elapsed().as_millis();
-        let page = FetchedPage {
-            url,
-            html,
-            document,
-            partial,
-            deadline_cut,
-            json_blocks: OnceLock::new(),
-        };
-        let probe_started = Instant::now();
-        check_or_raise(&page, post_path)?;
-        tracing::debug!(
-            path = %post_path,
-            partial,
-            parse_ms,
-            probe_ms = probe_started.elapsed().as_millis(),
-            "facebook html parsed"
-        );
-        Ok(page)
     }
 }
 
