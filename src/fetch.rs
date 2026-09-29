@@ -14,9 +14,9 @@ use url::Url;
 
 tokio::task_local! {
     /// When set, [`Fetcher::fetch`] uses this account index (modulo account count)
-    /// instead of the primary account. Used by the per-request retry loop to
-    /// deterministically try fallback cookie accounts.
-    pub static ACCOUNT_OVERRIDE: usize;
+    /// instead of the primary account, or no cookies at all for `None` (guest).
+    /// Set per attempt by the account race in `routes::scrape_with_accounts`.
+    pub static ACCOUNT_OVERRIDE: Option<usize>;
     pub static RESPONSE_DEADLINE: Instant;
 }
 
@@ -433,6 +433,12 @@ impl Fetcher {
         let value = tokio::time::timeout(budget, self.fetch_profile_handle(author_id))
             .await
             .unwrap_or(None);
+        // Guests can't see most profiles; a guest miss says nothing about
+        // what a cookie account would get, so don't let it shadow them.
+        let guest = matches!(ACCOUNT_OVERRIDE.try_with(|index| *index), Ok(None));
+        if value.is_none() && guest {
+            return None;
+        }
         if let Ok(mut cache) = self.profile_cache.lock() {
             // ponytail: bounded FIFO scan; use an LRU only if this small cache grows.
             if cache.len() >= PROFILE_CACHE_MAX && !cache.contains_key(author_id) {
@@ -457,7 +463,7 @@ impl Fetcher {
         let account_index = if self.cookies.load().is_empty() {
             None
         } else {
-            Some(ACCOUNT_OVERRIDE.try_with(|index| *index).unwrap_or(0))
+            ACCOUNT_OVERRIDE.try_with(|index| *index).unwrap_or(Some(0))
         };
         let mut request = self.client.head(profile_url.as_str());
         for (key, value) in HEADERS {
@@ -474,7 +480,7 @@ impl Fetcher {
             .flatten()
     }
 
-    /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
+    /// Fetch a Facebook path. Optionally attach cookies. Raises LoginWall on login walls.
     pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
         let started = Instant::now();
         let url = facebook_fetch_url(post_path)?;
@@ -577,12 +583,8 @@ impl Fetcher {
         let mut user_agent: &str = DEFAULT_USER_AGENT;
         let guard = self.cookies.load();
         if use_cookies {
-            let acc = ACCOUNT_OVERRIDE
-                .try_with(|i| guard.account_at(*i))
-                .ok()
-                .flatten()
-                .or_else(|| guard.account_at(0));
-            if let Some(acc) = acc {
+            let index = ACCOUNT_OVERRIDE.try_with(|i| *i).unwrap_or(Some(0));
+            if let Some(acc) = index.and_then(|i| guard.account_at(i)) {
                 account_label = acc.label.clone();
                 req = req.header("cookie", acc.header_value());
                 if let Some(ua) = acc.user_agent.as_deref() {
@@ -1200,7 +1202,7 @@ pub fn probe_page_type(html: &Html, body: &str) -> PageType {
 
 pub fn check_or_raise(page: &FetchedPage, post_path: &str) -> FacebedResult<()> {
     match probe_page_type(page.document(), &page.html) {
-        PageType::LoginWall => Err(FacebedError::no_data(format!(
+        PageType::LoginWall => Err(FacebedError::LoginWall(format!(
             "Facebook served a login wall for {post_path} - content requires authentication"
         ))),
         _ => Ok(()),

@@ -426,15 +426,6 @@ impl CookieJar {
         }
         m.insert(key, account_idx % self.accounts.len());
     }
-
-    /// Forget the affinity mapping for `key`. Called when the pinned
-    /// account fails — we'd rather re-discover a working one than keep
-    /// paying the slow first-try cost.
-    pub fn forget_affinity(&self, key: &str) {
-        if let Ok(mut m) = self.affinity.lock() {
-            m.remove(key);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -485,8 +476,6 @@ mod tests {
         assert_eq!(jar.affinity_for("groups/123"), None);
         jar.set_affinity("groups/123".into(), 1);
         assert_eq!(jar.affinity_for("groups/123"), Some(1));
-        jar.forget_affinity("groups/123");
-        assert_eq!(jar.affinity_for("groups/123"), None);
     }
 
     #[test]

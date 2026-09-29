@@ -5,6 +5,11 @@ pub enum FacebedError {
     #[error("no data: {0}")]
     NoData(String),
 
+    /// Facebook ignored the session cookie. Unlike [`Self::NoData`] this is
+    /// evidence against the account, not the content.
+    #[error("login wall: {0}")]
+    LoginWall(String),
+
     #[error("parse: {message}")]
     Parse {
         message: String,
@@ -65,7 +70,10 @@ impl FacebedError {
 
     pub fn error_code(&self) -> &'static str {
         match self {
-            Self::NoData(_) | Self::RateLimited { .. } | Self::Checkpointed => "C",
+            Self::NoData(_)
+            | Self::LoginWall(_)
+            | Self::RateLimited { .. }
+            | Self::Checkpointed => "C",
             Self::Parse { .. } => "P",
             Self::Http(_) | Self::Io(_) | Self::Json(_) | Self::Yaml(_) => "U",
             Self::Other(_) => "X",

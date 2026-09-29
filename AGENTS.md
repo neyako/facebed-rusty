@@ -102,7 +102,7 @@ They call `ctx.fetcher.fetch(post_path, use_cookies)` to get a `FetchedPage`, th
 
 - **`JsonPostParser`** (`parsers/json_post.rs`) — default post. Tries `data.comet_ufi_summary_and_actions_renderer`, then `node_v2.comet_sections`, then `node.comet_sections`, then group hoisted feed. Builds a `Story` (`util::Story::from_json`) which recursively handles `attached_story` for shared posts.
 - **`SinglePhotoParser`** (`single_photo.rs`) — `/photo` URLs. Uses `prefetch_uris_v2` for the image.
-- **`PhotocomParser`** (`photocom.rs`) — `?type=3` image-in-comment. Adds `(💬)` suffix to author.
+- **`PhotocomParser`** (`photocom.rs`) — `?type=3` image-in-comment. Adds `(💬)` suffix to author. FB also puts `type=3` on plain album photos (`set=a.<album>`); no attached comment → reuses the fetched page via `single_photo::parse_page`.
 - **`ReelsParser`** (`reels.rs`) — short-form video. **Bug 1 fix:** `find_content_node` matches `creation_story` with `short_form_video_context` OR `videoDeliveryResponseFragment` (modern field) OR `videoDeliveryLegacyFields` OR `playable_url`. Owner-with-name found by scanning every block (the rich owner lives in a different block from `creation_story`). Reads the full page every time — the early-stop scanner was removed (2026-08-29): FB moved the marker blocks late (79–92% of body) and any mispredicted stop forced a second full fetch (~1.8s wasted), more than the early stop ever saved.
 - **`VideoWatchParser`** (`video_watch.rs`) — `/watch` URLs. Generic-watch-feed canonical link → `NoData`.
 - **`StoriesParser`** (`stories.rs`) — NEW. Searches blocks for `unified_stories_with_notes.edges[0].node`, pulls `playable_url` (video) or `image.uri` (photo) from `attachments[0].media`. Owner from `bucket.owner.name`. Expired or login-walled story → `NoData` (24h auto-expiry).
@@ -134,7 +134,8 @@ search by key.
 
 ### Error codes (error.rs)
 
-- `NoData` → code **C** — login wall / restricted content / expired story. No webhook alert.
+- `NoData` → code **C** — restricted content / private group / expired story. No webhook alert.
+- `LoginWall` → code **C** — FB ignored the cookie. Counts against the account (see below).
 - `Parse { html, url }` → code **P** — parser bug. `fetch.rs` attaches raw HTML if missing.
   `routes::error_response` posts the HTML file to Discord webhook for offline triage.
 - Http/Io/Json/Yaml → code **U**.
@@ -150,11 +151,32 @@ Checked inside `Fetcher::fetch` before parser sees the page. Triggers:
 3. JSON blocks contain `login_data` or `useCometLogInFormQuery`
 4. Absence of `i18n_reaction_count` (no post data)
 
-### Multi-cookie / multi-account (cookies.rs)
+### Multi-cookie / multi-account (cookies.rs, routes.rs::scrape_with_accounts)
 
-`CookieJar` holds a `Vec<CookieAccount>`. `next_account()` round-robins per request (atomic
-counter). Each account has a label + entries. Header-based attachment (no reqwest cookie store).
-Expired cookies warned once at startup.
+`CookieJar` holds a `Vec<CookieAccount>`, each with a label + entries. Header-based
+attachment (no reqwest cookie store). Expired cookies warned once at startup.
+
+`scrape_with_accounts` → `race_identities` races identities from `account_order`
+(healthy in configured priority, the last winner for this group/profile hoisted first,
+cooled-down last). The next identity starts on failure **or** after `ACCOUNT_HEDGE_AFTER`
+(3s) with no result; first success wins and the rest are aborted. FB randomly
+slow-drips page bodies (~0.3 MB/s vs ~2 MB/s), so the hedge matters even with one
+account: then it re-runs the same account. Only healthy accounts hedge; nothing starts
+with less than `ATTEMPT_MIN_REMAINING` (3s) of budget left. `fetch::ACCOUNT_OVERRIDE`
+carries the attempt's identity (`Some(index)` or `None` = guest).
+
+Guest (no cookies) is the last resort, started only after a failure, never as the
+slow-read hedge. From the US VPS (tested 2026-09-29) guests load public page/profile
+posts and `share/p`/`share/v` targets, but hit a login wall on reels, `photo.php` and
+group posts. It rescues posts whose author blocked our account or a dead cookie. When
+everything fails, `final_error` reports a cookie account's `Parse` error first so
+parser bugs still reach the webhook.
+
+Accounts are penalized (cooldown + failure count toward the @everyone alert) only on
+account-level errors: `Checkpointed`, `RateLimited`, `LoginWall`. Losing a race is not
+evidence: private groups fail everywhere, slow-drips are transient, and "not a member
+of this group" is per-scope, which affinity already handles. Affinity keys are
+`groups/<id>` / `user/<name>` only; reels/watch/photo.php use priority order.
 
 ## Patterns to follow
 
