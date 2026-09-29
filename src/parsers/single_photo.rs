@@ -11,7 +11,6 @@ use serde_json::Value;
 
 pub struct SinglePhotoParser;
 
-#[async_trait::async_trait]
 impl Parser for SinglePhotoParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;

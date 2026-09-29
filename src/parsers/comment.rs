@@ -160,7 +160,6 @@ fn parsed_post_from_comment(
     })
 }
 
-#[async_trait::async_trait]
 impl Parser for CommentParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let comment_id = comment_id_in(post_path)

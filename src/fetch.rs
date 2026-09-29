@@ -2,12 +2,12 @@ use crate::cookies::CookieJar;
 use crate::error::{FacebedError, FacebedResult};
 use crate::jq;
 use crate::url_clean::{ensure_absolute, is_facebook_media_host, is_facebook_page_host};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{Client, RequestBuilder};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -1062,8 +1062,8 @@ fn current_user_name_from_json_blocks(doc: &Html) -> Option<String> {
     None
 }
 
-static CURRENT_USER_NAME_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#""NAME"\s*:\s*"((?:\\.|[^"\\])*)""#).unwrap());
+static CURRENT_USER_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""NAME"\s*:\s*"((?:\\.|[^"\\])*)""#).unwrap());
 
 fn current_user_name_from_body(body: &str) -> Option<String> {
     let mut offset = 0;
@@ -1096,18 +1096,19 @@ fn meta_content(doc: &Html, selector: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-static LOGIN_HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"/login\b").unwrap());
-static LOGIN_META_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)URL\s*=\s*/login[/?]").unwrap());
-static CANONICAL_LINK_SEL: Lazy<Selector> =
-    Lazy::new(|| Selector::parse(r#"link[rel="canonical"]"#).unwrap());
-static REFRESH_META_SEL: Lazy<Selector> =
-    Lazy::new(|| Selector::parse(r#"meta[http-equiv="refresh"]"#).unwrap());
-static JSON_SCRIPT_SEL: Lazy<Selector> = Lazy::new(|| {
+static LOGIN_HREF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/login\b").unwrap());
+static LOGIN_META_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)URL\s*=\s*/login[/?]").unwrap());
+static CANONICAL_LINK_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"link[rel="canonical"]"#).unwrap());
+static REFRESH_META_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"meta[http-equiv="refresh"]"#).unwrap());
+static JSON_SCRIPT_SEL: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse(r#"script[type="application/json"][data-content-len][data-sjs]"#).unwrap()
 });
-static OG_URL_SEL: Lazy<Selector> =
-    Lazy::new(|| Selector::parse(r#"meta[property="og:url"]"#).unwrap());
-static TITLE_SEL: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
+static OG_URL_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"meta[property="og:url"]"#).unwrap());
+static TITLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").unwrap());
 
 /// Classify a Facebook response that indicates the request was blocked rather
 /// than served. Rate limits are transient; checkpoint/recovery redirects need a

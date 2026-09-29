@@ -1,11 +1,11 @@
-use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use url::Url;
 
 const FB_BASE: &str = "https://www.facebook.com";
 
 /// Query keys we strip from any URL before fetching. Mobile/sharing junk.
-static DROP_KEYS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+static DROP_KEYS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "fs",
         "mibextid",

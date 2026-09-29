@@ -7,17 +7,17 @@ use crate::parsers::util::{
 };
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use scraper::{Html, Selector};
 use serde_json::Value;
+use std::sync::LazyLock;
 use url::Url;
 
 pub struct VideoWatchParser;
 
-static WATCH_FEED_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^https?://[^/]+/watch/?$").unwrap());
+static WATCH_FEED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^https?://[^/]+/watch/?$").unwrap());
 
-#[async_trait::async_trait]
 impl Parser for VideoWatchParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;

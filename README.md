@@ -63,7 +63,7 @@ docker compose up -d --force-recreate
 
 ## Develop
 
-Requires Rust 1.75 or newer.
+Requires Rust 1.86 or newer.
 
 ```bash
 cargo run -- -c config.yaml

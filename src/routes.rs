@@ -19,10 +19,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -351,27 +351,29 @@ fn no_store_html_response(body: String) -> Response {
     (StatusCode::OK, headers, body).into_response()
 }
 
-static RE_REEL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?reel/[0-9]+/?(?:\?.*)?$").unwrap());
-static RE_REEL_TWO_SEGMENTS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^/?reel/[0-9]+/[0-9]+/?$").unwrap());
+static RE_REEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/?reel/[0-9]+/?(?:\?.*)?$").unwrap());
+static RE_REEL_TWO_SEGMENTS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/?reel/[0-9]+/[0-9]+/?$").unwrap());
 // Only match bare `videos/<id>` (no Page prefix). Page-scoped video posts like
 // `<page>/videos/<slug>/<id>` are real video viewer pages — not reels — and
 // FB serves them with a watch-style JSON shape that the JsonPost root walker
 // can't handle. Routed below to VideoWatchParser via [`RE_PAGE_VIDEO`].
-static RE_VIDEOS: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/?videos/(?:[^/]+/)?(\d+)").unwrap());
+static RE_VIDEOS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/?videos/(?:[^/]+/)?(\d+)").unwrap());
 // `<page>/videos/<slug?>/<id>/` — FB Page video post viewer. Same JSON shape
 // as /watch?v=<id>, so route to VideoWatchParser.
-static RE_PAGE_VIDEO: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/videos/(?:[^/]+/)?\d+").unwrap());
-static RE_SLUGGED_PHOTO: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/photos/[^/?]+/(\d+)/?(?:\?.*)?$").unwrap());
-static RE_PHOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
-static RE_WATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/*watch").unwrap());
-static RE_SHARE_V: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
-static RE_SHARE_PR: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(/)?share/([pr]/)?[a-zA-Z0-9\-._]*(/)?").unwrap());
-static RE_STORIES: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^/?stories/\d+/[A-Za-z0-9=_-]+").unwrap());
+static RE_PAGE_VIDEO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/videos/(?:[^/]+/)?\d+").unwrap());
+static RE_SLUGGED_PHOTO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/?[a-zA-Z0-9\-._]+/photos/[^/?]+/(\d+)/?(?:\?.*)?$").unwrap());
+static RE_PHOTO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^/*photo(\.php)*/*$").unwrap());
+static RE_WATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^/*watch").unwrap());
+static RE_SHARE_V: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(/)?share/v/.*").unwrap());
+static RE_SHARE_PR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(/)?share/([pr]/)?[a-zA-Z0-9\-._]*(/)?").unwrap());
+static RE_STORIES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/?stories/\d+/[A-Za-z0-9=_-]+").unwrap());
 
 fn is_facebook_url(path: &str) -> bool {
     let full = format!("https://www.facebook.com/{path}");
@@ -1265,7 +1267,7 @@ async fn render_with_size_check(
         .try_with(|deadline| deadline.saturating_duration_since(Instant::now()))
         .ok();
     let size = if elapsed < VIDEO_PROBE_SKIP_AFTER
-        && remaining.map_or(true, |time| time > Duration::from_millis(850))
+        && remaining.is_none_or(|time| time > Duration::from_millis(850))
     {
         state.fetcher.head_content_length(video_url).await
     } else {

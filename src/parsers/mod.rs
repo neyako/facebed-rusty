@@ -127,8 +127,7 @@ pub fn banned_post(url: &str) -> ParsedPost {
     }
 }
 
-#[async_trait::async_trait]
-pub trait Parser {
+pub(crate) trait Parser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost>;
 }
 

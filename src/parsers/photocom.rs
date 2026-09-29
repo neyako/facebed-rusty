@@ -10,7 +10,6 @@ use serde_json::Value;
 
 pub struct PhotocomParser;
 
-#[async_trait::async_trait]
 impl Parser for PhotocomParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let page = ctx.fetcher.fetch(post_path, true).await?;
@@ -92,7 +91,7 @@ fn get_content_node(blocks: &[Value]) -> Option<Value> {
             .filter(|result| {
                 !result
                     .pointer("/data/attached_comment")
-                    .map_or(true, Value::is_null)
+                    .is_none_or(Value::is_null)
             })
             .cloned()
     })

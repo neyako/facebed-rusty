@@ -6,9 +6,9 @@ use crate::parsers::util::{
 };
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::{self, ensure_absolute};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
+use std::sync::LazyLock;
 use url::Url;
 
 pub struct JsonPostParser;
@@ -18,7 +18,6 @@ struct ParsedPostDraft {
     unresolved_author_id: Option<String>,
 }
 
-#[async_trait::async_trait]
 impl Parser for JsonPostParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let post_id = extract_post_id(post_path);
@@ -303,10 +302,10 @@ fn value_matches_post_id(value: &Value, post_id: &str) -> bool {
     }
 }
 
-static PAGE_CANONICAL_LINK_SEL: Lazy<scraper::Selector> =
-    Lazy::new(|| scraper::Selector::parse(r#"link[rel="canonical"]"#).unwrap());
-static PAGE_OG_URL_SEL: Lazy<scraper::Selector> =
-    Lazy::new(|| scraper::Selector::parse(r#"meta[property="og:url"]"#).unwrap());
+static PAGE_CANONICAL_LINK_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(r#"link[rel="canonical"]"#).unwrap());
+static PAGE_OG_URL_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(r#"meta[property="og:url"]"#).unwrap());
 
 fn canonical_page_post_id(html: &scraper::Html) -> Option<String> {
     [
@@ -378,7 +377,7 @@ impl PostBlockScanner {
     }
 }
 
-static POST_ID_RE: Lazy<Regex> = Lazy::new(|| {
+static POST_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)
         /posts/(?:[^/?]+/)?([A-Za-z0-9]+)

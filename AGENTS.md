@@ -53,7 +53,7 @@ cookies.example.json      cookies template (both single + multi-account shapes)
 
 Formatting: `cargo fmt` (rustfmt, 2021 edition) — CI enforces `cargo fmt --check`
 and `cargo test --locked` (`.github/workflows/docker-build.yml`), so format
-before pushing. Rust 1.75+ required (rust-version in Cargo.toml).
+before pushing. Rust 1.86+ required (rust-version in Cargo.toml).
 
 ## Runtime config
 

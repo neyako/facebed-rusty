@@ -17,7 +17,6 @@ struct SelectedContentNode {
     video_id: String,
 }
 
-#[async_trait::async_trait]
 impl Parser for ReelsParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         // Full read, always. The old early-stop scanner (stop once delivery +
