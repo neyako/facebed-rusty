@@ -1,12 +1,12 @@
 use crate::cookies::CookieJar;
 use crate::error::{FacebedError, FacebedResult};
 use crate::jq;
+use crate::ttl_map::TtlMap;
 use crate::url_clean::{ensure_absolute, is_facebook_media_host, is_facebook_page_host};
 use regex::Regex;
 use reqwest::{Client, RequestBuilder};
 use scraper::{Html, Selector};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,8 +23,8 @@ tokio::task_local! {
 pub struct Fetcher {
     client: Client,
     cookies: Arc<arc_swap::ArcSwap<CookieJar>>,
-    media_size_cache: Mutex<MediaSizeCache>,
-    profile_cache: Mutex<HashMap<String, (Option<String>, Instant)>>,
+    media_size_cache: Mutex<TtlMap<Option<u64>>>,
+    profile_cache: Mutex<TtlMap<Option<String>>>,
 }
 
 pub struct FetchedPage {
@@ -116,48 +116,6 @@ const PARTIAL_STREAM_DEADLINE: Duration = Duration::from_millis(4500);
 const VIDEO_HEAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const VIDEO_HEAD_CACHE_MAX: usize = 256;
 
-#[derive(Default)]
-struct MediaSizeCache {
-    entries: HashMap<String, CachedContentLength>,
-}
-
-#[derive(Clone, Copy)]
-struct CachedContentLength {
-    value: Option<u64>,
-    checked_at: Instant,
-}
-
-impl MediaSizeCache {
-    fn get(&mut self, url: &str, now: Instant) -> Option<Option<u64>> {
-        let entry = self.entries.get(url).copied()?;
-        if now.duration_since(entry.checked_at) <= VIDEO_HEAD_CACHE_TTL {
-            return Some(entry.value);
-        }
-        self.entries.remove(url);
-        None
-    }
-
-    fn insert(&mut self, url: &str, value: Option<u64>, now: Instant) {
-        if self.entries.len() >= VIDEO_HEAD_CACHE_MAX && !self.entries.contains_key(url) {
-            if let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.checked_at)
-                .map(|(url, _)| url.clone())
-            {
-                self.entries.remove(&oldest);
-            }
-        }
-        self.entries.insert(
-            url.to_owned(),
-            CachedContentLength {
-                value,
-                checked_at: now,
-            },
-        );
-    }
-}
-
 impl Fetcher {
     pub fn new(cookies: Arc<arc_swap::ArcSwap<CookieJar>>) -> anyhow::Result<Self> {
         let client = Client::builder()
@@ -172,8 +130,8 @@ impl Fetcher {
         Ok(Self {
             client,
             cookies,
-            media_size_cache: Mutex::default(),
-            profile_cache: Mutex::default(),
+            media_size_cache: Mutex::new(TtlMap::new(VIDEO_HEAD_CACHE_TTL, VIDEO_HEAD_CACHE_MAX)),
+            profile_cache: Mutex::new(TtlMap::new(PROFILE_CACHE_TTL, PROFILE_CACHE_MAX)),
         })
     }
 
@@ -367,16 +325,9 @@ impl Fetcher {
         if author_id.is_empty() || !author_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return None;
         }
-        if let Ok(cache) = self.profile_cache.lock() {
-            if let Some((value, checked_at)) = cache.get(author_id) {
-                let ttl = if value.is_some() {
-                    PROFILE_CACHE_TTL
-                } else {
-                    PROFILE_MISS_TTL
-                };
-                if checked_at.elapsed() <= ttl {
-                    return value.clone();
-                }
+        if let Ok(mut cache) = self.profile_cache.lock() {
+            if let Some(value) = cache.get(author_id, Instant::now()) {
+                return value;
             }
         }
         let budget = RESPONSE_DEADLINE
@@ -400,17 +351,12 @@ impl Fetcher {
             return None;
         }
         if let Ok(mut cache) = self.profile_cache.lock() {
-            // ponytail: bounded FIFO scan; use an LRU only if this small cache grows.
-            if cache.len() >= PROFILE_CACHE_MAX && !cache.contains_key(author_id) {
-                if let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, (_, at))| *at)
-                    .map(|(id, _)| id.clone())
-                {
-                    cache.remove(&oldest);
-                }
-            }
-            cache.insert(author_id.to_owned(), (value.clone(), Instant::now()));
+            let ttl = if value.is_some() {
+                PROFILE_CACHE_TTL
+            } else {
+                PROFILE_MISS_TTL
+            };
+            cache.insert_for(author_id, value.clone(), Instant::now(), ttl);
         }
         value
     }
@@ -1195,11 +1141,9 @@ mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
         head_target_usable, is_group_landing_target, is_login_wall, is_named_handle,
-        is_post_like_share_target, profile_handle_from_url, share_resolution_usable,
-        MediaSizeCache, ResolvedShare, VIDEO_HEAD_CACHE_MAX, VIDEO_HEAD_CACHE_TTL,
+        is_post_like_share_target, profile_handle_from_url, share_resolution_usable, ResolvedShare,
     };
     use scraper::Html;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn facebook_path_from_url_keeps_query_for_real_targets() {
@@ -1375,30 +1319,6 @@ mod tests {
         let body = r#"<script>{"queryName":"useCometLogInFormQuery","login_data":{}}</script>"#;
         let doc = Html::parse_document(body);
         assert!(is_login_wall(&doc, body));
-    }
-
-    #[test]
-    fn media_size_cache_expires_and_bounds_entries() {
-        let mut cache = MediaSizeCache::default();
-        let now = Instant::now();
-
-        cache.insert("https://video.test/1", Some(123), now);
-        assert_eq!(
-            cache.get("https://video.test/1", now + Duration::from_secs(1)),
-            Some(Some(123))
-        );
-        assert_eq!(
-            cache.get(
-                "https://video.test/1",
-                now + VIDEO_HEAD_CACHE_TTL + Duration::from_secs(1)
-            ),
-            None
-        );
-
-        for i in 0..=VIDEO_HEAD_CACHE_MAX {
-            cache.insert(&format!("https://video.test/{i}"), None, now);
-        }
-        assert!(cache.entries.len() <= VIDEO_HEAD_CACHE_MAX);
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod jq;
 mod notifier;
 mod parsers;
 mod routes;
+mod ttl_map;
 mod url_clean;
 
 use crate::config::Config;
