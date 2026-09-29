@@ -15,6 +15,7 @@ mod embed_cache;
 mod error;
 mod fetch;
 mod jq;
+mod markdown;
 mod notifier;
 mod parsers;
 mod routes;

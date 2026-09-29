@@ -89,12 +89,6 @@ fn escape_markdown(s: &str) -> String {
 /// them as plain text instead of formatting.
 const MD_ESCAPE: &[char] = &['*', '_', '~', '|', '`', '>'];
 
-/// Chars a Facebook-authored `\X` escape may protect. Includes `#` and `\`
-/// themselves, which `MD_ESCAPE` deliberately omits.
-fn is_md_special(c: char) -> bool {
-    MD_ESCAPE.contains(&c) || c == '#' || c == '\\'
-}
-
 fn push_escaped(out: &mut String, c: char) {
     out.push('\\');
     out.push(c);
@@ -125,162 +119,45 @@ fn format_post_description(post: &ParsedPost) -> String {
     output
 }
 
-/// Render trusted FB-group-post text for a Discord embed description.
-/// FB stores plain text, but group posters often write Markdown intending
-/// formatting. Render a safe subset (bold, italic, blockquote) and neutralize the rest.
+/// Render trusted FB-group-post text for a Discord embed description: keep
+/// the formatting [`crate::markdown`] recognizes, neutralize everything else.
 fn render_group_markdown(s: &str) -> String {
+    use crate::markdown::{Block, Span};
     let mut out = String::with_capacity(s.len());
-    for (i, line) in s.split('\n').enumerate() {
-        if i > 0 {
+    for (n, line) in crate::markdown::lines(s).enumerate() {
+        if n > 0 {
             out.push('\n');
         }
-        render_group_markdown_line(&mut out, line);
+        out.push_str(line.indent);
+        match line.block {
+            Block::Quote => out.push_str("> "),
+            Block::Bullet => out.push_str("• "),
+            Block::Plain => {}
+        }
+        let mut in_code = false;
+        for span in line.spans {
+            match span {
+                Span::Text(text) => {
+                    for c in text.chars() {
+                        if !in_code && MD_ESCAPE.contains(&c) {
+                            push_escaped(&mut out, c);
+                        } else {
+                            out.push(c);
+                        }
+                    }
+                }
+                Span::Escaped(c) => push_escaped(&mut out, c),
+                Span::Backslash => push_escaped(&mut out, '\\'),
+                Span::BoldOpen | Span::BoldClose => out.push_str("**"),
+                Span::ItalicOpen(c) | Span::ItalicClose(c) => out.push(c),
+                Span::CodeOpen | Span::CodeClose => {
+                    in_code = span == Span::CodeOpen;
+                    out.push('`');
+                }
+            }
+        }
     }
     out
-}
-
-fn render_group_markdown_line(out: &mut String, line: &str) {
-    let ws_end = line
-        .char_indices()
-        .find(|(_, c)| !c.is_whitespace())
-        .map(|(i, _)| i)
-        .unwrap_or(line.len());
-    out.push_str(&line[..ws_end]);
-    let mut rest = &line[ws_end..];
-
-    let hashes = rest.chars().take_while(|&c| c == '#').count();
-    if (1..=6).contains(&hashes) && rest[hashes..].starts_with(' ') {
-        rest = rest[hashes..].trim_start_matches(' ');
-    }
-
-    if rest == ">" || rest.starts_with("> ") {
-        out.push('>');
-        render_inline(out, &rest[1..]);
-        return;
-    }
-
-    render_inline(out, rest);
-}
-
-fn render_inline(out: &mut String, s: &str) {
-    let chars: Vec<char> = s.chars().collect();
-
-    let mut markers: Vec<usize> = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\\' {
-            i += 2;
-            continue;
-        }
-        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            markers.push(i);
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-
-    let paired = markers.len() - (markers.len() % 2);
-    let mut opens = std::collections::HashSet::new();
-    let mut closes = std::collections::HashSet::new();
-    for (n, &pos) in markers.iter().take(paired).enumerate() {
-        if n % 2 == 0 {
-            opens.insert(pos);
-        } else {
-            closes.insert(pos);
-        }
-    }
-    let (italic_opens, italic_closes) = group_italic_markers(&chars);
-
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\\' {
-            if let Some(&next) = chars.get(i + 1) {
-                if is_md_special(next) {
-                    push_escaped(out, next);
-                    i += 2;
-                    continue;
-                }
-            }
-            push_escaped(out, '\\');
-            i += 1;
-            continue;
-        }
-        if c == '*' && opens.contains(&i) {
-            out.push_str("**");
-            i += 2;
-            while chars.get(i) == Some(&' ') {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '*' && closes.contains(&i) {
-            while out.ends_with(' ') {
-                out.pop();
-            }
-            out.push_str("**");
-            i += 2;
-            continue;
-        }
-        if italic_opens.binary_search(&i).is_ok() || italic_closes.binary_search(&i).is_ok() {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if MD_ESCAPE.contains(&c) {
-            push_escaped(out, c);
-            i += 1;
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-}
-
-/// Pair single, unescaped group emphasis markers. Keep code, bold runs,
-/// intraword underscores, unmatched delimiters, and bullet stars literal.
-pub(crate) fn group_italic_markers(chars: &[char]) -> (Vec<usize>, Vec<usize>) {
-    let (mut opens, mut closes) = (Vec::new(), Vec::new());
-    let mut opening = None;
-    let mut in_code = false;
-    let mut index = 0;
-    while index < chars.len() {
-        let marker = chars[index];
-        if marker == '\\' {
-            index += 2;
-            continue;
-        }
-        if marker == '`' {
-            in_code = !in_code;
-        }
-        let previous = index.checked_sub(1).and_then(|i| chars.get(i));
-        let next = chars.get(index + 1);
-        if !in_code
-            && matches!(marker, '*' | '_')
-            && previous != Some(&marker)
-            && next != Some(&marker)
-            && !(marker == '_'
-                && previous.is_some_and(|c| c.is_alphanumeric())
-                && next.is_some_and(|c| c.is_alphanumeric()))
-        {
-            match opening {
-                Some((start, delimiter))
-                    if marker == delimiter && previous.is_some_and(|c| !c.is_whitespace()) =>
-                {
-                    opens.push(start);
-                    closes.push(index);
-                    opening = None;
-                }
-                None if next.is_some_and(|c| !c.is_whitespace()) => {
-                    opening = Some((index, marker));
-                }
-                _ => {}
-            }
-        }
-        index += 1;
-    }
-    (opens, closes)
 }
 
 fn truncate_chars(s: &str, max: usize) -> &str {
@@ -766,9 +643,9 @@ mod tests {
         assert_eq!(format_description_text("2 * 3 * 4", true), r"2 \* 3 \* 4");
         assert_eq!(
             format_description_text("* item with *italic*", true),
-            r"\* item with *italic*"
+            "• item with *italic*"
         );
-        assert_eq!(format_description_text("`*code*`", true), r"\`\*code\*\`");
+        assert_eq!(format_description_text("`*code*`", true), "`*code*`");
         assert_eq!(
             format_description_text("*italic* _italic_", false),
             r"\*italic\* \_italic\_"
@@ -797,7 +674,7 @@ mod tests {
 
         assert_eq!(
             format_description_text(text, true),
-            r"2 \* 3 \> 5? \`no\` \\ path"
+            r"2 \* 3 \> 5? `no` \\ path"
         );
     }
 
