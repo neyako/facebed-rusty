@@ -275,23 +275,19 @@ fn start_activity(
     Ok(completion)
 }
 
+/// Public liveness probe. Reports counts only: account labels and which
+/// cookie is cooling down are operator details, visible in the logs.
 async fn healthz(State(state): State<AppState>) -> Response {
     use std::sync::atomic::Ordering::Relaxed;
 
     let jar = state.ctx.cookies.load();
-    let accounts: Vec<(String, bool)> = (0..jar.len())
-        .map(|i| {
-            (
-                jar.label_at(i).unwrap_or("?").to_string(),
-                jar.in_cooldown(i),
-            )
-        })
-        .collect();
+    let cooling = (0..jar.len()).filter(|&i| jar.in_cooldown(i)).count();
     let body = build_healthz_json(
         state.started_at.elapsed().as_secs(),
         state.metrics.requests.load(Relaxed),
         state.metrics.errors.load(Relaxed),
-        &accounts,
+        jar.len(),
+        cooling,
     );
     json_response(body)
 }
@@ -319,19 +315,16 @@ fn build_healthz_json(
     uptime_secs: u64,
     requests: u64,
     errors: u64,
-    accounts: &[(String, bool)],
+    accounts: usize,
+    accounts_in_cooldown: usize,
 ) -> String {
-    let accounts: Vec<serde_json::Value> = accounts
-        .iter()
-        .map(|(label, in_cooldown)| serde_json::json!({"label": label, "in_cooldown": in_cooldown}))
-        .collect();
     serde_json::json!({
         "status": "ok",
         "uptime_secs": uptime_secs,
         "requests": requests,
         "errors": errors,
-        "cookie_accounts": accounts.len(),
-        "accounts": accounts,
+        "cookie_accounts": accounts,
+        "accounts_in_cooldown": accounts_in_cooldown,
     })
     .to_string()
 }
@@ -2161,14 +2154,14 @@ mod tests {
 
     #[test]
     fn healthz_json_reports_counters_and_accounts() {
-        let json = build_healthz_json(42, 7, 1, &[("primary".into(), true), ("alt".into(), false)]);
+        let json = build_healthz_json(42, 7, 1, 2, 1);
         assert!(json.contains(r#""status":"ok""#));
         assert!(json.contains(r#""uptime_secs":42"#));
         assert!(json.contains(r#""requests":7"#));
         assert!(json.contains(r#""errors":1"#));
         assert!(json.contains(r#""cookie_accounts":2"#));
-        assert!(json.contains(r#""label":"primary""#));
-        assert!(json.contains(r#""in_cooldown":true"#));
+        assert!(json.contains(r#""accounts_in_cooldown":1"#));
+        assert!(!json.contains("label"));
     }
 
     #[test]

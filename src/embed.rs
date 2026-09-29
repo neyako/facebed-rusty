@@ -634,7 +634,7 @@ pub fn format_error_embed(original_url: &str, error_code: &str) -> String {
 <html lang="">
 <head>
 <meta charset="UTF-8" />
-    <meta name="theme-color" content="#2c3048f" />
+    <meta name="theme-color" content="#2c3048" />
     <meta property="og:title" content="Log in or sign up to view{suffix}"/>
     <meta property="og:description" content="See posts, photos and more on Facebook.
 @neyako for cookies donation"/>
@@ -667,25 +667,21 @@ pub fn format_timeout_embed(original_url: &str) -> String {
     )
 }
 
+/// Body for the 301 humans get. Browsers follow the `Location` header; the
+/// meta refresh covers clients that render the body anyway.
 pub fn format_redirect_page(url: &str) -> String {
     let q = quote(url);
-    let esc = escape_attr(url);
     format!(
         r#"<!DOCTYPE HTML>
 <html lang="en-US">
     <head>
         <meta charset="UTF-8">
         <meta http-equiv="refresh" content="0; url={q}">
-        <script type="text/javascript">
-            window.location.href = "{esc}"
-        </script>
         <title>redirecting...</title>
     </head>
     <body>
     </body>
-</html>"#,
-        q = q,
-        esc = esc,
+</html>"#
     )
 }
 
