@@ -116,10 +116,12 @@ where
     let mut penalized: Vec<usize> = Vec::new();
 
     loop {
+        let cooled = |i: usize| state.ctx.cookies.load().in_cooldown(i);
         let hedge = match queue.front() {
-            Some(Some(i)) if state.ctx.cookies.load().in_cooldown(*i) => None,
+            Some(Some(i)) if cooled(*i) => None,
             Some(next) => Some((*next, false)),
-            None if solo_hedge => Some((first, true)),
+            // Re-read the only identity only if it is a healthy account.
+            None if solo_hedge => first.filter(|i| !cooled(*i)).map(|i| (Some(i), true)),
             None => None,
         }
         .filter(|_| hedge_at <= last_start);
@@ -377,6 +379,46 @@ mod tests {
         let (result, elapsed, _) = race_one_slow_account(4000).await;
         assert!(matches!(result, Err(FacebedError::NoData(_))));
         assert_eq!(elapsed.as_millis(), 6000);
+    }
+
+    /// Every attempt fails after 5s; returns the identities tried in order.
+    async fn identities_tried(state: &AppState, order: Vec<Option<usize>>) -> Vec<Option<usize>> {
+        let tried = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempt = |identity: Option<usize>| {
+            tried.lock().unwrap().push(identity);
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Err(FacebedError::no_data("slow"))
+            }
+        };
+        let path = "groups/1/posts/2/";
+        let _ =
+            super::race_identities(state, path, ParserKind::JsonPost, None, order, attempt).await;
+        let tried = tried.lock().unwrap().clone();
+        tried
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guest_is_never_reread() {
+        assert_eq!(
+            identities_tried(&test_state(), vec![None]).await,
+            vec![None]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooled_account_is_never_reread() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.json");
+        std::fs::write(&path, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        let jar = crate::cookies::CookieJar::load(&path).unwrap();
+        jar.mark_failed(0);
+        state.ctx.cookies.store(Arc::new(jar));
+        assert_eq!(
+            identities_tried(&state, vec![Some(0)]).await,
+            vec![Some(0), None]
+        );
     }
 
     #[test]
