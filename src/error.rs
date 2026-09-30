@@ -5,6 +5,11 @@ pub enum FacebedError {
     #[error("no data: {0}")]
     NoData(String),
 
+    /// Facebook ignored the session cookie. Unlike [`Self::NoData`] this is
+    /// evidence against the account, not the content.
+    #[error("login wall: {0}")]
+    LoginWall(String),
+
     #[error("parse: {message}")]
     Parse {
         message: String,
@@ -15,14 +20,8 @@ pub enum FacebedError {
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-
-    #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
 
     #[error("other: {0}")]
     Other(#[from] anyhow::Error),
@@ -65,9 +64,12 @@ impl FacebedError {
 
     pub fn error_code(&self) -> &'static str {
         match self {
-            Self::NoData(_) | Self::RateLimited { .. } | Self::Checkpointed => "C",
+            Self::NoData(_)
+            | Self::LoginWall(_)
+            | Self::RateLimited { .. }
+            | Self::Checkpointed => "C",
             Self::Parse { .. } => "P",
-            Self::Http(_) | Self::Io(_) | Self::Json(_) | Self::Yaml(_) => "U",
+            Self::Http(_) | Self::Json(_) => "U",
             Self::Other(_) => "X",
         }
     }

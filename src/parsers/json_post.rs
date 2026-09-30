@@ -6,9 +6,9 @@ use crate::parsers::util::{
 };
 use crate::parsers::{banned_post, ParsedPost, Parser, ParserCtx};
 use crate::url_clean::{self, ensure_absolute};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
+use std::sync::LazyLock;
 use url::Url;
 
 pub struct JsonPostParser;
@@ -18,7 +18,6 @@ struct ParsedPostDraft {
     unresolved_author_id: Option<String>,
 }
 
-#[async_trait::async_trait]
 impl Parser for JsonPostParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         let post_id = extract_post_id(post_path);
@@ -30,7 +29,7 @@ impl Parser for JsonPostParser {
             {
                 let page = ctx
                     .fetcher
-                    .fetch_until(post_path, true, |bytes| match &mode {
+                    .fetch_until(post_path, |bytes| match &mode {
                         PartialFetchMode::PostId => scanner.found_match(bytes, &pid),
                         PartialFetchMode::PermalinkNode => scanner.found_permalink_target(bytes),
                     })
@@ -62,7 +61,7 @@ impl Parser for JsonPostParser {
         }
 
         let parsed = {
-            let page = ctx.fetcher.fetch(post_path, true).await?;
+            let page = ctx.fetcher.fetch(post_path).await?;
             parse_page(ctx, post_path, post_id.as_deref(), &page)
         };
         Ok(resolve_author_handle(ctx, parsed?).await)
@@ -286,7 +285,7 @@ fn get_post_json_for_page<'a>(
 fn story_matches_post_id(story: &Value, post_id: &str) -> bool {
     story
         .get("post_id")
-        .is_some_and(|value| value_matches_post_id(value, post_id))
+        .is_some_and(|value| crate::parsers::util::value_matches_id(value, post_id))
         || story
             .get("wwwURL")
             .and_then(Value::as_str)
@@ -295,18 +294,10 @@ fn story_matches_post_id(story: &Value, post_id: &str) -> bool {
             == Some(post_id)
 }
 
-fn value_matches_post_id(value: &Value, post_id: &str) -> bool {
-    match value {
-        Value::String(value) => value == post_id,
-        Value::Number(value) => value.to_string() == post_id,
-        _ => false,
-    }
-}
-
-static PAGE_CANONICAL_LINK_SEL: Lazy<scraper::Selector> =
-    Lazy::new(|| scraper::Selector::parse(r#"link[rel="canonical"]"#).unwrap());
-static PAGE_OG_URL_SEL: Lazy<scraper::Selector> =
-    Lazy::new(|| scraper::Selector::parse(r#"meta[property="og:url"]"#).unwrap());
+static PAGE_CANONICAL_LINK_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(r#"link[rel="canonical"]"#).unwrap());
+static PAGE_OG_URL_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(r#"meta[property="og:url"]"#).unwrap());
 
 fn canonical_page_post_id(html: &scraper::Html) -> Option<String> {
     [
@@ -378,7 +369,7 @@ impl PostBlockScanner {
     }
 }
 
-static POST_ID_RE: Lazy<Regex> = Lazy::new(|| {
+static POST_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)
         /posts/(?:[^/?]+/)?([A-Za-z0-9]+)

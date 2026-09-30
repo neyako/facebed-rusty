@@ -1,51 +1,30 @@
 use crate::cookies::CookieJar;
 use crate::error::{FacebedError, FacebedResult};
 use crate::jq;
+use crate::ttl_map::TtlMap;
 use crate::url_clean::{ensure_absolute, is_facebook_media_host, is_facebook_page_host};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{Client, RequestBuilder};
 use scraper::{Html, Selector};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use url::Url;
 
 tokio::task_local! {
     /// When set, [`Fetcher::fetch`] uses this account index (modulo account count)
-    /// instead of the primary account. Used by the per-request retry loop to
-    /// deterministically try fallback cookie accounts.
-    pub static ACCOUNT_OVERRIDE: usize;
+    /// instead of the primary account, or no cookies at all for `None` (guest).
+    /// Set per attempt by the account race in `routes::scrape_with_accounts`.
+    pub static ACCOUNT_OVERRIDE: Option<usize>;
     pub static RESPONSE_DEADLINE: Instant;
 }
 
 pub struct Fetcher {
     client: Client,
-    media_client: Client,
     cookies: Arc<arc_swap::ArcSwap<CookieJar>>,
-    media_size_cache: Mutex<MediaSizeCache>,
-    profile_cache: Mutex<HashMap<String, (Option<String>, Instant)>>,
-}
-
-/// Max redirect hops the media proxy will follow.
-const MEDIA_MAX_REDIRECTS: usize = 4;
-
-/// Decide whether the media proxy may follow a redirect to `next_host` after
-/// `hops_so_far` hops. Every hop must stay on the Facebook media allowlist, and
-/// the chain is capped. `next_host` is `None` when the URL has no host.
-pub fn media_redirect_ok(next_host: Option<&str>, hops_so_far: usize) -> bool {
-    hops_so_far < MEDIA_MAX_REDIRECTS
-        && next_host
-            .map(crate::url_clean::is_facebook_media_host)
-            .unwrap_or(false)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageType {
-    HasData,
-    LoginWall,
-    Unknown,
+    media_size_cache: Mutex<TtlMap<Option<u64>>>,
+    profile_cache: Mutex<TtlMap<Option<String>>>,
 }
 
 pub struct FetchedPage {
@@ -73,6 +52,38 @@ pub struct CookieAccountCheck {
 }
 
 impl FetchedPage {
+    /// Parse `html` and reject login walls. Parser tests build pages from
+    /// fixtures with this, bypassing the network.
+    pub(crate) fn from_html(
+        url: String,
+        html: String,
+        post_path: &str,
+        partial: bool,
+        deadline_cut: bool,
+    ) -> FacebedResult<Self> {
+        let parse_started = Instant::now();
+        let document = Html::parse_document(&html);
+        let parse_ms = parse_started.elapsed().as_millis();
+        let page = Self {
+            url,
+            html,
+            document,
+            partial,
+            deadline_cut,
+            json_blocks: OnceLock::new(),
+        };
+        let probe_started = Instant::now();
+        check_or_raise(&page, post_path)?;
+        tracing::debug!(
+            path = %post_path,
+            partial,
+            parse_ms,
+            probe_ms = probe_started.elapsed().as_millis(),
+            "facebook html parsed"
+        );
+        Ok(page)
+    }
+
     pub fn document(&self) -> &Html {
         &self.document
     }
@@ -137,48 +148,6 @@ const PARTIAL_STREAM_DEADLINE: Duration = Duration::from_millis(4500);
 const VIDEO_HEAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const VIDEO_HEAD_CACHE_MAX: usize = 256;
 
-#[derive(Default)]
-struct MediaSizeCache {
-    entries: HashMap<String, CachedContentLength>,
-}
-
-#[derive(Clone, Copy)]
-struct CachedContentLength {
-    value: Option<u64>,
-    checked_at: Instant,
-}
-
-impl MediaSizeCache {
-    fn get(&mut self, url: &str, now: Instant) -> Option<Option<u64>> {
-        let entry = self.entries.get(url).copied()?;
-        if now.duration_since(entry.checked_at) <= VIDEO_HEAD_CACHE_TTL {
-            return Some(entry.value);
-        }
-        self.entries.remove(url);
-        None
-    }
-
-    fn insert(&mut self, url: &str, value: Option<u64>, now: Instant) {
-        if self.entries.len() >= VIDEO_HEAD_CACHE_MAX && !self.entries.contains_key(url) {
-            if let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.checked_at)
-                .map(|(url, _)| url.clone())
-            {
-                self.entries.remove(&oldest);
-            }
-        }
-        self.entries.insert(
-            url.to_owned(),
-            CachedContentLength {
-                value,
-                checked_at: now,
-            },
-        );
-    }
-}
-
 impl Fetcher {
     pub fn new(cookies: Arc<arc_swap::ArcSwap<CookieJar>>) -> anyhow::Result<Self> {
         let client = Client::builder()
@@ -190,35 +159,16 @@ impl Fetcher {
             // into an opaque decode error.
             .timeout(Duration::from_secs(15))
             .build()?;
-        let media_client = Client::builder()
-            .gzip(true)
-            .brotli(true)
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                let host = attempt.url().host_str().map(|h| h.to_owned());
-                if media_redirect_ok(host.as_deref(), attempt.previous().len()) {
-                    attempt.follow()
-                } else {
-                    attempt.stop()
-                }
-            }))
-            .build()?;
         Ok(Self {
             client,
-            media_client,
             cookies,
-            media_size_cache: Mutex::default(),
-            profile_cache: Mutex::default(),
+            media_size_cache: Mutex::new(TtlMap::new(VIDEO_HEAD_CACHE_TTL, VIDEO_HEAD_CACHE_MAX)),
+            profile_cache: Mutex::new(TtlMap::new(PROFILE_CACHE_TTL, PROFILE_CACHE_MAX)),
         })
     }
 
     pub fn client(&self) -> &Client {
         &self.client
-    }
-
-    pub fn media_client(&self) -> &Client {
-        &self.media_client
     }
 
     pub async fn check_cookie_accounts(&self) -> Vec<CookieAccountCheck> {
@@ -407,16 +357,9 @@ impl Fetcher {
         if author_id.is_empty() || !author_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return None;
         }
-        if let Ok(cache) = self.profile_cache.lock() {
-            if let Some((value, checked_at)) = cache.get(author_id) {
-                let ttl = if value.is_some() {
-                    PROFILE_CACHE_TTL
-                } else {
-                    PROFILE_MISS_TTL
-                };
-                if checked_at.elapsed() <= ttl {
-                    return value.clone();
-                }
+        if let Ok(mut cache) = self.profile_cache.lock() {
+            if let Some(value) = cache.get(author_id, Instant::now()) {
+                return value;
             }
         }
         let budget = RESPONSE_DEADLINE
@@ -433,18 +376,19 @@ impl Fetcher {
         let value = tokio::time::timeout(budget, self.fetch_profile_handle(author_id))
             .await
             .unwrap_or(None);
+        // Guests can't see most profiles; a guest miss says nothing about
+        // what a cookie account would get, so don't let it shadow them.
+        let guest = matches!(ACCOUNT_OVERRIDE.try_with(|index| *index), Ok(None));
+        if value.is_none() && guest {
+            return None;
+        }
         if let Ok(mut cache) = self.profile_cache.lock() {
-            // ponytail: bounded FIFO scan; use an LRU only if this small cache grows.
-            if cache.len() >= PROFILE_CACHE_MAX && !cache.contains_key(author_id) {
-                if let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, (_, at))| *at)
-                    .map(|(id, _)| id.clone())
-                {
-                    cache.remove(&oldest);
-                }
-            }
-            cache.insert(author_id.to_owned(), (value.clone(), Instant::now()));
+            let ttl = if value.is_some() {
+                PROFILE_CACHE_TTL
+            } else {
+                PROFILE_MISS_TTL
+            };
+            cache.insert_for(author_id, value.clone(), Instant::now(), ttl);
         }
         value
     }
@@ -457,7 +401,7 @@ impl Fetcher {
         let account_index = if self.cookies.load().is_empty() {
             None
         } else {
-            Some(ACCOUNT_OVERRIDE.try_with(|index| *index).unwrap_or(0))
+            ACCOUNT_OVERRIDE.try_with(|index| *index).unwrap_or(Some(0))
         };
         let mut request = self.client.head(profile_url.as_str());
         for (key, value) in HEADERS {
@@ -474,11 +418,11 @@ impl Fetcher {
             .flatten()
     }
 
-    /// Fetch a Facebook path. Optionally attach cookies. Raises NoData on login walls.
-    pub async fn fetch(&self, post_path: &str, use_cookies: bool) -> FacebedResult<FetchedPage> {
+    /// Fetch a Facebook path. Optionally attach cookies. Raises LoginWall on login walls.
+    pub async fn fetch(&self, post_path: &str) -> FacebedResult<FetchedPage> {
         let started = Instant::now();
         let url = facebook_fetch_url(post_path)?;
-        let (req, account_label) = self.request_for(&url, use_cookies);
+        let (req, account_label) = self.request_for(&url);
         let resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
@@ -492,7 +436,7 @@ impl Fetcher {
         let html = resp.text().await?;
         let read_ms = read_started.elapsed().as_millis();
         tracing::debug!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = false, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
-        self.page_from_html(url, html, post_path, false, false)
+        FetchedPage::from_html(url, html, post_path, false, false)
     }
 
     /// Fetch a Facebook path, stopping early once `should_stop` says the
@@ -501,7 +445,6 @@ impl Fetcher {
     pub async fn fetch_until<F>(
         &self,
         post_path: &str,
-        use_cookies: bool,
         mut should_stop: F,
     ) -> FacebedResult<FetchedPage>
     where
@@ -509,7 +452,7 @@ impl Fetcher {
     {
         let started = Instant::now();
         let url = facebook_fetch_url(post_path)?;
-        let (req, account_label) = self.request_for(&url, use_cookies);
+        let (req, account_label) = self.request_for(&url);
         let mut resp = req.send().await?;
         let response_ms = started.elapsed().as_millis();
         let status = resp.status();
@@ -559,7 +502,7 @@ impl Fetcher {
             );
         }
         tracing::debug!(path = %post_path, account = %account_label, status = %status, final_url = %final_url, len = html.len(), partial = stopped_early || deadline_cut, response_ms, read_ms, total_ms = started.elapsed().as_millis(), "fetch done");
-        self.page_from_html(
+        FetchedPage::from_html(
             url,
             html,
             post_path,
@@ -568,7 +511,9 @@ impl Fetcher {
         )
     }
 
-    fn request_for(&self, url: &str, use_cookies: bool) -> (RequestBuilder, String) {
+    /// GET `url` as the attempt's identity: the account in [`ACCOUNT_OVERRIDE`]
+    /// (account 0 outside a race), or no cookies for guest (`None`).
+    fn request_for(&self, url: &str) -> (RequestBuilder, String) {
         let mut req = self.client.get(url);
         for (k, v) in HEADERS {
             req = req.header(*k, *v);
@@ -576,52 +521,15 @@ impl Fetcher {
         let mut account_label = String::new();
         let mut user_agent: &str = DEFAULT_USER_AGENT;
         let guard = self.cookies.load();
-        if use_cookies {
-            let acc = ACCOUNT_OVERRIDE
-                .try_with(|i| guard.account_at(*i))
-                .ok()
-                .flatten()
-                .or_else(|| guard.account_at(0));
-            if let Some(acc) = acc {
-                account_label = acc.label.clone();
-                req = req.header("cookie", acc.header_value());
-                if let Some(ua) = acc.user_agent.as_deref() {
-                    user_agent = ua;
-                }
+        let index = ACCOUNT_OVERRIDE.try_with(|i| *i).unwrap_or(Some(0));
+        if let Some(acc) = index.and_then(|i| guard.account_at(i)) {
+            account_label = acc.label.clone();
+            req = req.header("cookie", acc.header_value());
+            if let Some(ua) = acc.user_agent.as_deref() {
+                user_agent = ua;
             }
         }
         (req.header("user-agent", user_agent), account_label)
-    }
-
-    fn page_from_html(
-        &self,
-        url: String,
-        html: String,
-        post_path: &str,
-        partial: bool,
-        deadline_cut: bool,
-    ) -> FacebedResult<FetchedPage> {
-        let parse_started = Instant::now();
-        let document = Html::parse_document(&html);
-        let parse_ms = parse_started.elapsed().as_millis();
-        let page = FetchedPage {
-            url,
-            html,
-            document,
-            partial,
-            deadline_cut,
-            json_blocks: OnceLock::new(),
-        };
-        let probe_started = Instant::now();
-        check_or_raise(&page, post_path)?;
-        tracing::debug!(
-            path = %post_path,
-            partial,
-            parse_ms,
-            probe_ms = probe_started.elapsed().as_millis(),
-            "facebook html parsed"
-        );
-        Ok(page)
     }
 }
 
@@ -677,12 +585,7 @@ async fn resolve_share_link_public(
         }
     }
 
-    let resolved = resolve_share_link_body(fetcher, path, None).await?;
-    if share_resolution_usable(&resolved) {
-        return Ok(resolved);
-    }
-
-    Ok(resolved)
+    resolve_share_link_body(fetcher, path, None).await
 }
 
 fn is_share_v_path(path: &str) -> bool {
@@ -724,7 +627,7 @@ async fn resolve_share_link_with_accounts(
     path: &str,
     is_share_v: bool,
 ) -> Option<ResolvedShare> {
-    for account_index in share_account_order(fetcher) {
+    for account_index in fetcher.cookies.load().priority_order() {
         let label = fetcher
             .cookies
             .load()
@@ -757,21 +660,6 @@ async fn resolve_share_link_with_accounts(
         }
     }
     None
-}
-
-fn share_account_order(fetcher: &Fetcher) -> Vec<usize> {
-    let guard = fetcher.cookies.load();
-    let n = guard.len();
-    let mut healthy = Vec::new();
-    let mut cooled = Vec::new();
-    for i in 0..n {
-        if guard.in_cooldown(i) {
-            cooled.push(i);
-        } else {
-            healthy.push(i);
-        }
-    }
-    healthy.into_iter().chain(cooled).collect()
 }
 
 async fn resolve_share_link_body(
@@ -1093,8 +981,8 @@ fn current_user_name_from_json_blocks(doc: &Html) -> Option<String> {
     None
 }
 
-static CURRENT_USER_NAME_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#""NAME"\s*:\s*"((?:\\.|[^"\\])*)""#).unwrap());
+static CURRENT_USER_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""NAME"\s*:\s*"((?:\\.|[^"\\])*)""#).unwrap());
 
 fn current_user_name_from_body(body: &str) -> Option<String> {
     let mut offset = 0;
@@ -1127,18 +1015,19 @@ fn meta_content(doc: &Html, selector: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-static LOGIN_HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"/login\b").unwrap());
-static LOGIN_META_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)URL\s*=\s*/login[/?]").unwrap());
-static CANONICAL_LINK_SEL: Lazy<Selector> =
-    Lazy::new(|| Selector::parse(r#"link[rel="canonical"]"#).unwrap());
-static REFRESH_META_SEL: Lazy<Selector> =
-    Lazy::new(|| Selector::parse(r#"meta[http-equiv="refresh"]"#).unwrap());
-static JSON_SCRIPT_SEL: Lazy<Selector> = Lazy::new(|| {
+static LOGIN_HREF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/login\b").unwrap());
+static LOGIN_META_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)URL\s*=\s*/login[/?]").unwrap());
+static CANONICAL_LINK_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"link[rel="canonical"]"#).unwrap());
+static REFRESH_META_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"meta[http-equiv="refresh"]"#).unwrap());
+static JSON_SCRIPT_SEL: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse(r#"script[type="application/json"][data-content-len][data-sjs]"#).unwrap()
 });
-static OG_URL_SEL: Lazy<Selector> =
-    Lazy::new(|| Selector::parse(r#"meta[property="og:url"]"#).unwrap());
-static TITLE_SEL: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
+static OG_URL_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"meta[property="og:url"]"#).unwrap());
+static TITLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").unwrap());
 
 /// Classify a Facebook response that indicates the request was blocked rather
 /// than served. Rate limits are transient; checkpoint/recovery redirects need a
@@ -1169,42 +1058,28 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-pub fn probe_page_type(html: &Html, body: &str) -> PageType {
-    if let Some(el) = html.select(&CANONICAL_LINK_SEL).next() {
-        if let Some(href) = el.value().attr("href") {
-            if LOGIN_HREF_RE.is_match(href) {
-                return PageType::LoginWall;
-            }
-        }
-    }
-    if let Some(el) = html.select(&REFRESH_META_SEL).next() {
-        if let Some(content) = el.value().attr("content") {
-            if LOGIN_META_RE.is_match(content) {
-                return PageType::LoginWall;
-            }
-        }
-    }
-
-    let has_post_data = body.contains("i18n_reaction_count");
-    let has_login_preloader =
-        body.contains("login_data") || body.contains("useCometLogInFormQuery");
-
-    if has_post_data {
-        PageType::HasData
-    } else if has_login_preloader {
-        PageType::LoginWall
-    } else {
-        PageType::Unknown
-    }
+/// True when Facebook served a login wall instead of the content. A page
+/// that carries post data wins over a stray login preloader.
+pub fn is_login_wall(html: &Html, body: &str) -> bool {
+    let attr_matches = |sel: &Selector, attr: &str, re: &Regex| {
+        html.select(sel)
+            .next()
+            .and_then(|el| el.value().attr(attr))
+            .is_some_and(|value| re.is_match(value))
+    };
+    attr_matches(&CANONICAL_LINK_SEL, "href", &LOGIN_HREF_RE)
+        || attr_matches(&REFRESH_META_SEL, "content", &LOGIN_META_RE)
+        || (!body.contains("i18n_reaction_count")
+            && (body.contains("login_data") || body.contains("useCometLogInFormQuery")))
 }
 
 pub fn check_or_raise(page: &FetchedPage, post_path: &str) -> FacebedResult<()> {
-    match probe_page_type(page.document(), &page.html) {
-        PageType::LoginWall => Err(FacebedError::no_data(format!(
+    if is_login_wall(page.document(), &page.html) {
+        return Err(FacebedError::LoginWall(format!(
             "Facebook served a login wall for {post_path} - content requires authentication"
-        ))),
-        _ => Ok(()),
+        )));
     }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1266,12 +1141,10 @@ pub fn get_json_blocks(html: &Html, sort: bool) -> Vec<Value> {
 mod tests {
     use super::{
         cookie_probe_blocked_reason, extract_account_name, facebook_path_from_url,
-        head_target_usable, is_group_landing_target, is_named_handle, is_post_like_share_target,
-        probe_page_type, profile_handle_from_url, share_resolution_usable, MediaSizeCache,
-        PageType, ResolvedShare, VIDEO_HEAD_CACHE_MAX, VIDEO_HEAD_CACHE_TTL,
+        head_target_usable, is_group_landing_target, is_login_wall, is_named_handle,
+        is_post_like_share_target, profile_handle_from_url, share_resolution_usable, ResolvedShare,
     };
     use scraper::Html;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn facebook_path_from_url_keeps_query_for_real_targets() {
@@ -1323,19 +1196,6 @@ mod tests {
             super::facebook_fetch_url("https://example.com/x?type=3"),
             Err(FacebedError::NoData(_))
         ));
-    }
-
-    #[test]
-    fn media_redirect_blocks_offsite_and_caps_hops() {
-        use super::media_redirect_ok;
-
-        assert!(media_redirect_ok(Some("scontent.xx.fbcdn.net"), 0));
-        assert!(media_redirect_ok(Some("video.fbcdn.net"), 2));
-        assert!(!media_redirect_ok(Some("169.254.169.254"), 0));
-        assert!(!media_redirect_ok(Some("evil.example.com"), 0));
-        assert!(!media_redirect_ok(Some("evilfbcdn.net"), 0));
-        assert!(!media_redirect_ok(None, 0));
-        assert!(!media_redirect_ok(Some("scontent.xx.fbcdn.net"), 4));
     }
 
     #[test]
@@ -1449,41 +1309,17 @@ mod tests {
     }
 
     #[test]
-    fn probe_page_type_uses_raw_post_data_fast_path() {
-        let body = r#"<script type="application/json">{"i18n_reaction_count":"1K"}</script>"#;
+    fn login_wall_ignores_preloader_when_post_data_present() {
+        let body = r#"<script>{"i18n_reaction_count":"1K","login_data":{}}</script>"#;
         let doc = Html::parse_document(body);
-        assert_eq!(probe_page_type(&doc, body), PageType::HasData);
+        assert!(!is_login_wall(&doc, body));
     }
 
     #[test]
-    fn probe_page_type_detects_raw_login_preloader() {
+    fn login_wall_detects_raw_login_preloader() {
         let body = r#"<script>{"queryName":"useCometLogInFormQuery","login_data":{}}</script>"#;
         let doc = Html::parse_document(body);
-        assert_eq!(probe_page_type(&doc, body), PageType::LoginWall);
-    }
-
-    #[test]
-    fn media_size_cache_expires_and_bounds_entries() {
-        let mut cache = MediaSizeCache::default();
-        let now = Instant::now();
-
-        cache.insert("https://video.test/1", Some(123), now);
-        assert_eq!(
-            cache.get("https://video.test/1", now + Duration::from_secs(1)),
-            Some(Some(123))
-        );
-        assert_eq!(
-            cache.get(
-                "https://video.test/1",
-                now + VIDEO_HEAD_CACHE_TTL + Duration::from_secs(1)
-            ),
-            None
-        );
-
-        for i in 0..=VIDEO_HEAD_CACHE_MAX {
-            cache.insert(&format!("https://video.test/{i}"), None, now);
-        }
-        assert!(cache.entries.len() <= VIDEO_HEAD_CACHE_MAX);
+        assert!(is_login_wall(&doc, body));
     }
 
     #[test]

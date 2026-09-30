@@ -30,7 +30,8 @@ fn status_json_uses_bare_real_handle_without_platform_domain() {
     let post = post("qualified account".to_owned(), vec![]);
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert_eq!(json["account"]["display_name"], "Example Author");
@@ -101,7 +102,8 @@ fn status_json_preserves_long_escaped_text_without_media() {
         vec![],
     );
 
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     assert!(json["content"].as_str().unwrap().contains("FINAL_SENTINEL"));
     assert!(json["content"]
@@ -130,7 +132,8 @@ fn status_json_appends_full_engagement_for_image_text_content() {
     post.top_reaction_ids = vec![ReactionKind::Haha, ReactionKind::Like];
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert!(json["content"]
@@ -152,7 +155,8 @@ fn status_json_appends_engagement_for_mixed_image_video_content() {
     post.video_links = vec!["https://video.example/post.mp4".to_owned()];
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert!(json["content"]
@@ -171,7 +175,8 @@ fn status_json_omits_engagement_for_video_only_content() {
     post.video_links = vec!["https://video.example/post.mp4".to_owned()];
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert!(!json["content"]
@@ -197,7 +202,8 @@ fn status_json_keeps_engagement_after_quoted_content() {
     });
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
     let content = json["content"].as_str().unwrap();
 
     // Then
@@ -215,7 +221,8 @@ fn status_json_escapes_activity_engagement() {
     post.shares = "null".to_owned();
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert!(json["content"]
@@ -234,7 +241,8 @@ fn status_json_renders_safe_group_markdown_as_activity_html() {
     post.allow_discord_markdown = true;
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
     let content = json["content"].as_str().unwrap();
 
     // Then
@@ -256,7 +264,8 @@ fn status_json_keeps_non_group_markdown_literal() {
     );
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
     let content = json["content"].as_str().unwrap();
 
     // Then
@@ -307,7 +316,8 @@ fn status_json_links_quoted_post_heading_with_fixupx_spacing() {
     });
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
     let content = json["content"].as_str().unwrap();
 
     // Then
@@ -323,7 +333,8 @@ fn status_json_uses_absolute_https_account_images() {
     let post = post("text-only".to_owned(), vec![]);
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     for field in ["avatar", "avatar_static", "header", "header_static"] {
@@ -351,17 +362,18 @@ fn status_json_uses_facebed_logo_for_avatar_and_banner_for_header() {
     post.author_id = None;
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert_eq!(
         json["account"]["avatar"],
-        "https://facebed.neyahub.com/favicon.ico"
+        "https://facebed.example/favicon.ico"
     );
     assert_eq!(json["account"]["avatar_static"], json["account"]["avatar"]);
     assert_eq!(
         json["account"]["header"],
-        "https://facebed.neyahub.com/banner.png"
+        "https://facebed.example/banner.png"
     );
     assert_eq!(json["account"]["header_static"], json["account"]["header"]);
 }
@@ -373,7 +385,8 @@ fn status_json_uses_numeric_author_id_for_profile_avatar() {
     post.author_avatar_url = None;
     post.author_id = Some("61579685171950".to_owned());
 
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     assert_eq!(
         json["account"]["avatar"],
@@ -389,7 +402,8 @@ fn status_json_uses_facebook_profile_picture_when_handle_has_no_embedded_avatar(
     post.author_avatar_url = None;
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert_eq!(
@@ -405,7 +419,8 @@ fn status_json_uses_real_author_avatar_when_available() {
     let post = post("text-only".to_owned(), vec![]);
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert_eq!(json["account"]["avatar"], "https://img.example/avatar.jpg");
@@ -420,7 +435,8 @@ fn status_json_uses_video_attachment_when_post_has_no_images() {
     post.thumbnail = Some("https://img.example/post.jpg".to_owned());
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
 
     // Then
     assert_eq!(
@@ -452,7 +468,8 @@ fn status_json_keeps_mastodon_image_attachments_in_source_order() {
     );
 
     // When
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
     let attachments = json["media_attachments"].as_array().unwrap();
 
     // Then
@@ -492,7 +509,8 @@ fn status_json_limits_gallery_to_first_four_images() {
         ],
     );
 
-    let json: Value = serde_json::from_str(&status_json("123", &post)).unwrap();
+    let json: Value =
+        serde_json::from_str(&status_json("123", &post, "https://facebed.example")).unwrap();
     let attachments = json["media_attachments"].as_array().unwrap();
 
     assert_eq!(attachments.len(), 4);

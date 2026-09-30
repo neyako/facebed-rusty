@@ -13,6 +13,9 @@ pub mod stories;
 pub mod util;
 pub mod video_watch;
 
+#[cfg(test)]
+mod fixtures;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostContext {
     pub author_name: String,
@@ -127,8 +130,7 @@ pub fn banned_post(url: &str) -> ParsedPost {
     }
 }
 
-#[async_trait::async_trait]
-pub trait Parser {
+pub(crate) trait Parser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost>;
 }
 

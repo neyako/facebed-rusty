@@ -1,9 +1,9 @@
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 /// Crawlers/bots whose User-Agent should receive the embed instead of a redirect.
 /// Pattern is a single case-insensitive regex.
-static CRAWLER_RE: Lazy<Regex> = Lazy::new(|| {
+static CRAWLER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(discordbot|slackbot|telegrambot|twitterbot|facebookexternalhit|whatsapp|skypeuripreview|redditbot|linkedinbot|googlebot|bingbot|yandexbot|duckduckbot|applebot|petalbot|gptbot|chatgpt-user|claudebot|bytespider|crawler|spider|preview|embedly|iframely|tumblrcrawler|developers\.google\.com/\+/web/snippet|nuzzel|outbrain|pinterestbot|qwantify|vkshare|w3c_validator|yahoo|baiduspider|coccocbot|sogou|seznambot|exabot|aolbuild|mediapartners-google|adsbot-google)\b",
     )

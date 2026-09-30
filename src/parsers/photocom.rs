@@ -1,97 +1,104 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::get_json_blocks;
+use crate::fetch::{get_json_blocks, FetchedPage};
 use crate::jq;
 use crate::parsers::util::{
     author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
     top_reactions_from_feedback, val_str_at,
 };
-use crate::parsers::{ParsedPost, Parser, ParserCtx};
+use crate::parsers::{single_photo, ParsedPost, Parser, ParserCtx};
 use serde_json::Value;
 
 pub struct PhotocomParser;
 
-#[async_trait::async_trait]
 impl Parser for PhotocomParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.document();
-        let blocks = get_json_blocks(html, true);
-        let content = get_content_node(&blocks).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Cannot process photocom (cn)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-        let data = content
-            .get("data")
-            .ok_or_else(|| FacebedError::parse("missing data"))?;
-        let attached_comment = data
-            .get("attached_comment")
-            .ok_or_else(|| FacebedError::parse("missing attached_comment"))?;
-        let body = attached_comment.get("preferred_body");
-        let text = body
-            .and_then(|b| b.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let owner = data.get("owner").unwrap_or(&Value::Null);
-        let owner_name = owner
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let date = data
-            .get("created_time")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-
-        let (image, url) = get_attached_image_and_url(&blocks).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Cannot process photocom (iau)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-        let reactions_count = get_reaction_count(&blocks).ok_or_else(|| {
-            FacebedError::parse_with(
-                "Cannot process photocom (rc)",
-                page.html.clone(),
-                page.url.clone(),
-            )
-        })?;
-        let top_reaction_ids = get_reaction_feedback(&blocks)
-            .map(top_reactions_from_feedback)
-            .unwrap_or_default();
-
-        Ok(ParsedPost {
-            author_name: format!("{} (💬)", owner_name),
-            author_id: author_id_in_node(owner),
-            author_handle: author_handle_in_node(owner),
-            author_avatar_url: author_avatar_in_node(owner),
-            context: None,
-            text,
-            allow_discord_markdown: false,
-            image_links: vec![image],
-            url,
-            date,
-            likes: human_format(&reactions_count.into()),
-            top_reaction_ids,
-            comments: "null".into(),
-            shares: "null".into(),
-            video_links: Vec::new(),
-            thumbnail: None,
-        })
+        let page = ctx.fetcher.fetch(post_path).await?;
+        parse_page(post_path, &page)
     }
 }
 
+pub(crate) fn parse_page(post_path: &str, page: &FetchedPage) -> FacebedResult<ParsedPost> {
+    let html = page.document();
+    let blocks = get_json_blocks(html, true);
+    // `type=3` also tags plain album photos (`photo.php?fbid=..&set=a.<album>`).
+    // Those pages carry no attached comment; embed them as a single photo.
+    let Some(content) = get_content_node(&blocks) else {
+        return single_photo::parse_page(post_path, page);
+    };
+    let data = content
+        .get("data")
+        .ok_or_else(|| FacebedError::parse("missing data"))?;
+    let attached_comment = data
+        .get("attached_comment")
+        .ok_or_else(|| FacebedError::parse("missing attached_comment"))?;
+    let body = attached_comment.get("preferred_body");
+    let text = body
+        .and_then(|b| b.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let owner = data.get("owner").unwrap_or(&Value::Null);
+    let owner_name = owner
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let date = data
+        .get("created_time")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let (image, url) = get_attached_image_and_url(&blocks).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Cannot process photocom (iau)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+    let reactions_count = get_reaction_count(&blocks).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Cannot process photocom (rc)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+    let top_reaction_ids = get_reaction_feedback(&blocks)
+        .map(top_reactions_from_feedback)
+        .unwrap_or_default();
+
+    Ok(ParsedPost {
+        author_name: format!("{} (💬)", owner_name),
+        author_id: author_id_in_node(owner),
+        author_handle: author_handle_in_node(owner),
+        author_avatar_url: author_avatar_in_node(owner),
+        context: None,
+        text,
+        allow_discord_markdown: false,
+        image_links: vec![image],
+        url,
+        date,
+        likes: human_format(&reactions_count.into()),
+        top_reaction_ids,
+        comments: "null".into(),
+        shares: "null".into(),
+        video_links: Vec::new(),
+        thumbnail: None,
+    })
+}
+
 fn get_content_node(blocks: &[Value]) -> Option<Value> {
-    for bloc in blocks {
-        if jq::has(bloc, &["attached_comment"]) && !jq::has(bloc, &["unified_reactors"]) {
-            return jq::first(bloc, "result").cloned();
+    blocks.iter().find_map(|bloc| {
+        if !jq::has(bloc, &["attached_comment"]) || jq::has(bloc, &["unified_reactors"]) {
+            return None;
         }
-    }
-    None
+        jq::first(bloc, "result")
+            .filter(|result| {
+                !result
+                    .pointer("/data/attached_comment")
+                    .is_none_or(Value::is_null)
+            })
+            .cloned()
+    })
 }
 
 fn get_reaction_count(blocks: &[Value]) -> Option<i64> {
@@ -137,7 +144,7 @@ mod tests {
         let blocks = vec![
             json!({
                 "attached_comment": {},
-                "result": {"data": {"owner": {
+                "result": {"data": {"attached_comment": {"id": "c1"}, "owner": {
                     "id": "55",
                     "name": "Comment Owner",
                     "profile_picture_depth_0": {"uri": "https://img.example/comment-owner.jpg"}
@@ -168,5 +175,14 @@ mod tests {
                 "https://www.facebook.com/c".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn album_photo_without_attached_comment_has_no_content_node() {
+        let blocks = vec![json!({
+            "attached_comment": null,
+            "result": {"data": {"attached_comment": null, "owner": {"name": "Page"}}}
+        })];
+        assert!(get_content_node(&blocks).is_none());
     }
 }

@@ -1,5 +1,5 @@
 use crate::error::{FacebedError, FacebedResult};
-use crate::fetch::get_json_blocks;
+use crate::fetch::{get_json_blocks, FetchedPage};
 use crate::jq;
 use crate::parsers::util::{
     author_avatar_in_node, author_handle_in_node, author_id_in_node, human_format,
@@ -7,94 +7,98 @@ use crate::parsers::util::{
 };
 use crate::parsers::{ParsedPost, Parser, ParserCtx};
 use crate::url_clean::ensure_absolute;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use scraper::{Html, Selector};
 use serde_json::Value;
+use std::sync::LazyLock;
 use url::Url;
 
 pub struct VideoWatchParser;
 
-static WATCH_FEED_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^https?://[^/]+/watch/?$").unwrap());
+static WATCH_FEED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^https?://[^/]+/watch/?$").unwrap());
 
-#[async_trait::async_trait]
 impl Parser for VideoWatchParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
-        let page = ctx.fetcher.fetch(post_path, true).await?;
-        let html = page.document();
-        let blocks = get_json_blocks(html, true);
-        let target_video_id = target_video_id(post_path);
-        let content_node = get_content_node(
-            &blocks,
-            html,
-            &page.html,
-            &page.url,
-            target_video_id.as_deref(),
-        )?;
-        let video_link = get_video_link(&blocks, &content_node, target_video_id.as_deref())
-            .ok_or_else(|| {
-                FacebedError::parse_with(
-                    "Invalid watch link (vn)",
-                    page.html.clone(),
-                    page.url.clone(),
-                )
-            })?;
+        let page = ctx.fetcher.fetch(post_path).await?;
+        parse_page(post_path, &page)
+    }
+}
 
-        let post_url = ensure_absolute(post_path);
-        let video_id = val_str_at(&content_node, "id")
-            .map(str::to_owned)
-            .or(target_video_id)
-            .unwrap_or_default();
-        let owner = get_op_owner(&blocks, &content_node, &video_id).ok_or_else(|| {
+pub(crate) fn parse_page(post_path: &str, page: &FetchedPage) -> FacebedResult<ParsedPost> {
+    let html = page.document();
+    let blocks = get_json_blocks(html, true);
+    let target_video_id = target_video_id(post_path);
+    let content_node = get_content_node(
+        &blocks,
+        html,
+        &page.html,
+        &page.url,
+        target_video_id.as_deref(),
+    )?;
+    let video_link = get_video_link(&blocks, &content_node, target_video_id.as_deref())
+        .ok_or_else(|| {
             FacebedError::parse_with(
-                "Invalid watch link (opn)",
+                "Invalid watch link (vn)",
                 page.html.clone(),
                 page.url.clone(),
             )
         })?;
-        let op_name = owner_name_from_candidate(&owner).unwrap_or_default();
-        let text = content_node
-            .pointer("/title/text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let likes = content_node
-            .pointer("/feedback/reaction_count/count")
-            .cloned()
-            .unwrap_or(Value::Null);
-        let cmts = content_node
-            .pointer("/feedback/total_comment_count")
-            .cloned()
-            .unwrap_or(Value::Null);
-        let top_reaction_ids =
-            top_reactions_from_feedback(content_node.get("feedback").unwrap_or(&Value::Null));
-        let date = find_creation_time(&blocks).ok_or_else(|| {
-            FacebedError::parse_with("cannot find date", page.html.clone(), page.url.clone())
-        })?;
 
-        let thumbnail = thumbnail_in_node(&content_node)
-            .or_else(|| thumbnail_in_target_blocks(&blocks, &video_id))
-            .or_else(|| blocks.iter().find_map(thumbnail_in_node));
+    let post_url = ensure_absolute(post_path);
+    let video_id = val_str_at(&content_node, "id")
+        .map(str::to_owned)
+        .or(target_video_id)
+        .unwrap_or_default();
+    let owner = get_op_owner(&blocks, &content_node, &video_id).ok_or_else(|| {
+        FacebedError::parse_with(
+            "Invalid watch link (opn)",
+            page.html.clone(),
+            page.url.clone(),
+        )
+    })?;
+    let op_name = owner_name_from_candidate(&owner).unwrap_or_default();
+    let text = content_node
+        .pointer("/title/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let likes = content_node
+        .pointer("/feedback/reaction_count/count")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let cmts = content_node
+        .pointer("/feedback/total_comment_count")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let top_reaction_ids =
+        top_reactions_from_feedback(content_node.get("feedback").unwrap_or(&Value::Null));
+    let date = find_creation_time(&blocks).ok_or_else(|| {
+        FacebedError::parse_with("cannot find date", page.html.clone(), page.url.clone())
+    })?;
 
-        Ok(ParsedPost {
-            author_name: op_name,
-            author_id: author_id_in_node(&owner),
-            author_handle: author_handle_in_node(&owner),
-            author_avatar_url: author_avatar_in_node(&owner),
-            context: None,
-            text,
-            allow_discord_markdown: false,
-            image_links: Vec::new(),
-            url: post_url,
-            date,
-            likes: human_format(&likes),
-            top_reaction_ids,
-            comments: human_format(&cmts),
-            shares: "null".into(),
-            video_links: vec![video_link],
-            thumbnail,
-        })
-    }
+    let thumbnail = thumbnail_in_node(&content_node)
+        .or_else(|| thumbnail_in_target_blocks(&blocks, &video_id))
+        .or_else(|| blocks.iter().find_map(thumbnail_in_node));
+
+    Ok(ParsedPost {
+        author_name: op_name,
+        author_id: author_id_in_node(&owner),
+        author_handle: author_handle_in_node(&owner),
+        author_avatar_url: author_avatar_in_node(&owner),
+        context: None,
+        text,
+        allow_discord_markdown: false,
+        image_links: Vec::new(),
+        url: post_url,
+        date,
+        likes: human_format(&likes),
+        top_reaction_ids,
+        comments: human_format(&cmts),
+        shares: "null".into(),
+        video_links: vec![video_link],
+        thumbnail,
+    })
 }
 
 fn target_video_id(post_path: &str) -> Option<String> {
@@ -223,15 +227,7 @@ fn owner_name_from_candidate(owner: &Value) -> Option<String> {
 fn block_mentions_id(block: &Value, needle: &str) -> bool {
     jq::all(block, "id")
         .into_iter()
-        .any(|value| value_matches_id(value, needle))
-}
-
-fn value_matches_id(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(s) => s == needle,
-        Value::Number(n) => n.to_string() == needle,
-        _ => false,
-    }
+        .any(|value| crate::parsers::util::value_matches_id(value, needle))
 }
 
 fn get_content_node(

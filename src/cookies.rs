@@ -122,61 +122,46 @@ impl CookieJar {
     ///
     /// Each file may be either:
     ///   - Cookie-Editor flat array `[{name, value, ...}, ...]` → 1 account, label from filename
+    ///     (also accepted wrapped as `{"url": ..., "cookies": [...]}`)
     ///   - Multi-account object `{"accounts": [{"label": "...", "entries": [...]}, ...]}`
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let mut accounts = Vec::new();
-        let mut seen: HashSet<PathBuf> = HashSet::new();
+        Self::load_with(path, false)
+    }
 
-        let mut load_one = |p: &Path, accounts: &mut Vec<CookieAccount>| {
-            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            if !seen.insert(canon) {
-                return;
-            }
-            match Self::load_file(p) {
-                Ok(mut got) => accounts.append(&mut got),
-                Err(e) => warn!("failed to load {}: {}", p.display(), e),
-            }
-        };
+    /// Like [`Self::load`], but an unreadable cookie directory or an
+    /// unreadable or malformed cookie file is an error instead of a skipped warning. SIGHUP reload uses this so a bad
+    /// edit keeps the running jar instead of silently dropping accounts.
+    pub fn load_strict(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with(path, true)
+    }
 
-        if path.exists() {
-            load_one(path, &mut accounts);
-        } else {
+    fn load_with(path: &Path, strict: bool) -> anyhow::Result<Self> {
+        if !path.exists() {
             warn!("{} not found", path.display());
         }
-
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        match std::fs::read_dir(&parent) {
-            Ok(rd) => {
-                let mut sibs: Vec<PathBuf> = rd
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        if !p.is_file() {
-                            return false;
-                        }
-                        let n = match p.file_name().and_then(|s| s.to_str()) {
-                            Some(n) => n,
-                            None => return false,
-                        };
-                        n.starts_with("cookies")
-                            && n.ends_with(".json")
-                            && n != "cookies.example.json"
-                    })
-                    .collect();
-                sibs.sort();
-                for p in sibs {
-                    load_one(&p, &mut accounts);
-                }
+        let files = match cookie_files(path, &parent) {
+            Ok(files) => files,
+            Err(e) if strict => anyhow::bail!("could not scan {}: {e}", parent.display()),
+            Err(e) => {
+                warn!("could not scan {} for cookie files: {e}", parent.display());
+                path.exists()
+                    .then(|| path.to_path_buf())
+                    .into_iter()
+                    .collect()
             }
-            Err(e) => warn!(
-                "could not scan {} for cookie files: {}",
-                parent.display(),
-                e
-            ),
+        };
+        let mut accounts = Vec::new();
+        for file in files {
+            match Self::load_file(&file) {
+                Ok(mut got) => accounts.append(&mut got),
+                Err(e) if strict => anyhow::bail!("{}: {e}", file.display()),
+                Err(e) => warn!("failed to load {}: {}", file.display(), e),
+            }
         }
 
         // Sidecar useragents.json: { "alice": "UA-string", ... }. Lets users
@@ -224,6 +209,13 @@ impl CookieJar {
     fn load_file(path: &Path) -> anyhow::Result<Vec<CookieAccount>> {
         let raw = std::fs::read_to_string(path)?;
         let v: serde_json::Value = serde_json::from_str(&raw)?;
+        // `{"url": ..., "cookies": [...]}` exports wrap the flat array.
+        let v = match v {
+            serde_json::Value::Object(mut map) if map.contains_key("cookies") => {
+                map.remove("cookies").unwrap_or_default()
+            }
+            v => v,
+        };
 
         let fname_label = path
             .file_stem()
@@ -266,6 +258,30 @@ impl CookieJar {
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
     }
+}
+
+/// `path` (if present) plus sibling `cookies*.json` files in `parent`,
+/// primary first, siblings sorted, each file once.
+fn cookie_files(path: &Path, parent: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if path.exists() {
+        files.push(path.to_path_buf());
+    }
+    let mut siblings: Vec<PathBuf> = std::fs::read_dir(parent)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|s| s.to_str()).is_some_and(|n| {
+                    n.starts_with("cookies") && n.ends_with(".json") && n != "cookies.example.json"
+                })
+        })
+        .collect();
+    siblings.sort();
+    files.extend(siblings);
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    files.retain(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
+    Ok(files)
 }
 
 /// Read an optional `useragents.json` sidecar from `dir`. Shape:
@@ -405,6 +421,41 @@ impl CookieJar {
         Some(&self.accounts[i % self.accounts.len()].label)
     }
 
+    /// Carry runtime state from the jar a SIGHUP reload replaces. Affinity
+    /// follows the label (same Facebook account). Cooldown and failure counts
+    /// carry over only if the cookie is unchanged: a re-exported cookie is
+    /// usually the fix for them, so it starts clean.
+    pub fn inherit_state(&self, old: &CookieJar) {
+        let index_of = |label: &str| self.accounts.iter().position(|a| a.label == label);
+        for (j, previous) in old.accounts.iter().enumerate() {
+            let Some(i) = index_of(&previous.label) else {
+                continue;
+            };
+            if previous.header_value() == self.accounts[i].header_value() {
+                let until = old.cooldown_until[j].load(Ordering::Relaxed);
+                let failures = old.consecutive_failures[j].load(Ordering::Relaxed);
+                self.cooldown_until[i].store(until, Ordering::Relaxed);
+                self.consecutive_failures[i].store(failures, Ordering::Relaxed);
+            }
+        }
+        let (Ok(previous), Ok(mut current)) = (old.affinity.lock(), self.affinity.lock()) else {
+            return;
+        };
+        for (key, &j) in previous.iter() {
+            if let Some(i) = old.accounts.get(j).and_then(|a| index_of(&a.label)) {
+                current.insert(key.clone(), i);
+            }
+        }
+    }
+
+    /// Account indices in configured priority, healthy ones first and
+    /// cooled-down ones as a last resort.
+    pub fn priority_order(&self) -> Vec<usize> {
+        let (healthy, cooled): (Vec<usize>, Vec<usize>) =
+            (0..self.len()).partition(|&i| !self.in_cooldown(i));
+        healthy.into_iter().chain(cooled).collect()
+    }
+
     /// Account index previously known to succeed for this scope key.
     pub fn affinity_for(&self, key: &str) -> Option<usize> {
         self.affinity.lock().ok()?.get(key).copied()
@@ -426,15 +477,6 @@ impl CookieJar {
         }
         m.insert(key, account_idx % self.accounts.len());
     }
-
-    /// Forget the affinity mapping for `key`. Called when the pinned
-    /// account fails — we'd rather re-discover a working one than keep
-    /// paying the slow first-try cost.
-    pub fn forget_affinity(&self, key: &str) {
-        if let Ok(mut m) = self.affinity.lock() {
-            m.remove(key);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -452,13 +494,57 @@ mod tests {
 
         fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
         fs::write(&alice, r#"[{"name":"c_user","value":"2"}]"#).unwrap();
-        fs::write(&two, r#"[{"name":"c_user","value":"3"}]"#).unwrap();
+        fs::write(
+            &two,
+            r#"{"url":"https://www.facebook.com","cookies":[{"name":"c_user","value":"3"}]}"#,
+        )
+        .unwrap();
         fs::write(&example, r#"[{"name":"c_user","value":"99"}]"#).unwrap();
 
         let jar = CookieJar::load(&main).unwrap();
         let mut labels: Vec<_> = jar.accounts.iter().map(|a| a.label.clone()).collect();
         labels.sort();
         assert_eq!(labels, vec!["2", "alice", "default"]);
+    }
+
+    #[test]
+    fn strict_load_rejects_a_malformed_sibling_lenient_skips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        fs::write(dir.path().join("cookies-bad.json"), "{not json").unwrap();
+        assert_eq!(CookieJar::load(&main).unwrap().len(), 1);
+        assert!(CookieJar::load_strict(&main).is_err());
+    }
+
+    #[test]
+    fn strict_load_rejects_an_unreadable_cookie_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("gone").join("cookies.json");
+        assert!(CookieJar::load(&main).unwrap().is_empty());
+        assert!(CookieJar::load_strict(&main).is_err());
+    }
+
+    #[test]
+    fn reload_keeps_affinity_and_only_keeps_health_for_unchanged_cookies() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("cookies.json");
+        let alice = dir.path().join("cookies-alice.json");
+        fs::write(&main, r#"[{"name":"c_user","value":"1"}]"#).unwrap();
+        fs::write(&alice, r#"[{"name":"c_user","value":"2"}]"#).unwrap();
+        let old = CookieJar::load(&main).unwrap();
+        let (default, alice_index) = (0, 1);
+        old.mark_failed(default);
+        old.mark_failed(alice_index);
+        old.set_affinity("groups/1".into(), alice_index);
+
+        // alice re-exported her cookie; default is untouched.
+        fs::write(&alice, r#"[{"name":"c_user","value":"3"}]"#).unwrap();
+        let new = CookieJar::load(&main).unwrap();
+        new.inherit_state(&old);
+        assert!(new.in_cooldown(default));
+        assert!(!new.in_cooldown(alice_index));
+        assert_eq!(new.affinity_for("groups/1"), Some(alice_index));
     }
 
     #[test]
@@ -485,8 +571,6 @@ mod tests {
         assert_eq!(jar.affinity_for("groups/123"), None);
         jar.set_affinity("groups/123".into(), 1);
         assert_eq!(jar.affinity_for("groups/123"), Some(1));
-        jar.forget_affinity("groups/123");
-        assert_eq!(jar.affinity_for("groups/123"), None);
     }
 
     #[test]

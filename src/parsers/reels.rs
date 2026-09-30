@@ -17,7 +17,6 @@ struct SelectedContentNode {
     video_id: String,
 }
 
-#[async_trait::async_trait]
 impl Parser for ReelsParser {
     async fn process(&self, ctx: &ParserCtx, post_path: &str) -> FacebedResult<ParsedPost> {
         // Full read, always. The old early-stop scanner (stop once delivery +
@@ -26,12 +25,16 @@ impl Parser for ReelsParser {
         // (79-92%): a stopped prefix that failed to parse forced a second
         // full fetch, ~1.8s of the Discord budget — more than the early stop
         // ever saved. A single full read is ~1.3-2.3s for a ~2.9 MB page.
-        let page = ctx.fetcher.fetch(post_path, true).await?;
+        let page = ctx.fetcher.fetch(post_path).await?;
         parse_reel(ctx, post_path, &page)
     }
 }
 
-fn parse_reel(ctx: &ParserCtx, post_path: &str, page: &FetchedPage) -> FacebedResult<ParsedPost> {
+pub(crate) fn parse_reel(
+    ctx: &ParserCtx,
+    post_path: &str,
+    page: &FetchedPage,
+) -> FacebedResult<ParsedPost> {
     let html = page.document();
     let blocks = get_json_blocks(html, true);
 
@@ -147,7 +150,7 @@ fn find_avatar_node(node: &Value, author_id: &str) -> Option<String> {
         Value::Object(map) => {
             if node
                 .get("id")
-                .is_some_and(|id| value_matches_id(id, author_id))
+                .is_some_and(|id| crate::parsers::util::value_matches_id(id, author_id))
             {
                 if let Some(avatar) = author_avatar_in_node(node) {
                     return Some(avatar);
@@ -174,9 +177,9 @@ fn select_content_node(
         for bloc in blocks {
             for cs in jq::all(bloc, "creation_story") {
                 if is_strict_content_story(cs)
-                    && cs
-                        .get("id")
-                        .is_some_and(|id| value_matches_id(id, target_video_id))
+                    && cs.get("id").is_some_and(|id| {
+                        crate::parsers::util::value_matches_id(id, target_video_id)
+                    })
                 {
                     return Some(selected_content(
                         cs.clone(),
@@ -356,7 +359,7 @@ fn has_target_attachment(node: &Value, target_video_id: &str) -> bool {
                 attachment
                     .get("media")
                     .and_then(|media| media.get("id"))
-                    .is_some_and(|id| value_matches_id(id, target_video_id))
+                    .is_some_and(|id| crate::parsers::util::value_matches_id(id, target_video_id))
             })
         })
 }
@@ -407,7 +410,7 @@ fn has_target_media_context(node: &Value) -> bool {
 fn matches_target_delivery(candidate: &Value, target_video_id: &str) -> bool {
     candidate
         .get("id")
-        .is_some_and(|id| value_matches_id(id, target_video_id))
+        .is_some_and(|id| crate::parsers::util::value_matches_id(id, target_video_id))
         && candidate.get("videoDeliveryResponseFragment").is_some()
 }
 
@@ -459,7 +462,7 @@ fn find_target_video_link(node: &Value, target_video_id: &str) -> Option<String>
         Value::Object(map) => {
             if node
                 .get("id")
-                .is_some_and(|id| value_matches_id(id, target_video_id))
+                .is_some_and(|id| crate::parsers::util::value_matches_id(id, target_video_id))
             {
                 if let Some(link) = direct_video_link(node) {
                     return Some(link);
@@ -536,7 +539,7 @@ fn owner_linked_to_id(node: &Value, video_id: &str) -> Option<Value> {
         Value::Object(map) => {
             if node
                 .get("id")
-                .is_some_and(|id| value_matches_id(id, video_id))
+                .is_some_and(|id| crate::parsers::util::value_matches_id(id, video_id))
             {
                 if let Some(owner) = owner_from_node(node) {
                     return Some(owner);
@@ -604,14 +607,6 @@ fn owner_id_for_post(owner: &Value) -> Option<String> {
     author_id_in_node(owner).filter(|id| !id.is_empty())
 }
 
-fn value_matches_id(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(s) => s == needle,
-        Value::Number(n) => n.to_string() == needle,
-        _ => false,
-    }
-}
-
 fn find_shareable_url(node: &Value) -> Option<String> {
     jq::all(node, "short_form_video_context")
         .into_iter()
@@ -650,7 +645,7 @@ fn contains_id(node: &Value, video_id: &str) -> bool {
     match node {
         Value::Object(map) => {
             node.get("id")
-                .is_some_and(|id| value_matches_id(id, video_id))
+                .is_some_and(|id| crate::parsers::util::value_matches_id(id, video_id))
                 || map.values().any(|child| contains_id(child, video_id))
         }
         Value::Array(values) => values.iter().any(|child| contains_id(child, video_id)),
@@ -716,7 +711,7 @@ fn linked_message_text(node: &Value, video_id: &str) -> Option<String> {
             let linked = ["id", "video_id", "videoId", "videoID"]
                 .iter()
                 .filter_map(|key| map.get(*key))
-                .any(|value| value_matches_id(value, video_id));
+                .any(|value| crate::parsers::util::value_matches_id(value, video_id));
             if linked {
                 if let Some(text) = first_message_text(node) {
                     return Some(text);

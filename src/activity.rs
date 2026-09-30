@@ -5,8 +5,6 @@ use serde_json::json;
 use url::Url;
 
 const MAX_STATUS_BYTES: usize = 2_048;
-const ACCOUNT_AVATAR_URL: &str = "https://facebed.neyahub.com/favicon.ico";
-const ACCOUNT_HEADER_URL: &str = "https://facebed.neyahub.com/banner.png";
 
 pub fn status_id(post_url: &str) -> Option<String> {
     if post_url.len() > MAX_STATUS_BYTES || !url_clean::is_facebook_page_url(post_url) {
@@ -86,7 +84,11 @@ pub fn alternate_link(post: &crate::parsers::ParsedPost, public_origin: &str) ->
     format!(r#"<link href="{status_url}" rel="alternate" type="application/activity+json"/>"#)
 }
 
-pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
+/// `origin` is this server's public origin (e.g. `https://facebed.example`);
+/// the fallback avatar and header are served from it.
+pub fn status_json(id: &str, post: &crate::parsers::ParsedPost, origin: &str) -> String {
+    let fallback_avatar = format!("{origin}/favicon.ico");
+    let header = format!("{origin}/banner.png");
     let username = activity_username(post);
     let account_id = post.author_id.as_deref().unwrap_or(username);
     let profile_avatar = post
@@ -99,7 +101,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
         .author_avatar_url
         .as_deref()
         .or(profile_avatar.as_deref())
-        .unwrap_or(ACCOUNT_AVATAR_URL);
+        .unwrap_or(&fallback_avatar);
     let attachments = if post.image_links.is_empty() {
         post.video_links
             .first()
@@ -141,7 +143,7 @@ pub fn status_json(id: &str, post: &crate::parsers::ParsedPost) -> String {
             "discoverable": false, "group": false, "created_at": "1970-01-01T00:00:00Z",
             "note": "", "url": post.url,
             "avatar": avatar, "avatar_static": avatar,
-            "header": ACCOUNT_HEADER_URL, "header_static": ACCOUNT_HEADER_URL,
+            "header": header, "header_static": header,
             "followers_count": 0, "following_count": 0, "statuses_count": 0,
             "last_status_at": null,
         },
@@ -206,162 +208,41 @@ fn status_content(post: &crate::parsers::ParsedPost) -> String {
     content
 }
 
+/// HTML rendering of [`crate::markdown`] tokens for the Activity card.
 fn render_activity_markdown(text: &str) -> String {
+    use crate::markdown::{Block, Span};
     let mut output = String::with_capacity(text.len());
-    for (index, line) in text.split('\n').enumerate() {
-        if index > 0 {
+    for (n, line) in crate::markdown::lines(text).enumerate() {
+        if n > 0 {
             output.push_str("<br>");
         }
-        render_activity_markdown_line(&mut output, line);
+        output.push_str(&encode_text(line.indent));
+        match line.block {
+            Block::Quote => output.push_str("<blockquote>"),
+            Block::Bullet => output.push_str("• "),
+            Block::Plain => {}
+        }
+        for span in line.spans {
+            match span {
+                Span::Text(text) => output.push_str(&encode_text(&text)),
+                Span::Escaped(c) => {
+                    output.push('\\');
+                    output.push_str(&encode_text(&c.to_string()));
+                }
+                Span::Backslash => output.push('\\'),
+                Span::BoldOpen => output.push_str("<strong>"),
+                Span::BoldClose => output.push_str("</strong>"),
+                Span::ItalicOpen(_) => output.push_str("<em>"),
+                Span::ItalicClose(_) => output.push_str("</em>"),
+                Span::CodeOpen => output.push_str("<code>"),
+                Span::CodeClose => output.push_str("</code>"),
+            }
+        }
+        if matches!(line.block, Block::Quote) {
+            output.push_str("</blockquote>");
+        }
     }
     output
-}
-
-fn render_activity_markdown_line(output: &mut String, line: &str) {
-    let whitespace_end = line
-        .char_indices()
-        .find(|(_, character)| !character.is_whitespace())
-        .map(|(index, _)| index)
-        .unwrap_or(line.len());
-    output.push_str(&encode_text(&line[..whitespace_end]));
-    let mut rest = &line[whitespace_end..];
-
-    let heading_markers = rest
-        .chars()
-        .take_while(|character| *character == '#')
-        .count();
-    if (1..=6).contains(&heading_markers) && rest[heading_markers..].starts_with(' ') {
-        rest = rest[heading_markers..].trim_start_matches(' ');
-    }
-
-    if rest == ">" || rest.starts_with("> ") {
-        output.push_str("<blockquote>");
-        render_activity_inline(output, rest.strip_prefix("> ").unwrap_or(""));
-        output.push_str("</blockquote>");
-        return;
-    }
-
-    // Facebook renders `* item` lines in group posts as bullet points.
-    // A leading `* ` is a bullet, not a bold marker (`**` is handled inline).
-    if rest == "*" || rest.starts_with("* ") {
-        output.push_str("• ");
-        render_activity_inline(output, rest.strip_prefix("* ").unwrap_or(""));
-        return;
-    }
-
-    render_activity_inline(output, rest);
-}
-
-fn render_activity_inline(output: &mut String, text: &str) {
-    // Facebook group Markdown uses `**bold**`, `*italic*`, `_italic_`, and
-    // `` `code` ``. Markers pair first-with-second, third-with-fourth;
-    // unmatched trailing markers and escaped ones stay literal.
-    let characters = text.chars().collect::<Vec<_>>();
-    let mut bold_markers = Vec::new();
-    let mut code_markers = Vec::new();
-    let mut index = 0;
-    while index < characters.len() {
-        if characters[index] == '\\' {
-            index += 2;
-            continue;
-        }
-        if characters[index] == '*'
-            && characters
-                .get(index + 1)
-                .is_some_and(|character| *character == '*')
-        {
-            bold_markers.push(index);
-            index += 2;
-            continue;
-        }
-        if characters[index] == '`' {
-            code_markers.push(index);
-            index += 1;
-            continue;
-        }
-        index += 1;
-    }
-
-    let (bold_opens, bold_closes) = pair_activity_markers(&bold_markers);
-    let (italic_opens, italic_closes) = crate::embed::group_italic_markers(&characters);
-    let (code_opens, code_closes) = pair_activity_markers(&code_markers);
-
-    let mut plain = String::new();
-    let mut index = 0;
-    while index < characters.len() {
-        if characters[index] == '\\' {
-            plain.push('\\');
-            if let Some(next) = characters.get(index + 1) {
-                plain.push(*next);
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if bold_opens.binary_search(&index).is_ok() {
-            flush_activity_text(output, &mut plain);
-            output.push_str("<strong>");
-            index += 2;
-            continue;
-        }
-        if bold_closes.binary_search(&index).is_ok() {
-            flush_activity_text(output, &mut plain);
-            output.push_str("</strong>");
-            index += 2;
-            continue;
-        }
-        if italic_opens.binary_search(&index).is_ok() {
-            flush_activity_text(output, &mut plain);
-            output.push_str("<em>");
-            index += 1;
-            continue;
-        }
-        if italic_closes.binary_search(&index).is_ok() {
-            flush_activity_text(output, &mut plain);
-            output.push_str("</em>");
-            index += 1;
-            continue;
-        }
-        if code_opens.binary_search(&index).is_ok() {
-            flush_activity_text(output, &mut plain);
-            output.push_str("<code>");
-            index += 1;
-            continue;
-        }
-        if code_closes.binary_search(&index).is_ok() {
-            flush_activity_text(output, &mut plain);
-            output.push_str("</code>");
-            index += 1;
-            continue;
-        }
-        plain.push(characters[index]);
-        index += 1;
-    }
-    flush_activity_text(output, &mut plain);
-}
-
-fn pair_activity_markers(markers: &[usize]) -> (Vec<usize>, Vec<usize>) {
-    let paired = markers.len() - (markers.len() % 2);
-    let opens = markers
-        .iter()
-        .take(paired)
-        .step_by(2)
-        .copied()
-        .collect::<Vec<_>>();
-    let closes = markers
-        .iter()
-        .take(paired)
-        .skip(1)
-        .step_by(2)
-        .copied()
-        .collect::<Vec<_>>();
-    (opens, closes)
-}
-
-fn flush_activity_text(output: &mut String, plain: &mut String) {
-    output.push_str(&encode_text(plain));
-    plain.clear();
 }
 
 #[cfg(test)]
