@@ -62,6 +62,10 @@ pub fn router(state: AppState) -> Router {
         .route("/oembed.json", get(oembed))
         .route("/favicon.ico", get(favicon))
         .route("/banner.png", get(banner))
+        // Hyphenated names can't collide with a Facebook username.
+        .route("/demo-post.webp", get(demo_post))
+        .route("/demo-comment.webp", get(demo_comment))
+        .route("/demo-quote.webp", get(demo_quote))
         .route("/healthz", get(healthz))
         .route("/api/v1/statuses/:id", get(activity_status))
         .route("/users/:username/statuses/:id", get(user_activity_status))
@@ -74,8 +78,15 @@ static INDEX_HTML: LazyLock<String> = LazyLock::new(|| {
     include_str!("../../assets/index.html").replace("{|CREDIT|}", crate::embed::credit())
 });
 
-async fn root() -> Response {
-    html_response(INDEX_HTML.clone())
+/// The home page tells people to swap in this server's own domain, so it
+/// names the host the request came in on.
+async fn root(headers: HeaderMap) -> Response {
+    let origin = request_origin(&headers);
+    let host = origin
+        .as_deref()
+        .and_then(|origin| origin.split_once("://"))
+        .map_or("this domain", |(_, host)| host);
+    html_response(INDEX_HTML.replace("{|HOST|}", &crate::embed::escape_attr(host)))
 }
 
 async fn favicon() -> Response {
@@ -86,11 +97,30 @@ async fn banner() -> Response {
     static_asset(include_bytes!("../../assets/banner.png"), "image/png")
 }
 
+async fn demo_post() -> Response {
+    static_asset(include_bytes!("../../assets/demo-post.webp"), "image/webp")
+}
+
+async fn demo_comment() -> Response {
+    static_asset(
+        include_bytes!("../../assets/demo-comment.webp"),
+        "image/webp",
+    )
+}
+
+async fn demo_quote() -> Response {
+    static_asset(include_bytes!("../../assets/demo-quote.webp"), "image/webp")
+}
+
 fn static_asset(bytes: &'static [u8], content_type: &'static str) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static(content_type),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
     );
     (StatusCode::OK, headers, bytes).into_response()
 }
@@ -762,6 +792,27 @@ mod tests {
             .await
             .expect("cached response body");
         assert_eq!(&body[..], b"origin-b cached HTML");
+    }
+
+    #[tokio::test]
+    async fn home_page_names_the_request_host() {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "fb.example.org:8443")
+            .body(Body::empty())
+            .expect("home request");
+
+        let response = router(test_state())
+            .oneshot(request)
+            .await
+            .expect("route response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("home body");
+        let html = std::str::from_utf8(&body).expect("utf-8 home page");
+
+        assert!(html.contains("Replace facebook.com with fb.example.org:8443 in any link."));
+        assert!(!html.contains("{|"));
     }
 
     #[tokio::test]

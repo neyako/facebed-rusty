@@ -54,7 +54,10 @@ src/
     comment.rs            comment permalink (?comment_id=)
     fixtures.rs           parser tests on minimized real pages + the capture tool
     fixtures/             the fixture pages
-assets/                   favicon, banner, index.html (compiled into the binary), README images
+assets/                   favicon (Minecraft bed), banner, index.html home page, demo-*.webp
+                          (README screenshots cropped for the home page), README images.
+                          All but the README images are compiled into the binary;
+                          `root` fills `{|HOST|}` from the request
 Dockerfile                multi-stage musl build → scratch image
 docker-compose.yml        compose example with volume mounts
 config.example.yaml       config template
@@ -101,7 +104,7 @@ and cookies (`CookieJar::load_strict`: a malformed file or unreadable directory 
 ### Request flow
 
 1. `axum::Router` (`routes/mod.rs::router`) serves `/`, `/favicon.ico`, `/banner.png`,
-   `/healthz` (counts only), `/oembed.json` (author/provider line Discord reads),
+   `/demo-*.webp`, `/healthz` (counts only), `/oembed.json` (author/provider line Discord reads),
    the Activity routes `/api/v1/statuses/:id` and `/users/:user/statuses/:id`, and
    every other path via `catch_all`.
 2. Crawler UA gate (`crawler::is_crawler`): non-crawlers get a 301 + `format_redirect_page`.
