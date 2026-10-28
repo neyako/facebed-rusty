@@ -1,45 +1,69 @@
 <!DOCTYPE html>
-    <html>
-        <head>
-            <title>Facebed</title>
-            <link rel="icon" href="/favicon.ico" type="image/x-icon">
-            <style type="text/css">
-                html {background-color: #eee; font-family: Arial, sans-serif;}
-                body {background-color: #fff; border: 1px solid #ddd; padding: 15px; margin: 15px;}
-                pre, code {
-                    background-color: #818b981f;
-                    color: black;
-                    border-radius: 5px;
-                    padding: 3px;
-                    font-family: monospace;
-                }
-            </style>
-            <meta property="og:title" content="{|CREDIT|}"/>
-            <meta property="og:image" content="/banner.png">
-            <meta content="summary_large_image" name="twitter:card"/>
-            <meta property="og:description" content="A better Facebook embed provider for messaging apps."/>
-        </head>
-        <body>
-            <h1><img src="/favicon.ico" style="vertical-align: middle; width: 32px"> Facebed</h1>
-            <p>A better Facebook embed provider for messaging apps.</p>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{|CREDIT|}</title>
+    <link rel="icon" href="/favicon.ico" type="image/png">
+    <meta property="og:site_name" content="{|CREDIT|}"/>
+    <meta property="og:title" content="Facebook embeds for Discord"/>
+    <meta property="og:description" content="Replace facebook.com with {|HOST|} in any link."/>
+    <meta property="og:image" content="/banner.png"/>
+    <meta name="twitter:card" content="summary_large_image"/>
+    <meta name="theme-color" content="#0866ff"/>
+    <style>
+        * {box-sizing: border-box; margin: 0}
+        html {background: #000; color: #fff; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif}
+        body {max-width: 1040px; margin: 0 auto; padding: 40px 24px 32px}
+        a {color: #fff; text-decoration: underline; text-decoration-color: #555; text-underline-offset: 3px}
+        code {font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .9em}
+        header {display: flex; align-items: center; gap: 10px}
+        header img {width: 40px; height: 40px; image-rendering: pixelated}
+        header h1 {font-size: 22px; font-weight: 800; letter-spacing: -.3px}
+        header a {margin-left: auto; font-size: 14px}
+        .lead {margin-top: 22px; font-size: 17px; line-height: 1.55}
+        .host {color: #3b8bff}
+        .demos {margin-top: 36px; display: grid; grid-template-columns: 1fr 1fr; gap: 36px 28px; align-items: start}
+        .demos > div {display: grid; gap: 36px}
+        @media (max-width: 760px) {.demos {grid-template-columns: 1fr}}
+        section h2 {font-size: 15px; font-weight: 700; margin-bottom: 4px}
+        section p {font-size: 13px; color: #a8a8a8; margin-bottom: 12px; line-height: 1.45}
+        section img {display: block; width: 100%; height: auto; border-radius: 8px}
+        .more {max-width: 720px; margin-top: 36px; font-size: 15px; color: #d6d6d6; line-height: 1.6}
+        footer {margin-top: 24px; font-size: 13px; color: #8a8a8a; line-height: 1.7}
+    </style>
+</head>
+<body>
+    <header>
+        <img src="/favicon.ico" alt="">
+        <h1>{|CREDIT|}</h1>
+        <a href="https://github.com/neyako/facebed-rusty">Source</a>
+    </header>
 
-            <h3>Usage:</h3>
-            Replace <code>facebook.com</code> with <code>facebed.com</code> or use <code>s/book/bed</code> in Discord. <br>
-            Append <code>/text</code> to the end of any supported URL to render a text-only version.
+    <p class="lead">Replace <code>facebook.com</code> with <code class="host">{|HOST|}</code> in any Facebook link and Discord shows the post.</p>
 
-            <h3>Features:</h3>
-            Currently supported URL schemes include:
-            <pre>
-/:user/posts/:(id|hash)
-/share/p/:hash
-/permalink.php?story_fbid
-/story.php?story_fbid
-/groups/:id/posts/:(id|hash)
-</pre>
+    <!-- Real embeds, cropped from the README screenshots. -->
+    <div class="demos">
+        <section>
+            <h2>Posts</h2>
+            <p>Full text with its formatting, up to 4 photos, reaction counts.</p>
+            <img src="/demo-post.webp" width="960" height="1372" alt="A Facebook post in Discord with formatted text and four photos">
+        </section>
+        <div>
+            <section>
+                <h2>Comments</h2>
+                <p>Link a comment, get that comment and its post.</p>
+                <img src="/demo-comment.webp" width="1360" height="1180" loading="lazy" alt="A Facebook comment in Discord quoting the post it is on">
+            </section>
+            <section>
+                <h2>Shared posts</h2>
+                <p>The original comes along as a quote.</p>
+                <img src="/demo-quote.webp" width="1000" height="569" loading="lazy" alt="A shared Facebook post in Discord quoting the original">
+            </section>
+        </div>
+    </div>
 
-            Reels are supported. Shared videos and reels are not perfectly supported.
-            <br>
-            <hr>
-            <sub>This project is not affiliated in any way with Meta or Facebook.</sub>
-        </body>
-    </html>'
+    <p class="more">Reels and videos play in Discord, or show their thumbnail past 25 MB. Also stories, photos and share links. Group posts work when one of this server's Facebook accounts is a member.</p>
+    <footer>Clicking a link still opens Facebook. Not affiliated with Meta.</footer>
+</body>
+</html>
